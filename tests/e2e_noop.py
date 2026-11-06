@@ -349,12 +349,12 @@ def run(procs, srv):
 
     # ---- disk cap: eviction, and jobs larger than the cache are not leased to it
     t_small = admin("add-worker", "small").split()[3]
-    for i, n in enumerate("abca"):
-        admin("enqueue-noop", "1", "--seconds", "0", "--size", "100", "--seed", str(300 + i), "--inputs", f"test/{n}.bin", "--tag", "disk")
+    for i, n in enumerate("abca"):                 # one level each: inside a level 0.4 would take the cached a again first
+        admin("enqueue-noop", "1", "--seconds", "0", "--size", "100", "--seed", str(300 + i), "--inputs", f"test/{n}.bin", "--tag", f"disk{i}")
     admin("enqueue-noop", "1", "--seconds", "0", "--size", "100", "--seed", "310", "--inputs", "test/a.bin,test/b.bin,test/c.bin", "--tag", "big")
     w = worker("small", t_small, "--cache-gb", "0.0007", "--idle-exit", "4"); procs.append(w); w.wait(40)
     st = stats("small"); used = sum(os.path.getsize(os.path.join(f"{W}/small/cache/blobs", f)) for f in os.listdir(f"{W}/small/cache/blobs"))
-    ok("disk cap: 4 jobs done with eviction", all(states()[i] == "accepted" for i in jobs_of("disk")) and st and st[-1]["evicted"] >= 2,
+    ok("disk cap: 4 jobs done with eviction", all(states()[i] == "accepted" for t in range(4) for i in jobs_of(f"disk{t}")) and st and st[-1]["evicted"] >= 2,
        f"evicted {st[-1]['evicted'] if st else None}, cache {used} B <= 700000")
     ok("cache stays under its cap", used <= 700_000)
     ok("job bigger than the cache not leased to it", states()[jobs_of("big")[0]] == "queued")

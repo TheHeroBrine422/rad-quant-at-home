@@ -1,4 +1,4 @@
-# rad-quant-at-home: donate GPU time to the rad-exl3 quantizations (v0.3)
+# rad-quant-at-home: donate GPU time to the rad-exl3 quantizations (v0.4)
 
 > **Status: pre-release.** There is no public queue server yet and the job types still change; please read, comment and
 > open issues, but don't run a worker against anything until a release is announced.
@@ -23,6 +23,15 @@ GHCR (public packages; pulling needs no login), the server host and its volumes,
 steps were built and run on the 4070 without Docker, `tests/cuda_rootfs.sh`, but the Docker build needs a host with
 ≥ 8 GB of free RAM per compile job; ROCm: with radiance inside), `docker run --gpus` on an NVIDIA host, and one real
 R9700 job of each type.
+
+What is new in 0.4:
+- **Bandwidth limits for donors** on data caps or slow links: rate caps (`--max-down-mbps`, `--max-up-mbps`) and day /
+  month data budgets (`--max-down-gb-day` ...). The server offers a worker only jobs whose downloads and uploads fit
+  what is left ("Data caps" below).
+- **Scheduling** (docs/SCHED.md): ladder levels get a default priority by K's granularity (integer K first, then
+  halves, quarters, eighths), and `admin.py reprioritize` changes it by level pattern. Inside a priority class, whole
+  levels finish first, and a worker gets the jobs whose inputs it already caches. A higher-priority job never starves
+  behind lower ones for longer than `--class-wait-s`.
 
 What is new in 0.3:
 - **Verification by score** (docs/VERIFY.md): a quant result is accepted when its codes, decoded on the server with
@@ -57,7 +66,7 @@ docker run -d --name rad-quant-at-home --restart unless-stopped --device /dev/kf
   --security-opt seccomp=unconfined --security-opt no-new-privileges --cap-drop ALL --memory 40g --stop-timeout 900 \
   -v rqah-state:/var/lib/rqah -v /etc/localtime:/etc/localtime:ro \
   -e RQAH_SERVER=https://<queue-url> -e RQAH_INVITE=<invite-code> -e RQAH_NAME=<name-for-the-leaderboard> \
-  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.3.0-rocm7.14-gfx1201 --gpu-name r9700 --gpus 0 --vram-gb 32 --ram-gb 32 --cache-gb 200
+  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.4.0-rocm7.14-gfx1201 --gpu-name r9700 --gpus 0 --vram-gb 32 --ram-gb 32 --cache-gb 200
 ```
 
 NVIDIA (`--gpus all` hands the cards to the container; the worker's own `--gpus 0` picks among them):
@@ -67,7 +76,7 @@ docker run -d --name rad-quant-at-home --restart unless-stopped --gpus all \
   --security-opt no-new-privileges --cap-drop ALL --memory 24g --stop-timeout 900 \
   -v rqah-state:/var/lib/rqah -v /etc/localtime:/etc/localtime:ro \
   -e RQAH_SERVER=https://<queue-url> -e RQAH_INVITE=<invite-code> -e RQAH_NAME=<name-for-the-leaderboard> \
-  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.3.0-cu128 --gpu-name rtx4070 --gpus 0 --vram-gb 12 --ram-gb 16 --cache-gb 50
+  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.4.0-cu128 --gpu-name rtx4070 --gpus 0 --vram-gb 12 --ram-gb 16 --cache-gb 50
 ```
 
 Declare the VRAM the worker may really use: a card that also drives your desktop has ~1 GB less (e.g. `--vram-gb 11`
@@ -76,6 +85,18 @@ on a 12 GB card), and `--vram-cap-gb 7` caps the worker's allocator below that i
 Several cards in one box: `--gpus 0,1,2,3` (one job per card at once; jobs that need two cards get them together)
 and `--ram-gb` for the RAM all of them may use together. Only at night: add `--window 22:00-08:00` (repeatable, your
 local time). `docker/worker/compose.yaml` holds the same settings for compose users (AMD).
+
+**Data caps.** If your internet plan has a monthly allowance, or the link is slow, tell the worker:
+`--max-down-gb-month 300 --max-up-gb-month 100` (also `-day`; 1 GB = 10^9 bytes) counts the data its jobs move and
+stops taking new jobs when the allowance is used up. The month starts again on `--budget-reset-day` (1-28, e.g. your
+ISP's billing day), the day at local midnight. The counters live in the state volume, so restarts and new containers
+keep them. `--max-down-mbps 50 --max-up-mbps 10` caps the rates (megabits per second, all jobs together), and it
+applies to resumed transfers too. With a budget set, the server sends only jobs whose downloads (inputs you don't
+already have) and expected uploads fit what is left, and it prefers jobs whose inputs your worker already holds. When
+the allowance runs out, the running jobs finish and nothing new starts until the reset. `rqah status` shows what is
+left and when it resets. The worker counts payload bytes (inputs and results), not TCP/TLS overhead (a few percent),
+so leave your ISP's cap some margin. Typical sizes are in "Data per job": a 27B layer job downloads ~1.5 GB the
+first time and uploads 50-300 MB.
 
 **Stop it.** `docker stop rad-quant-at-home` finishes the running jobs (up to 15 min) and exits; `docker kill -s TERM
 rad-quant-at-home` while that waits hands them back at once. `docker start rad-quant-at-home` resumes. To leave for
@@ -146,15 +167,20 @@ itself: [research-kit/](research-kit/README.md).
   only to a worker holding an active lease on a job that lists the file, and goldens / corpora only while their
   privacy marker says public. No HTTP endpoint changes anything as admin; the search's batch endpoint (its own token)
   can only enqueue eval_mix jobs on public goldens.
-- **Scheduler** (0.2): every job type declares what one job needs (`requires`: GPU, cards, VRAM per card, host RAM;
+- **Scheduler** (0.2, 0.4: docs/SCHED.md): every job type declares what one job needs (`requires`: GPU, cards, VRAM per card, host RAM;
   by model size or bpw), every worker what it has (`--gpus` / `--cards`, `--vram-gb`, `--ram-gb`, `--cache-gb`). A job
   is leased only to a worker whose declaration covers it and whose cards and RAM are free now (the server counts its
   active leases). Gang jobs (more than one card) on a busy multi-card worker: the server reserves the worker for the
   job (it gets nothing else while its cards drain), then leases it the gang job; a worker that can run it at once
   still takes it. Trusted-only types go to workers the operator flagged `trusted`, spot-check re-runs to `verifier`
-  workers (ours), never to the original donor; quarantined workers get nothing.
+  workers (ours), never to the original donor; quarantined workers get nothing. 0.4: priority classes strictly in
+  order, whole levels first inside a class, then the jobs whose inputs the worker caches (it reports its cache when
+  leasing). It filters by the worker's declared data budget (each job type declares its expected upload,
+  `upload_bytes`), and a higher-class job that a busy worker keeps passing over drains that worker after
+  `--class-wait-s`.
 - **Admin** (`server/admin.py`): data (`datapack`, `ladder-add`, `golden-add`, `corpus-add`, `manifest`), jobs
-  (`enqueue-level`, `enqueue-golden`, `batch-submit` / `-status` / `-collect`, `list`, `events`, `requeue`, `cancel`),
+  (`enqueue-level`, `enqueue-golden`, `batch-submit` / `-status` / `-collect`, `list`, `queue`, `reprioritize`, `events`,
+  `requeue`, `cancel`),
   verification (`check`, `spot`, `quarantine`, `unquarantine`), workers (`invite`, `add-worker`, `workers`, `trust`,
   `verifier`, `disable-worker`), donors (`invite --personal`, `donors`, `donor ID --hide`, `link`), `points`,
   `status-page`, `export` (the accepted shards of a level in `quantize/ourq.py`'s layout, so knap4 and the search read
@@ -173,6 +199,8 @@ itself: [research-kit/](research-kit/README.md).
   - `--window HH:MM-HH:MM` (repeatable, local time): no new leases outside the windows.
   - `--gpu-lock FILE` (`{card}` = one lock per card, e.g. `/var/lock/gpu-card{card}.lock` on a shared box): flock around GPU jobs.
   - `--vram-cap-gb`: caps torch's allocator in job processes (a shared card).
+  - Bandwidth (0.4, `worker/bandwidth.py`): token-bucket rate caps shared by all jobs; data budgets per calendar day
+    and budget month in `STATE/bandwidth.json`. Running jobs reserve what they still have to move.
 - **Donor API and CLI** (`server/donor.py`, `client/rqah.py`): a donor reads their own workers, jobs, lumens and
   log with any one of their worker tokens, and sets their public profile (section "Donor CLI").
 - **Status page** (`server/statuspage.py`): one static HTML file, rebuilt every minute from the database and served
@@ -388,7 +416,8 @@ What a donor (or an agent working for one) runs to see their own part of the que
 state volume), so no flags are needed:
 
 ```bash
-docker exec rad-quant-at-home rqah status            # profile, workers, running jobs, lumens, pending, queue depth
+docker exec rad-quant-at-home rqah status            # profile, workers, running jobs, lumens, pending, queue depth,
+                                                     # data budget left (0.4: DATA LEFT, this box's day / month counters)
 docker exec rad-quant-at-home rqah jobs --limit 20   # recent jobs (--active: running only; --worker ID)
 docker exec rad-quant-at-home rqah points            # lumens per worker / type, the grant / revoke ledger, rank
 docker exec rad-quant-at-home rqah logs -f           # the server's events for your workers (--local: this box's job records)
@@ -495,7 +524,9 @@ Measured numbers are in TESTS.md.
 | 0.8B Hessian group (test, measured) | 18.9 MB | 3.2 MB |
 
 The Hessians and weights of a layer are the same for every level, so a donor working down the ladder layer by
-layer hits its cache. Cache-aware leasing is a v1 item.
+layer hits its cache: the scheduler (0.4) gives a worker, inside the level being finished, the layers whose inputs it
+holds (docs/SCHED.md). A worker with a data budget is charged only for the inputs it does not hold, and for the
+type's expected upload (`upload_bytes` in `jobs/*.py`).
 
 v0.2 job types (from the file layouts; the fake-model sizes in TESTS.md §8):
 
@@ -537,7 +568,7 @@ Files: `docker/server/Dockerfile`, `entrypoint.sh` (`rad-quant-at-home serve | a
 with the compose plugin (tested: Docker 29.8, compose 5.6; Podman untested).
 
 ```bash
-# 1. build (from a commit; --worktree for uncommitted code). Tags rad-quant-at-home-server:0.3.0, :0.3.0-<commit>, :latest
+# 1. build (from a commit; --worktree for uncommitted code). Tags rad-quant-at-home-server:0.4.0, :0.4.0-<commit>, :latest
 docker/server/build.sh
 # 2. configure: copy .env.example to .env next to compose.yaml and set at least the directories
 cd docker/server && cp .env.example .env
@@ -584,6 +615,7 @@ Settings (`.env`; defaults in brackets):
 | `RQAH_SEARCH_TOKEN_FILE` [off] | enables the search's batch API (`/api/v0/search/...`: eval_mix on public goldens only) for that bearer token (≥ 32 characters, a file in `RQAH_SECRETS_DIR`) |
 | `RQAH_SPOT_RATE` [0.04], `RQAH_SPOT_FIRST` [1] | spot checks: the fraction of each donor's accepted jobs re-run on a verifier, and every donor's first N per type |
 | `RQAH_GANG_WAIT_S` [0], `RQAH_RESERVE_MAX_S` [21600] | gang jobs: how long one waits before a busy multi-card worker drains for it; when a drain is given up |
+| `RQAH_CLASS_WAIT_S` [900], `RQAH_CLASS_SCAN` [5000] | 0.4 (docs/SCHED.md): how long a job a busy worker could run waits before that worker is drained for it instead of getting lower-priority work; queued jobs looked at per priority class and lease |
 | `RQAH_ADMIN_TOKEN_FILE` [off] | enables the read-only `GET /api/v0/admin/summary` (counts per level, workers, last events) for that bearer token (≥ 32 characters, a file in `RQAH_SECRETS_DIR`, readable by uid 10001) |
 | `RQAH_UID` / `RQAH_GID` [10001] | user the container runs as |
 | `RQAH_MEM_LIMIT` [2g], `RQAH_ADMIN_MEM_LIMIT` [8g], `RQAH_ADMIN_CPUS` [8] | resource caps |
@@ -602,7 +634,27 @@ Toolkit on the host; the worker's own `--gpus` then picks among the cards the co
 - `RQAH_TOKEN_FILE`: a file mounted read-only.
 - `RQAH_TOKEN`: the token in an env variable. This shows in `docker inspect`, so prefer the other two.
 
-Flags (each also `RQAH_<FLAG>`):
+Worker options (each flag also `RQAH_<FLAG>`, e.g. `--max-up-gb-month` = `RQAH_MAX_UP_GB_MONTH`):
+
+| option [default] | meaning |
+|---|---|
+| `--server`, `--token-file` / `--invite` + `--name` | the queue and how to authenticate (see above) |
+| `--state` [`/var/lib/rqah` in the image] | token, running jobs, input cache, `worker.jsonl`, `bandwidth.json` |
+| `--gpus 0,1,...` / `--cards N`, `--gpu-name`, `--vram-gb` (per card) | the cards jobs may use |
+| `--slots` [one per card] | jobs at once |
+| `--ram-gb` | host RAM all running jobs together may use |
+| `--cache-gb` [200] | disk cap of the input cache |
+| `--window HH:MM-HH:MM` (repeatable; `RQAH_WINDOWS=a-b,c-d`) [always] | local-time windows for new jobs |
+| `--vram-cap-gb`, `--gpu-lock FILE` | shared cards: torch allocator cap, flock around GPU jobs |
+| `--job-types a,b` [all the image has] | job types to accept |
+| `--on-stop finish\|abandon` [finish], `--stop-file F` | what a stop does to running jobs |
+| `--max-down-mbps`, `--max-up-mbps` [0 = unlimited] | **0.4** rate caps in Mbit/s, all jobs together, resumed transfers included |
+| `--max-down-gb-day`, `--max-down-gb-month` [0 = unlimited] | **0.4** download budget (1 GB = 10^9 bytes) per calendar day / budget month, local time |
+| `--max-up-gb-day`, `--max-up-gb-month` [0 = unlimited] | **0.4** upload budget, the same |
+| `--budget-reset-day N` [1] | **0.4** day of the month (1-28) the monthly budgets start again |
+| `--max-jobs N`, `--idle-exit N`, `--poll S` | tests and one-off runs |
+
+More on each:
 - **Cards:** `--gpus 0,1,...` (or `--cards N`), `--vram-gb` (per card), `--gpu-name`; `--slots` (jobs at once,
   default one per card). Without cards the worker is CPU-only (test jobs only).
 - **RAM:** `--ram-gb`: host RAM all running jobs together may use; the server leases only what fits beside the jobs
@@ -612,6 +664,9 @@ Flags (each also `RQAH_<FLAG>`):
 - **Time windows:** `--window` (repeatable) or `RQAH_WINDOWS=a-b,c-d`, in the container's local time (the host's,
   via the `/etc/localtime` mount, or `-e TZ=...`). Outside them the worker takes no new jobs.
 - `--vram-cap-gb` caps torch's allocator on a shared card; `--gpu-lock FILE` (with `{card}`: per card) for shared boxes.
+- **Bandwidth (0.4):** "Data caps" above; the counters are in `STATE/bandwidth.json` (`rqah status` reads them).
+  The month runs from `--budget-reset-day` to the day before it in the next month. A spent download budget still
+  allows jobs whose inputs are all cached; a spent upload budget allows nothing new.
 - **Job types:** the CUDA image declares `noop,quant_layer,quant_head,quant_tensor` (no radiance in it); the ROCm image
   every type. A 27B layer job needs 8 GB of VRAM up to K6 and 12 GB above, its down_proj group the same, every other
   group 6 GB (docs/SMALL-CARDS.md): declare `--vram-gb` honestly and the server sends only what fits.
@@ -656,7 +711,7 @@ labels).
 IMAGE_REPO=ghcr.io/theherobrine422/rad-quant-at-home-worker RXM_COMMIT=<rxm-commit> RADIANCE_IMAGE=radiance:<fork-commit> \
   docker/build.sh rocm <commit>                      # never from --worktree
 IMAGE_REPO=ghcr.io/theherobrine422/rad-quant-at-home-worker RXM_COMMIT=<rxm-commit> docker/build.sh cuda <commit>
-docker image inspect ghcr.io/theherobrine422/rad-quant-at-home-worker:0.3.0-cu128 --format '{{json .Config.Labels}}'
+docker image inspect ghcr.io/theherobrine422/rad-quant-at-home-worker:0.4.0-cu128 --format '{{json .Config.Labels}}'
 docker push ghcr.io/theherobrine422/rad-quant-at-home-worker --all-tags
 ```
 
@@ -665,8 +720,8 @@ The CUDA build compiles exllamav3 and the side extensions for `TORCH_CUDA_ARCH` 
 `BUILD_ARGS="--build-arg MAX_JOBS=1"`, and `--build-arg TORCH_CUDA_ARCH=8.9` for a quick single-arch test build).
 
 Tags:
-- `0.3.0-rocm7.14-gfx1201`, `0.3.0-cu128`: what donors pin.
-- `0.3.0-rocm` / `0.3.0-cuda` and `rocm` / `cuda`: these move.
+- `0.4.0-rocm7.14-gfx1201`, `0.4.0-cu128`: what donors pin.
+- `0.4.0-rocm` / `0.4.0-cuda` and `rocm` / `cuda`: these move.
 - `rocm-<commit>-rxm<commit>`, `cuda-...`: the exact source commits.
 
 #### Research images (research-kit/)
@@ -688,6 +743,12 @@ exercised yet.
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
   privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record; w25: the donor CLI (every
   command, `--json`, exit codes, isolation, link, personal invites) and the served status page.
+- `tests/sched_test.py` (0.4): the scheduling rules in process, a few seconds (docs/SCHED.md): K-granularity
+  priorities, `reprioritize`, class order, level-first, cache affinity, the budget filter (incl. a randomized
+  check), the cache report protocol, the class-wait drain.
+- `tests/bandwidth_e2e.py` (0.4): the bandwidth limits end to end with noop jobs, ~3 min: the budget counters (day,
+  month, reset day, year wrap), rate caps on a 30 s fetch / upload / resumed fetch (±10%), budgets across a SIGKILL
+  and a restart, `rqah status`, the status page.
 - `tests/statuspage_test.py`: the status page from a fixture database, a few seconds: well-formed XHTML, element
   allow-list, no active content, no token / IP / path / hostname patterns, escaping, the numbers, the display-name
   rules.
@@ -709,15 +770,14 @@ exercised yet.
   NVIDIA host, then calibrate the eval tolerance on the first donor / verifier pairs (cross-GPU spread of per-position
   KL).
 - **Web UI on the donor side:** start / stop button, time windows, storage and bandwidth limits (the worker already
-  has the flags; the UI writes them and the stop file). An upload bandwidth limit and a preference for small-upload
-  jobs on slow uplinks.
+  has the flags, bandwidth limits included since 0.4; the UI writes them and the stop file). A preference for
+  small-upload jobs on slow uplinks beyond the budget filter.
 - **Leaderboard, beyond the status page:** teams, per-donor public pages ("your card quantized K2.375 of
   EXL3-V3"), credits in the model cards (`admin.py donors --json` / `points --json` have the numbers). A share of points for bytes served if seeding is ever
   peer-to-peer.
 - **Verification by score**, after the first campaign: re-tune `TOL` / `NOISE` from the honest best-of-N pairs; a GPU
   scorer job for our verifiers; binding codes to their seed (the sign vectors) against copying between copies.
-- **Cache-aware scheduling:** prefer jobs whose inputs a worker already holds (same layer, next level; the same
-  ladder pieces for evals). Bootstrap seeding of the ~105 GB.
+- **Bootstrap seeding** of the ~105 GB (cache-aware scheduling is in 0.4).
 - **Healing jobs** (hours each, checkpointed state of tens of MB); **layer-streamed statistics** for new models
   (Σdy² partial sums, input-Hessian partials by token chunk and layer group); **big-box** backward passes (Σdy², REAL-Q
   Fisher), fuller H_out accumulators, long-context checks: trusted donors, with split-half / per-layer comparisons

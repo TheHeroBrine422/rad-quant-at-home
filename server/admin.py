@@ -52,8 +52,17 @@ w25 (donors, status page):
                                          provisional; a fail quarantines; --loop: every S seconds until killed)
   score-import --level L DIR [--published NOTE]   our own ourq output dir (q-LNN.safetensors) for that level's jobs as
                                          trusted reference rows (or, --published, a released model's codes: replay guard)
-  scores [--level L] [--job J]           the scored tensors: rel, basis, band, state"""
+  scores [--level L] [--job J]           the scored tensors: rel, basis, band, state
+0.4 (docs/SCHED.md):
+  enqueue-level ... [--priority-boost B | --priority P]
+                                         default priority from K's granularity: integer K 40, halves 30, quarters 20,
+                                         eighths 10, sixteenths 5, finer 0 (+ B); the head job one above its level
+  reprioritize PATTERN [--priority P | --by-granularity] [--priority-boost B] [--dry-run]
+                                         set the priority of the queued / leased jobs of every level matching the shell
+                                         pattern (e.g. 'q27-k2.*'): P, or K's granularity default (+ B); heads +1
+  queue [--limit N]                      queued jobs in scheduling order: priority classes, levels, sizes"""
 import argparse, concurrent.futures as cf, json, os, shutil, sys, time
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.util import read_json, write_json_atomic, sha256_file, st_header, safe_relpath, fmt_bytes, env
@@ -62,7 +71,7 @@ from common import radfile
 import jobs
 from jobs import qwen, quant_common as QC, golden_common as G
 from server.store import Store
-from server import verify as V, batch as B, donor as D, statuspage as SP
+from server import verify as V, batch as B, donor as D, statuspage as SP, sched as SCH
 
 
 def man_files(data):
@@ -197,6 +206,7 @@ def cmd_enqueue_level(a, S):
     nl = (cfg.get("text_config") or cfg)["num_hidden_layers"]
     lo, hi = map(int, (a.layers or f"0-{nl - 1}").split("-"))
     if a.verify == "score": base["verify"] = "score"
+    prio = a.priority if a.priority is not None else SCH.level_priority(a.K, a.priority_boost)
     n, stamps = 0, set()
     with S.tx() as db:
         for c in range(a.copies):                      # best of N: copy c quantizes with seed_offset + c
@@ -207,14 +217,55 @@ def cmd_enqueue_level(a, S):
                 if a.unit == "group":
                     for g in range(len(qwen.layer_plan(a.arch, l))):
                         n += add_job(S, db, man, "quant_tensor", {**b, "layer": l, "group": g}, a.level,
-                                     f"quant_tensor/v{jobs.get('quant_tensor').VERSION}:{b['stamp']}:L{l:02d}:g{g}{sfx}") is not None
+                                     f"quant_tensor/v{jobs.get('quant_tensor').VERSION}:{b['stamp']}:L{l:02d}:g{g}{sfx}",
+                                     priority=prio) is not None
                 else:
                     n += add_job(S, db, man, "quant_layer", {**b, "layer": l}, a.level,
-                                 f"quant_layer/v{jobs.get('quant_layer').VERSION}:{b['stamp']}:L{l:02d}{sfx}") is not None
-            if a.head:
+                                 f"quant_layer/v{jobs.get('quant_layer').VERSION}:{b['stamp']}:L{l:02d}{sfx}", priority=prio) is not None
+            if a.head:                                 # the longest job of a level starts first
                 n += add_job(S, db, man, "quant_head", b, a.level, f"quant_head/v{jobs.get('quant_head').VERSION}:{b['stamp']}:head{sfx}",
-                             priority=1) is not None
-    print(f"level {a.level} (stamp {', '.join(sorted(stamps))}{', verify by score' if a.verify == 'score' else ''}): {n} new jobs")
+                             priority=prio + 1) is not None
+    print(f"level {a.level} (stamp {', '.join(sorted(stamps))}{', verify by score' if a.verify == 'score' else ''}): {n} new jobs, "
+          f"priority {prio}")
+
+
+def cmd_reprioritize(a, S):
+    """the queued / leased jobs of the levels matching a pattern get priority P (or K's granularity default) + boost;
+    quant_head jobs one more, as at enqueue. Accepted / failed / cancelled jobs keep theirs (it no longer matters)"""
+    levels = [r[0] for r in S.q("SELECT DISTINCT level FROM jobs WHERE state IN ('queued','leased') AND verify_of IS NULL")]
+    hit = SCH.match_levels(levels, a.pattern)
+    if not hit: sys.exit(f"no queued level matches {a.pattern!r}")
+    if a.priority is None and not a.by_granularity: sys.exit("give --priority P or --by-granularity")
+    changes = Counter()
+    with S.tx() as db:
+        for lv in sorted(hit):
+            for j in db.execute("SELECT id, type, params, priority FROM jobs WHERE level=? AND state IN ('queued','leased') "
+                                "AND verify_of IS NULL", (lv,)).fetchall():
+                p = json.loads(j["params"])
+                if a.priority is not None: new = a.priority + a.priority_boost
+                elif "K" in p: new = SCH.level_priority(p["K"], a.priority_boost)
+                else: continue                          # not a ladder job (no K): left alone
+                new += j["type"] == "quant_head"
+                if new == j["priority"]: continue
+                changes[(lv, j["priority"], new)] += 1
+                if not a.dry_run: db.execute("UPDATE jobs SET priority=? WHERE id=?", (new, j["id"]))
+            if not a.dry_run and any(k[0] == lv for k in changes):
+                S.event(db, "reprioritize", detail={"level": lv, "to": sorted({k[2] for k in changes if k[0] == lv})})
+    for (lv, old, new), n in sorted(changes.items()): print(f"{lv}: {n} jobs {old} -> {new}")
+    print(f"{'would change' if a.dry_run else 'changed'} {sum(changes.values())} jobs in {len(hit)} matching levels")
+
+
+def cmd_queue(a, S):
+    """the queue in the order an unrestricted worker with an empty cache would get it (docs/SCHED.md)"""
+    rows = S.q("SELECT * FROM jobs WHERE state='queued' ORDER BY priority DESC, id")
+    with S.lock: ranks = SCH.level_ranks(S.db, [r["level"] for r in rows])
+    rows.sort(key=lambda r: (-r["priority"], ranks.get(r["level"], r["id"]) if r["level"] else r["id"], r["id"]))
+    for r in rows[:a.limit]:
+        p = json.loads(r["params"]); what = f"L{p['layer']:02d}" if "layer" in p else ("head" if r["type"] == "quant_head" else "")
+        print(f"{r['id']:6d} prio {r['priority']:4d} {r['type']:12s} {what:5s} lvl {r['level'] or '-':16s} K {p.get('K', '-')!s:6s} "
+              f"in {fmt_bytes(r['input_bytes'])}")
+    print(f"{len(rows)} queued" + (f" (first {a.limit} shown)" if len(rows) > a.limit else "") + "; by class: " +
+          ", ".join(f"{k}: {v}" for k, v in sorted(Counter(r["priority"] for r in rows).items(), reverse=True)))
 
 
 def cmd_enqueue_noop(a, S):
@@ -577,6 +628,12 @@ def main():
                    help="score: the server scores the codes (docs/VERIFY.md); replicate: the 0.2 checker + spot checks")
     x.add_argument("--unit", choices=("layer", "group"), default="layer", help="group: one quant_tensor job per Hessian group")
     x.add_argument("--copies", type=int, default=1, help="best of N: N copies of every job (seed_offset + 0..N-1)")
+    x.add_argument("--priority-boost", type=int, default=0, help="added to the default priority from K's granularity")
+    x.add_argument("--priority", type=int, help="explicit priority (instead of the granularity default)")
+    x = sp.add_parser("reprioritize"); x.add_argument("pattern", help="shell pattern over level names, e.g. 'q27-k2.*'")
+    x.add_argument("--priority", type=int); x.add_argument("--by-granularity", action="store_true")
+    x.add_argument("--priority-boost", type=int, default=0); x.add_argument("--dry-run", action="store_true")
+    x = sp.add_parser("queue"); x.add_argument("--limit", type=int, default=50)
     x = sp.add_parser("enqueue-noop"); x.add_argument("n", type=int); x.add_argument("--seconds", type=float, default=1)
     x.add_argument("--size", type=int, default=1024); x.add_argument("--seed", type=int, default=0)
     x.add_argument("--inputs"); x.add_argument("--tag"); x.add_argument("--fail", action="store_true")
@@ -621,6 +678,8 @@ def main():
     elif a.cmd == "manifest": cmd_manifest(a)
     elif a.cmd == "datapack": cmd_datapack(a)
     elif a.cmd == "enqueue-level": cmd_enqueue_level(a, S)
+    elif a.cmd == "reprioritize": cmd_reprioritize(a, S)
+    elif a.cmd == "queue": cmd_queue(a, S)
     elif a.cmd == "score": cmd_score(a, S)
     elif a.cmd == "score-import": cmd_score_import(a, S)
     elif a.cmd == "scores": cmd_scores(a, S)

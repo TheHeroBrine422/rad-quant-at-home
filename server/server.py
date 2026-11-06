@@ -15,6 +15,12 @@ reservation on that worker: it is leased nothing else until enough of its cards 
 worker that can run it at once still may. Trusted-only types go to workers flagged trusted; spot-check re-runs to
 verifiers only (server/verify.py); quarantined workers get nothing.
 
+Scheduling (0.4, server/sched.py, docs/SCHED.md): priority classes strictly in order; inside a class whole levels
+first, then the jobs whose inputs the worker caches (its lease request reports its cache: sha256 prefixes, resent
+when they change). A worker may declare a data budget (bytes left to download / upload); it is offered only jobs whose
+uncached inputs and expected upload (jobs/*.upload_bytes) fit. A higher-class job a busy worker could run but keeps
+passing over drains that worker once it has waited --class-wait-s.
+
   POST /api/v0/register   {invite, name}                              -> {worker_id, token}
   POST /api/v0/lease      {caps}                                      -> {job: {...}} | {job: null, retry_s}
   POST /api/v0/heartbeat  {job_id, lease_id}                          -> {ok, cancel, lease_expires}
@@ -47,6 +53,7 @@ import jobs
 from jobs import golden_common as G
 from server.store import Store
 from server import verify as V, batch as B, donor as D, statuspage as SP
+from server import sched as SCH
 from server.sched import norm_req, job_filter
 
 CHUNK_MAX = 64 << 20
@@ -61,7 +68,16 @@ CAPS = {"type": "object", "required": ["job_types"], "properties": {
     "ram_gb": {"type": "number", "minimum": 0, "maximum": 65536, "description": "host RAM for all its jobs together"},
     "disk_gb": {"type": "number", "minimum": 0, "maximum": 1e6}, "image": {"type": "string", "maxLength": 128},
     "running": {"type": "array", "maxItems": 64, "items": {"type": "integer"}},
-    "versions": {"type": "object", "additionalProperties": {"type": "integer"}}}}
+    "versions": {"type": "object", "additionalProperties": {"type": "integer"}},
+    # 0.4: the data budget left (bytes, null = unlimited) and the input cache report (docs/SCHED.md)
+    "budget": {"type": "object", "properties": {
+        "down": {"type": ["integer", "null"], "minimum": 0}, "up": {"type": ["integer", "null"], "minimum": 0},
+        "spent": {"type": "array", "maxItems": 2, "items": {"enum": ["down", "up"]}},
+        "reset": {"type": "integer", "minimum": 0, "description": "when the binding limit resets (unix time)"}}},
+    "cache": {"type": "object", "required": ["rev"], "properties": {
+        "rev": {"type": "string", "pattern": "[0-9a-f]{16}"},
+        "shas": {"type": "array", "maxItems": 32768, "items": {"type": "string", "pattern": "[0-9a-f]{16}"},
+                 "description": "sha256[:16] of every complete blob in the worker's input cache; sent when rev changes"}}}}}
 
 
 class HTTPError(Exception):
@@ -84,6 +100,8 @@ class Queue:
         self.policy = V.Policy(a.spot_rate, a.spot_first)
         self.store.reserve_max_s = a.reserve_max_s; self.store.reserve_idle_s = max(4 * a.lease_s, 60)
         self.piece_cache = {}
+        self.up_memo = {}                                   # job id -> expected upload bytes (sched.Transfers)
+        self.cache_reports = {}                             # worker id -> (rev, set of sha256[:16])
         self.page, self.page_t = None, 0.0
         self.campaign = a.campaign or os.path.join(os.path.dirname(os.path.abspath(a.db)), "campaign.json")
 
@@ -106,7 +124,7 @@ class Queue:
         m = os.path.getmtime(p) if os.path.exists(p) else None
         if m != self._man_mtime:
             try:
-                self._man = (read_json(p, {}) or {}).get("files", {}); self._man_mtime = m; self.piece_cache = {}
+                self._man = (read_json(p, {}) or {}).get("files", {}); self._man_mtime = m; self.piece_cache = {}; self.up_memo = {}
             except (OSError, ValueError) as e:              # e.g. written 0600 by another uid: keep the last good one
                 print(f"manifest.json unreadable, keeping the previous one ({len(self._man)} files): {e!r}", flush=True)
         return self._man
@@ -126,14 +144,26 @@ class Queue:
 
     # ------------------------------------------------------------ lease
     def lease(self, w, caps):
+        """docs/SCHED.md: priority classes strictly in order; inside a class whole levels first and cached inputs
+        first; only jobs that fit the worker's declared data budget; a gang job, or a higher-class job that has
+        waited --class-wait-s, drains a busy worker that could run it"""
         try: validate(caps, CAPS, "caps")
         except SchemaError as e: raise HTTPError(400, str(e))
+        cr = caps.get("cache")
+        if cr is not None:
+            if "shas" in cr: self.cache_reports[w["id"]] = (cr["rev"], frozenset(cr["shas"]))
+            elif self.cache_reports.get(w["id"], (None,))[0] != cr["rev"]:
+                return {"job": None, "retry_s": 0, "cache_unknown": True}           # e.g. after a server restart
+        cached = self.cache_reports.get(w["id"], (None, frozenset()))[1] if cr is not None else frozenset()
+        budget = caps.get("budget")
+        stored = dict(caps)
+        if cr is not None: stored["cache"] = {"rev": cr["rev"], "n": len(cached)}
         self.store.expire()
         cards = caps.get("cards", 1 if caps.get("gpu") else 0)
         slots = min(caps.get("slots", max(cards, 1)), self.a.max_leases)
         now = time.time()
         with self.store.tx() as db:
-            db.execute("UPDATE workers SET last_seen=?, caps=? WHERE id=?", (now, json.dumps(caps), w["id"]))
+            db.execute("UPDATE workers SET last_seen=?, caps=? WHERE id=?", (now, json.dumps(stored), w["id"]))
             wr = db.execute("SELECT * FROM workers WHERE id=?", (w["id"],)).fetchone()
             if wr["quarantined"]:
                 return {"job": None, "retry_s": 3600, "quarantined": True, "why": "this worker is quarantined (a result failed "
@@ -145,30 +175,59 @@ class Queue:
             free_cards = cards - sum(r["cards"] for r in used); free_ram = caps.get("ram_gb", 0) - sum(r["ram_gb"] for r in used)
 
             eligible = job_filter(wr, caps)
+            tr = SCH.Transfers(self.manifest(), self.up_memo)
 
             def fits_now(r): return r["cards"] <= free_cards and r["ram_gb"] <= free_ram
+
+            def affordable(j):
+                if not budget and not cached: return j["input_bytes"], 0       # nothing to weigh: skip the JSON
+                d, have = tr.down(j, cached)
+                return (d, have) if SCH.fits_budget(budget, d, tr.up(j)) else None
+
+            def drain(j, r, why):
+                db.execute("INSERT INTO reservations VALUES(?,?,?)", (j["id"], w["id"], now))
+                self.store.event(db, "reserve", j["id"], w["id"], detail={"cards": r["cards"], "free_cards": free_cards, "why": why})
+                return {"job": None, "retry_s": min(self.a.retry_s, 10), "draining": j["id"],
+                        "why": f"draining for {'gang ' if r['cards'] > 1 else ''}job {j['id']} ({r['cards']} cards, {r['ram_gb']:g} GB RAM)"}
 
             res = db.execute("SELECT * FROM reservations WHERE worker_id=?", (w["id"],)).fetchone()
             if res:
                 j = db.execute("SELECT * FROM jobs WHERE id=? AND state='queued'", (res["job_id"],)).fetchone()
                 r = eligible(j) if j else None
+                if r is not None and affordable(j) is None: r = None
                 if r is None: db.execute("DELETE FROM reservations WHERE job_id=?", (res["job_id"],))
-                elif fits_now(r): return self._grant(db, w, j, r, now)
+                elif fits_now(r): return self._grant(db, w, j, r, now, tr, cached)
                 else: return {"job": None, "retry_s": min(self.a.retry_s, 10), "draining": j["id"],
-                              "why": f"draining for gang job {j['id']} ({r['cards']} cards)"}
-            for j in db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY priority DESC, id LIMIT 2000").fetchall():
-                r = eligible(j)
-                if r is None: continue
-                if fits_now(r): return self._grant(db, w, j, r, now)
-                if r["cards"] > 1 and now - j["created"] >= self.a.gang_wait_s and \
-                        not db.execute("SELECT 1 FROM reservations WHERE job_id=?", (j["id"],)).fetchone():
-                    db.execute("INSERT INTO reservations VALUES(?,?,?)", (j["id"], w["id"], now))
-                    self.store.event(db, "reserve", j["id"], w["id"], detail={"cards": r["cards"], "free_cards": free_cards})
-                    return {"job": None, "retry_s": min(self.a.retry_s, 10), "draining": j["id"],
-                            "why": f"draining for gang job {j['id']} ({r['cards']} cards)"}
+                              "why": f"draining for job {j['id']} ({r['cards']} cards)"}
+            over, starving = 0, None
+            reserved = {r[0] for r in db.execute("SELECT job_id FROM reservations")}
+            for (prio,) in db.execute("SELECT DISTINCT priority FROM jobs WHERE state='queued' ORDER BY priority DESC").fetchall():
+                cands = []
+                for j in db.execute("SELECT * FROM jobs WHERE state='queued' AND priority=? ORDER BY id LIMIT ?",
+                                    (prio, self.a.class_scan)).fetchall():
+                    r = eligible(j)
+                    if r is None: continue
+                    t = affordable(j)
+                    if t is None: over += 1; continue
+                    cands.append({"j": j, "r": r, "down": t[0], "cached": t[1], "prio": prio})
+                if not cands: continue
+                ranks = SCH.level_ranks(db, [c["j"]["level"] for c in cands])
+                for c in cands: c["rank"] = ranks.get(c["j"]["level"], c["j"]["id"])
+                cands.sort(key=SCH.order_key(bool(budget) and budget.get("down") is not None))
+                for c in cands:
+                    j, r = c["j"], c["r"]
+                    if fits_now(r):
+                        if starving is not None and starving["prio"] > prio: return drain(starving["j"], starving["r"], "class-wait")
+                        return self._grant(db, w, j, r, now, tr, cached)
+                    if j["id"] in reserved: continue
+                    if r["cards"] > 1 and now - j["created"] >= self.a.gang_wait_s: return drain(j, r, "gang")
+                    if starving is None and now - (j["updated"] or j["created"]) >= self.a.class_wait_s: starving = c
+        if over:
+            return {"job": None, "retry_s": max(self.a.retry_s, 60), "over_budget": over,
+                    "why": f"{over} queued jobs this worker could run need more data than its budget has left"}
         return {"job": None, "retry_s": self.a.retry_s}
 
-    def _grant(self, db, w, j, r, now):
+    def _grant(self, db, w, j, r, now, tr=None, cached=frozenset()):
         lid = secrets.token_hex(16); exp = now + self.lease_s
         db.execute("DELETE FROM reservations WHERE job_id=?", (j["id"],))
         db.execute("INSERT INTO leases VALUES(?,?,?,?,?, 'active', NULL, NULL)", (lid, j["id"], w["id"], now, exp))
@@ -176,7 +235,9 @@ class Queue:
                    "updated=? WHERE id=?", (lid, w["id"], exp, now, j["id"]))
         self.store.event(db, "lease", j["id"], w["id"], lid)
         man = self.manifest(); params = json.loads(j["params"])
+        tr = tr or SCH.Transfers(man, self.up_memo)
         return {"job": {"id": j["id"], "type": j["type"], "version": j["version"], "params": params,
+                        "expect": {"down": tr.down(j, cached)[0], "up": tr.up(j)},
                         "inputs": [{"name": n, "sha256": man[n]["sha256"], "size": man[n]["size"]} for n in json.loads(j["inputs"])],
                         "outputs": jobs.get(j["type"]).outputs(params), "requires": r,
                         "lease_id": lid, "lease_expires": exp, "heartbeat_s": self.hb_s}}
@@ -540,6 +601,11 @@ def main():
                     help="most active leases per worker (a worker gets min(this, its slots); slots default to its cards)")
     ap.add_argument("--gang-wait-s", type=float, default=env("GANG_WAIT_S", 0, float),
                     help="how long a gang job waits before a busy multi-card worker starts draining for it")
+    ap.add_argument("--class-wait-s", type=float, default=env("CLASS_WAIT_S", 900, float),
+                    help="a queued job a busy worker could run but keeps passing over for lower-priority work drains that "
+                         "worker after waiting this long (docs/SCHED.md)")
+    ap.add_argument("--class-scan", type=int, default=env("CLASS_SCAN", 5000, int),
+                    help="queued jobs of one priority class looked at per lease request")
     ap.add_argument("--reserve-max-s", type=float, default=env("RESERVE_MAX_S", 6 * 3600, float),
                     help="a drain that has not freed the cards by then is given up (the job may be reserved again)")
     ap.add_argument("--spot-rate", type=float, default=env("SPOT_RATE", 0.04, float),

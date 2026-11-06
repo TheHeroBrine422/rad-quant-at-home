@@ -57,6 +57,7 @@ def outputs(p):
 
 
 def required_outputs(p): return {"kld.json", "tokens.i32", "top.bin", "rows.f32", "job.json"}
+def upload_bytes(p, sizes): return (4 + 1 + 8 * p["top"] + 12) * p["max_positions"] + (1 << 20)   # max_positions bounds the tokens
 
 
 def run(p, ctx):

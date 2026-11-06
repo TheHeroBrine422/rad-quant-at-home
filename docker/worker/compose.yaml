@@ -14,7 +14,7 @@ name: rad-quant-at-home-worker
 
 services:
   worker:
-    image: ${RQAH_IMAGE:-${RADQUANT_IMAGE:-ghcr.io/theherobrine422/rad-quant-at-home-worker:0.3.0-rocm7.14-gfx1201}}
+    image: ${RQAH_IMAGE:-${RADQUANT_IMAGE:-ghcr.io/theherobrine422/rad-quant-at-home-worker:0.4.0-rocm7.14-gfx1201}}
     restart: unless-stopped
     devices: [/dev/kfd, /dev/dri]
     group_add:                                  # the host's numeric ids: getent group video render
@@ -38,6 +38,14 @@ services:
       RQAH_CACHE_GB: ${RQAH_CACHE_GB:-${RADQUANT_CACHE_GB:-200}} # disk cap of the input cache in the state volume
       RQAH_WINDOWS: ${RQAH_WINDOWS:-${RADQUANT_WINDOWS:-}}  # e.g. 22:00-08:00,12:00-13:00 (local time, TZ); empty: always
       RQAH_ON_STOP: ${RQAH_ON_STOP:-${RADQUANT_ON_STOP:-finish}} # finish | abandon the current jobs on stop
+      # 0.4 bandwidth limits (empty / 0 = unlimited; README "Data caps"): rates in Mbit/s, budgets in GB (1e9 bytes)
+      RQAH_MAX_DOWN_MBPS: ${RQAH_MAX_DOWN_MBPS:-}
+      RQAH_MAX_UP_MBPS: ${RQAH_MAX_UP_MBPS:-}
+      RQAH_MAX_DOWN_GB_DAY: ${RQAH_MAX_DOWN_GB_DAY:-}
+      RQAH_MAX_DOWN_GB_MONTH: ${RQAH_MAX_DOWN_GB_MONTH:-}
+      RQAH_MAX_UP_GB_DAY: ${RQAH_MAX_UP_GB_DAY:-}
+      RQAH_MAX_UP_GB_MONTH: ${RQAH_MAX_UP_GB_MONTH:-}
+      RQAH_BUDGET_RESET_DAY: ${RQAH_BUDGET_RESET_DAY:-1}  # the day (1-28) your ISP's month starts
       TZ: ${TZ:-UTC}
     volumes:
       - ${RQAH_STATE_DIR:-${RADQUANT_STATE_DIR:-rqah-state}}:/var/lib/rqah   # token, current jobs, input cache

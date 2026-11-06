@@ -17,15 +17,22 @@ go to <blob>.part (resumed with HTTP ranges) and are renamed only after their sh
 server's offset. A killed worker restarted with the same --state picks its jobs up again if their leases are alive.
 Stop: SIGINT / SIGTERM or the --stop-file once = finish the current jobs and exit (--on-stop abandon: give them back
 now); twice = abandon now. Time windows: no new leases outside them. Every flag has a RQAH_* environment variable
-(the 0.2 names RADQUANT_* are still read in 0.3)."""
-import argparse, fcntl, json, os, re, shutil, signal, subprocess, sys, threading, time, traceback
+(the 0.2 names RADQUANT_* are still read in 0.3).
+
+Bandwidth (0.4, worker/bandwidth.py): --max-down-mbps / --max-up-mbps cap the transfer rates (all jobs together);
+--max-{down,up}-gb-{day,month} are data budgets counted in STATE/bandwidth.json. The worker declares what is left
+(minus what its running jobs still have to move) and which inputs it caches when it leases; the server offers only
+jobs that fit. A spent budget: the running jobs finish, nothing new is leased until the day / month resets."""
+import argparse, fcntl, hashlib, json, os, re, shutil, signal, subprocess, sys, threading, time, traceback
 import urllib.request, urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.util import API, read_json, write_json_atomic, sha256_file, safe_relpath, env
+from common.util import API, read_json, write_json_atomic, sha256_file, safe_relpath, env, fmt_bytes
+from worker.bandwidth import Meter, GB
 import jobs
 
-UA = "rad-quant-at-home-worker/0.2"
+UA = "rad-quant-at-home-worker/0.4"
+CACHE_REPORT_MAX = 32768                                 # cached blobs reported at lease time (most recently used)
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -41,7 +48,9 @@ class Client:
         h = {"User-Agent": UA, **(headers or {})}
         if self.token: h["Authorization"] = f"Bearer {self.token}"
         data = None
-        if body is not None and not isinstance(body, (bytes, bytearray)):
+        if isinstance(body, MeteredBody):                                    # a throttled upload chunk
+            body.reset(); data = body; h["Content-Length"] = str(len(body))
+        elif body is not None and not isinstance(body, (bytes, bytearray)):
             data = json.dumps(body).encode(); h["Content-Type"] = "application/json"
         elif body is not None: data = bytes(body)
         r = urllib.request.Request(self.url + path, data=data, method=method, headers=h)
@@ -75,6 +84,20 @@ def log(msg):
     print(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()) + msg, flush=True)
 
 
+class MeteredBody:
+    """an upload chunk that pays the up bucket and counts against the budget as http.client reads it (8 KB at a
+    time); reset() before every attempt (a retried request sends it again, and that counts again)"""
+    def __init__(self, b, meter, job):
+        self.b, self.meter, self.job, self.pos = memoryview(b), meter, job, 0
+    def __len__(self): return len(self.b)
+    def reset(self): self.pos = 0
+    def read(self, n=-1):
+        if n is None or n < 0: n = len(self.b) - self.pos
+        x = bytes(self.b[self.pos:self.pos + n]); self.pos += len(x)
+        if x: self.meter.transfer("up", len(x), self.job)
+        return x
+
+
 # ---------------------------------------------------------------- the input cache
 class CacheFull(Exception): pass
 
@@ -102,6 +125,24 @@ class Cache:
     def path(self, sha): return os.path.join(self.blobs, sha)
     def save(self): write_json_atomic(self.ix_path, self.ix)
     def have(self, i): return os.path.exists(self.path(i["sha256"])) and os.path.getsize(self.path(i["sha256"])) == i["size"]
+
+    def missing_bytes(self, inputs):
+        """what fetching these inputs would still download (partial downloads resume)"""
+        n = 0
+        for i in {i["sha256"]: i for i in inputs}.values():
+            if self.have(i): continue
+            part = self.path(i["sha256"]) + ".part"
+            n += i["size"] - min(i["size"], os.path.getsize(part) if os.path.exists(part) else 0)
+        return n
+
+    def report(self):
+        """(rev, [sha256[:16] of complete blobs, most recently used first]) for the lease request: the server prefers
+        jobs whose inputs are here and charges only the rest against a download budget"""
+        with self.cv:
+            ks = [k for _, k in sorted(((v.get("last", 0), k) for k, v in self.ix.items()), reverse=True)
+                  if os.path.exists(self.path(k))][:CACHE_REPORT_MAX]
+        shas = sorted(k[:16] for k in ks)
+        return hashlib.sha256(",".join(shas).encode()).hexdigest()[:16], shas
 
     def _room(self, need, mine):
         """under cv: evict until need fits beside complete blobs and in-flight downloads. True / False (others' pins
@@ -250,6 +291,13 @@ class Worker:
                 with os.fdopen(fd, "w") as f: f.write(tok + "\n")
             log(f"registered as worker {r['worker_id']}")
         self.cache = Cache(a.cache or os.path.join(a.state, "cache"), int(a.cache_gb * 1e9))
+        lim = {f"{d}_{p}": int(getattr(a, f"max_{d}_gb_{p}") * GB) if getattr(a, f"max_{d}_gb_{p}") else None
+               for d in ("down", "up") for p in ("day", "month")}
+        self.meter = Meter(a.state, a.max_down_mbps, a.max_up_mbps, lim, a.budget_reset_day)
+        self.cache_sent = None                                                # cache report rev the server holds
+        self.legacy_caps = False                                              # a 0.3 server: no budget / cache keys
+        self.budget_note = None
+        self.lease_pause = 0.0                                                # after handing back an over-budget job
         self.stop, self.abandon = threading.Event(), threading.Event()
         self.stop_lock, self.stop_file_seen = threading.Lock(), False
         impl = {n for n, m in jobs.REGISTRY.items() if m.IMPLEMENTED}
@@ -310,26 +358,64 @@ class Worker:
             if self.a.max_jobs and self.jobs_done + n_run >= self.a.max_jobs:
                 if not n_run: break
                 time.sleep(0.3); continue
-            if n_run >= self.slots or not in_windows(self.a.window):
-                self.stop.wait(0.3 if n_run else 30); continue
+            if n_run >= self.slots or not in_windows(self.a.window) or time.time() < self.lease_pause:
+                self.stop.wait(0.3 if n_run or time.time() < self.lease_pause else 30); continue
             caps = dict(self.caps, running=sorted(self.running))
+            if not self.legacy_caps:
+                bud = self.meter.declare()
+                if bud is not None: caps["budget"] = bud
+                rev, shas = self.cache.report()
+                caps["cache"] = {"rev": rev} if rev == self.cache_sent else {"rev": rev, "shas": shas}
+                self.note_budget(bud)
             try: r = self.c.api("POST", "lease", {"caps": caps}, stop=self.stop.is_set)
             except APIError as e:
+                if e.code == 400 and not self.legacy_caps and "unknown key" in str(e.body.get("error", "")):
+                    self.legacy_caps = True
+                    log("server predates 0.4 (no data budgets, no cache report): leasing with the 0.3 caps; jobs over "
+                        "the budget are handed back"); continue
                 log(f"lease refused: {e}")
                 if e.code == 401: self.stop.set(); log("token rejected by the server"); continue
                 self.stop.wait(30); continue
             except Exception:
                 if self.stop.is_set(): continue
                 raise
+            if r.get("cache_unknown"): self.cache_sent = None; continue          # the server lost our report: resend
+            if "cache" in caps: self.cache_sent = caps["cache"]["rev"]
             if not r.get("job"):
                 if r.get("quarantined") and not n_run: log(f"server: {r.get('why')}")
-                elif r.get("draining") and not idle: log(f"server: {r.get('why')}")
+                elif (r.get("draining") or r.get("over_budget")) and not idle: log(f"server: {r.get('why')}")
                 if not n_run: idle += 1
                 if self.a.idle_exit and idle >= self.a.idle_exit and not n_run: log("idle: exiting"); break
                 self.stop.wait(min(r.get("retry_s", 30), self.a.poll)); continue
             idle = 0
             self.start(r["job"])
+        self.meter.budget.flush()
         log("worker stopped")
+
+    def note_budget(self, bud):
+        """log when the data budget becomes spent / available again"""
+        if not bud: return
+        spent = bud.get("spent") or []
+        note = None
+        if spent:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(bud["reset"])) if bud.get("reset") else "?"
+            note = (f"data budget spent ({', '.join('download' if d == 'down' else 'upload' for d in spent)}): no new jobs "
+                    + ("except ones whose inputs are all cached " if spent == ["down"] else "") + f"until {when} local time")
+        if note != self.budget_note:
+            log(note or "data budget: available again")
+            self.budget_note = note
+
+    def budget_check(self, job):
+        """the worker's own check of a fresh lease against its budget (the server should never offer more; a 0.3
+        server does not know the budget): None if it fits, else why not. Reserves the job's transfers if it fits"""
+        down = self.cache.missing_bytes(job["inputs"])
+        up = int((job.get("expect") or {}).get("up") or sum(job.get("outputs", {}).values()))
+        for d, n in (("down", down), ("up", up)):
+            left = self.meter.available(d, but=job["id"])
+            if left is not None and n > left:
+                return f"over this worker's data budget: {d}load {fmt_bytes(n)}, {fmt_bytes(left)} left"
+        self.meter.reserve(job["id"], down, up)
+        return None
 
     def validate(self, job):
         """is this a job we run, with parameters and inputs it allows? (no code from the server, ever) -> (module,
@@ -420,12 +506,19 @@ class Worker:
         st = {"job": job["id"], "type": job["type"], "resumed": resumed, "devices": cur["devices"]}
         pinned = False
         try:
+            self.cache.pin(job["inputs"]); pinned = True
+            if resumed: self.meter.reserve(job["id"], self.cache.missing_bytes(job["inputs"]) if cur["phase"] == "fetch" else 0,
+                                           (job.get("expect") or {}).get("up", 0))   # a running job always finishes
+            else:
+                why = self.budget_check(job)
+                if why:
+                    log(f"job {job['id']}: {why}: handing it back"); self.lease_pause = time.time() + 60
+                    self.fail(job, why, abandon=True); self.cleanup(cur); return
             self.save(cur)
             jd, out, stage = self.dirs(job); os.makedirs(out, exist_ok=True)
             # 2. fetch
             t0 = time.time()
-            self.cache.pin(job["inputs"]); pinned = True
-            paths, got = self.cache.ensure(job["inputs"], lambda i, part: self.fetch(i, part, cancel), cancel)
+            paths, got = self.cache.ensure(job["inputs"], lambda i, part: self.fetch(i, part, cancel, job["id"]), cancel)
             st.update(fetch_s=round(time.time() - t0, 2), down_bytes=got, input_bytes=sum(i["size"] for i in job["inputs"]),
                       evicted=self.cache.evicted)
             if cancel.is_set(): raise InterruptedError("cancelled")
@@ -445,6 +538,7 @@ class Worker:
             with self.lock: self.running.pop(job["id"], None); self.jobs_done += 1   # its cards and RAM are free from here
             st.update(upload_s=round(time.time() - t0, 2), **up)
             st["total_s"] = round(time.time() - cur.get("t_lease", time.time()), 2)
+            with self.meter.lock: st["link_bytes"] = dict(self.meter.moved.get(job["id"], {}))   # incl. retries
             self.record(**st)
             log(f"job {job['id']} done: {json.dumps(st)}")
             self.cleanup(cur)
@@ -461,9 +555,10 @@ class Worker:
         finally:
             done.set()
             if pinned: self.cache.unpin(job["inputs"])
+            self.meter.release(job["id"])
             with self.lock: self.running.pop(job["id"], None)
 
-    def fetch(self, inp, part, cancel):
+    def fetch(self, inp, part, cancel, job_id=None):
         """one input into part, resuming from its size with a Range request; returns bytes transferred"""
         have = os.path.getsize(part) if os.path.exists(part) else 0
         if have > inp["size"]: os.remove(part); have = 0
@@ -471,13 +566,16 @@ class Worker:
         r = self.c.call("GET", "/data/" + inp["name"], headers={"Range": f"bytes={have}-"}, raw=True, tries=5)
         if r.status == 200 and have: have = 0; mode = "wb"                    # server ignored the range
         else: mode = "ab"
-        n = 0
-        with open(part, mode) as f:
-            while True:
-                b = r.read(1 << 20)
-                if not b: break
-                f.write(b); n += len(b)
-                if cancel.is_set(): raise InterruptedError("cancelled")
+        n, chunk = 0, self.meter.chunk("down")
+        try:
+            with open(part, mode) as f:
+                while True:
+                    b = r.read(chunk)
+                    if not b: break
+                    f.write(b); n += len(b)
+                    self.meter.transfer("down", len(b), job_id, cancel)          # rate cap + budget
+                    if cancel.is_set(): raise InterruptedError("cancelled")
+        finally: self.meter.budget.flush()
         return n
 
     def upload_and_complete(self, job, out, result, m, cancel):
@@ -514,13 +612,14 @@ class Worker:
             f.seek(off)
             while off < size:
                 b = f.read(min(chunk, size - off))
-                try: r = self.c.api("PUT", f"{ep}?offset={off}", b, tries=5)
+                try: r = self.c.api("PUT", f"{ep}?offset={off}", MeteredBody(b, self.meter, job["id"]), tries=5)
                 except APIError as e:
                     if e.code == 409 and "size" in e.body: off = e.body["size"]; f.seek(off); continue
                     if e.code == 409 and e.body.get("accepted"): return sent
                     raise
                 off = r["size"]; sent += len(b)
                 if cancel.is_set() and self.abandon.is_set(): raise InterruptedError("cancelled")
+        self.meter.budget.flush()
         return sent
 
 
@@ -563,7 +662,20 @@ def main():
     ap.add_argument("--on-stop", choices=("finish", "abandon"), default=e("ON_STOP", "finish")); ap.add_argument("--stop-file", default=e("STOP_FILE"))
     ap.add_argument("--poll", type=float, default=30); ap.add_argument("--idle-exit", type=int, default=0)
     ap.add_argument("--max-jobs", type=int, default=0); ap.add_argument("--chunk-mb", type=int, default=16)
+    bw = ap.add_argument_group("bandwidth (0 = unlimited; all jobs of this worker together)")
+    bw.add_argument("--max-down-mbps", type=float, default=float(e("MAX_DOWN_MBPS", 0)), help="download rate cap, Mbit/s ($RQAH_MAX_DOWN_MBPS)")
+    bw.add_argument("--max-up-mbps", type=float, default=float(e("MAX_UP_MBPS", 0)), help="upload rate cap, Mbit/s ($RQAH_MAX_UP_MBPS)")
+    for d in ("down", "up"):
+        for p in ("day", "month"):
+            bw.add_argument(f"--max-{d}-gb-{p}", type=float, default=float(e(f"MAX_{d.upper()}_GB_{p.upper()}", 0)),
+                            help=f"{'download' if d == 'down' else 'upload'} budget per {'calendar day' if p == 'day' else 'budget month'}, "
+                                 f"GB = 1e9 bytes ($RQAH_MAX_{d.upper()}_GB_{p.upper()})")
+    bw.add_argument("--budget-reset-day", type=int, default=int(e("BUDGET_RESET_DAY", 1)),
+                    help="day of the month (1-28) the monthly budgets start again, local time ($RQAH_BUDGET_RESET_DAY)")
     a = ap.parse_args()
+    if not 1 <= a.budget_reset_day <= 28: ap.error("--budget-reset-day: 1..28")
+    for k in ("max_down_mbps", "max_up_mbps", "max_down_gb_day", "max_down_gb_month", "max_up_gb_day", "max_up_gb_month"):
+        if getattr(a, k) < 0: ap.error(f"--{k.replace('_', '-')}: not negative")
     if not a.server or not a.state: ap.error("--server and --state are required (or $RQAH_SERVER / $RQAH_STATE)")
     if not a.window: a.window = [x for x in (e("WINDOWS", "")).replace(" ", ",").split(",") if x]
     for w_ in a.window:
@@ -572,7 +684,11 @@ def main():
     w = Worker(a)
     signal.signal(signal.SIGINT, w.on_signal); signal.signal(signal.SIGTERM, w.on_signal)
     log(f"rad-quant-at-home worker up: types {w.types}, cards {w.gpus or 'none'} ({w.gpu_env}), slots {w.slots}, "
-        f"RAM {a.ram_gb} GB, cache {a.cache_gb} GB, windows {a.window or 'always'}")
+        f"RAM {a.ram_gb} GB, cache {a.cache_gb} GB, windows {a.window or 'always'}"
+        + (f", rate caps down {a.max_down_mbps or '-'} / up {a.max_up_mbps or '-'} Mbps" if a.max_down_mbps or a.max_up_mbps else "")
+        + (", data budget " + ", ".join(f"{d} {getattr(a, f'max_{d}_gb_{p}'):g} GB/{p}" for d in ("down", "up") for p in ("day", "month")
+                                         if getattr(a, f"max_{d}_gb_{p}")) + f" (month from day {a.budget_reset_day})"
+           if w.meter.budget.limited() else ""))
     w.loop()
 
 

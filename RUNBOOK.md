@@ -73,7 +73,11 @@ $A manifest --jobs 8                                                            
   `server/batch.py`. Repeated candidates reuse their earlier result.
 - **Reference goldens** (trusted big boxes): `$A enqueue-golden --model qwen38-27b --rev <rev> --corpus xcorp-m2
   --method tp2|staged --top 512 --max-model-len 32768`.
-- Priorities: `--priority` on `enqueue-noop` / `enqueue-golden` / the batch spec's `priority`; higher first.
+- Priorities (docs/SCHED.md): higher first, strictly by class. Ladder levels default by K's granularity: integer K 40,
+  halves 30, quarters 20, eighths 10, sixteenths 5 (heads +1); `enqueue-level --priority-boost B` / `--priority P`.
+  Later: `$A reprioritize 'k2.*' --by-granularity --priority-boost 5 --dry-run` (then without `--dry-run`), `$A queue`
+  shows the order. Everything else defaults to 0 (`--priority` on `enqueue-noop` / `enqueue-golden`, the batch
+  spec's `priority`), so search batches and goldens queue behind every ladder level unless given a priority.
 
 ## 4. Watch
 

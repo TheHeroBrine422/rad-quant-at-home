@@ -14,6 +14,8 @@ Every job module defines
     lumens(p)                   points for one verified job: its reference cost in R9700 card-minutes
     inputs(p)                   (required relpaths, [regex for optional relpaths]) under the server's data root
     outputs(p)                  {file name: max bytes}: the only files a worker uploads and the server accepts
+    upload_bytes(p, sizes)      (0.4) what one job is expected to upload, in bytes (sizes: {input relpath: bytes});
+                                the scheduler charges it against a worker's upload budget (expected_upload())
     required_outputs(p)         the subset that must be present at completion
     run(p, ctx) -> dict         the work; ctx is worker.worker.JobContext; returns a small JSON result
     accept(p, files, result, data_path)   cheap structural check on the server at completion (files: name -> path);
@@ -44,6 +46,16 @@ def requirements(m, p, info=None):
     r["vram_gb"] = float(r.get("vram_gb", 0)); r["ram_gb"] = float(r.get("ram_gb", 0))
     if getattr(m, "TRUSTED_ONLY", False): r["trusted"] = True
     return r
+
+
+def expected_upload(m, p, sizes=None):
+    """bytes one job is expected to upload: the type's upload_bytes(p, sizes), else the sum of its output caps (an
+    upper bound)"""
+    f = getattr(m, "upload_bytes", None)
+    if f is not None:
+        try: return max(0, int(f(p, sizes or {})))
+        except (KeyError, ValueError, TypeError): pass
+    return sum(m.outputs(p).values())
 
 
 def check_params(jtype, params):

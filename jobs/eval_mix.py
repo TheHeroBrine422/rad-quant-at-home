@@ -78,6 +78,7 @@ def inputs(p):
 
 def outputs(p): return {"rows.f32": 16 * p["rows"], "kld.json": 4 << 20, "job.json": 64 << 10}
 def required_outputs(p): return {"rows.f32", "kld.json", "job.json"}
+def upload_bytes(p, sizes): return 16 * p["rows"] + (256 << 10)
 
 
 def run(p, ctx):

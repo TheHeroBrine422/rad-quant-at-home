@@ -88,6 +88,9 @@ def collect(S, campaign=None, now=None):
                 "queued": qd.get(t, {}).get("queued", 0), "reruns": qd.get(t, {}).get("reruns", 0),
                 "day": day.get(t, 0), "total": tot.get(t, 0)} for t in types]
     busy = S.q("SELECT j.requires, l.worker_id FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.state='active'")
+    # workers seen in the last 15 min whose data budget is spent (a count only: no names, no amounts)
+    paused = sum(1 for r in S.q("SELECT caps FROM workers WHERE last_seen>=? AND disabled=0", (now - 900,))
+                 if D.budget_paused(_caps(r["caps"])))
     cards = sum(max(0, int(json.loads(r["requires"]).get("cards", 0) or 0)) for r in busy)
     # leaderboard
     rows, others = D.board(S)
@@ -122,7 +125,7 @@ def collect(S, campaign=None, now=None):
             "search": {"done": ev_done, "queued": ev_all - ev_done, "target": tgt("search", "evals")},
             "goldens": {"done": gd_done, "total": max(gd_all, tgt("goldens", "chunks") or 0)},
             "spot": {"pass": spot.get("pass", 0), "fail": spot.get("fail", 0), "pending": spot.get("pending", 0)},
-            "by_type": by_type, "cards_busy": cards, "workers_busy": len({r["worker_id"] for r in busy}),
+            "by_type": by_type, "cards_busy": cards, "workers_busy": len({r["worker_id"] for r in busy}), "budget_paused": paused,
             "donors_day": donors_day, "board": rows[:50], "board_more": max(0, len(rows) - 50), "others": others,
             "lumens_all": lumens_all, "recent": recent}
 
@@ -138,6 +141,12 @@ table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.25rem .
 td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}progress{width:100%;height:.8rem}
 .ok{color:var(--ok)}ul.kpi{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:.5rem 2rem}
 """
+
+
+def _caps(s):
+    try: c = json.loads(s or "{}")
+    except ValueError: return {}
+    return c if isinstance(c, dict) else {}
 
 
 def _e(x): return html.escape(str(x), quote=True)
@@ -178,7 +187,8 @@ def render(d):
         o += ['</tbody>', '</table>']
         if L["active_more"]: o.append(f'<p class="mut">and {_n(L["active_more"])} more levels</p>')
     o += ['</section>', '<section id="jobs">', '<h2>Jobs</h2>',
-          f'<p>{_n(d["cards_busy"])} cards busy on {_n(d["workers_busy"])} workers · {_n(d["donors_day"])} donors active in the last 24 h</p>',
+          f'<p>{_n(d["cards_busy"])} cards busy on {_n(d["workers_busy"])} workers · {_n(d["donors_day"])} donors active in the last 24 h'
+          + (f' · {_n(d["budget_paused"])} workers at their data cap until it resets' if d.get("budget_paused") else '') + '</p>',
           '<table>', '<thead><tr><th>job type</th><th class="n">running</th><th class="n">queued</th>'
           '<th class="n">done (24 h)</th><th class="n">done (all)</th></tr></thead>', '<tbody>']
     for t in d["by_type"]:

@@ -151,6 +151,22 @@ def verification(j, l, net, wr):
     return "accepted"
 
 
+def budget_view(caps):
+    """a worker's declared data budget as its donor sees it (numbers only), None if it declared none"""
+    b = caps.get("budget") if isinstance(caps, dict) else None
+    if not isinstance(b, dict): return None
+    num = lambda v: int(v) if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+    return {"down": num(b.get("down")), "up": num(b.get("up")),
+            "spent": [d for d in (b.get("spent") or []) if d in ("down", "up")], "reset": num(b.get("reset"))}
+
+
+def budget_paused(caps):
+    """the worker declared a spent data budget (upload: nothing new until the reset; download: only jobs whose inputs
+    it caches)"""
+    b = budget_view(caps)
+    return bool(b and b["spent"])
+
+
 def _expected(j):
     try: return round(float(jobs.get(j["type"]).lumens(json.loads(j["params"]))), 4)
     except Exception: return None
@@ -175,7 +191,8 @@ def me(S, w):
         workers.append({"id": x["id"], "name": x["name"], "registered": x["created"], "last_seen": x["last_seen"],
                         "gpu_name": scrub(caps.get("gpu_name", ""), 64), "cards": caps.get("cards"), "vram_gb": caps.get("vram_gb"),
                         "ram_gb": caps.get("ram_gb"), "disk_gb": caps.get("disk_gb"), "job_types": caps.get("job_types", []),
-                        "image": scrub(caps.get("image", ""), 128),
+                        "image": scrub(caps.get("image", ""), 128), "budget": budget_view(caps),
+                        "cached_inputs": (caps.get("cache") or {}).get("n") if isinstance(caps.get("cache"), dict) else None,
                         "trusted": bool(x["trusted"]), "verifier": bool(x["verifier"]), "quarantined": bool(x["quarantined"]),
                         "disabled": bool(x["disabled"]),
                         "quarantine_reason": scrub(x["quarantine_reason"]) if x["quarantined"] else None,

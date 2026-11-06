@@ -24,6 +24,7 @@ def outputs(p): return {"q-head.safetensors": Q.shard_cap(p, HEAD_PARAMS_MAX), *
 def shard(p): return "q-head.safetensors"
 def wfile(p): return "head.safetensors"
 def required_outputs(p): return Q.required(p, shard(p))
+def upload_bytes(p, sizes): return Q.upload_bytes(p, sizes, wfile(p), HEAD_PARAMS_MAX)
 
 
 def run(p, ctx):

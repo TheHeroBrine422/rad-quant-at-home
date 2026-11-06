@@ -110,6 +110,14 @@ def shard_cap(p, n_params):
     return 32 * 2 ** 20 + int(n_params * p["K"] / 8 * 1.05)
 
 
+def upload_bytes(p, sizes, wrel, n_params_max):
+    """expected upload: the shard (the bf16 weight file's parameters at K bits, plus scales and headers), proxy /
+    stamp / job / log files, and in replicate mode the per-row claim"""
+    w = sizes.get(f"{root(p)}/weights/{wrel}")
+    n = w // 2 if w else n_params_max
+    return int(n * float(p["K"]) / 8 * 1.02) + (1 << 20) + (0 if score_mode(p) else 4 << 20)
+
+
 LOG_CAP = 1 << 20
 SMALL = {"proxy.jsonl": 256 << 10, "stamp.json": 1 << 20, "job.json": 64 << 10, "ourq.log": LOG_CAP, "rowerr.npz": 16 << 20}
 

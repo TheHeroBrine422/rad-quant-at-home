@@ -32,6 +32,7 @@ def plan(p): return qwen.layer_plan(p["arch"], p["layer"])
 def inputs(p): return Q.inputs_for(p, plan(p), wfile(p))
 def outputs(p): return {shard(p): Q.shard_cap(p, LAYER_PARAMS_MAX), **Q.SMALL}
 def required_outputs(p): return Q.required(p, shard(p))
+def upload_bytes(p, sizes): return Q.upload_bytes(p, sizes, wfile(p), LAYER_PARAMS_MAX)
 
 
 def run(p, ctx):

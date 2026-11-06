@@ -28,9 +28,10 @@ import argparse, glob, hashlib, json, os, sys, time, urllib.error, urllib.reques
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.util import API, env
 
-UA = "rqah-cli/0.3"
+UA = "rqah-cli/0.4"
 LOCAL_ENV = ("GPU_NAME", "GPUS", "CARDS", "VRAM_GB", "RAM_GB", "CACHE_GB", "WINDOWS", "ON_STOP", "JOB_TYPES", "NAME",
-             "IMAGE_ID", "LEADERBOARD")
+             "IMAGE_ID", "LEADERBOARD", "MAX_DOWN_MBPS", "MAX_UP_MBPS", "MAX_DOWN_GB_DAY", "MAX_DOWN_GB_MONTH", "MAX_UP_GB_DAY",
+             "MAX_UP_GB_MONTH", "BUDGET_RESET_DAY")
 
 
 class Fail(Exception):
@@ -100,9 +101,33 @@ def local_jobs(a):
     return out
 
 
+def gb(n):
+    if n is None: return "unlimited"
+    return f"{n / 1e9:.2f} GB" if n >= 1e9 else f"{n / 1e6:.1f} MB"
+
+
+def budget_cell(w):
+    """the DATA column: what the worker declared it has left (after its running jobs' reservations)"""
+    b = w.get("budget")
+    if not b: return "-"
+    if "up" in b["spent"]: return "SPENT"
+    return " / ".join(f"{d} " + ("SPENT" if d in b["spent"] else gb(b[d]) if b[d] is not None else "-") for d in ("down", "up"))
+
+
+def local_budget(a):
+    """this machine's data budget (STATE/bandwidth.json, written by the worker), if readable"""
+    try: b = json.load(open(os.path.join(a.state or "/nonexistent", "bandwidth.json")))
+    except (OSError, ValueError): return None
+    lim = b.get("limits") or {}
+    if not any(v is not None for v in lim.values()): return {"limited": False, **{k: b.get(k) for k in ("day", "month")}}
+    return {"limited": True, "day": b.get("day"), "month": b.get("month"), "reset_day": b.get("reset_day"),
+            "used": {k: b.get(k, 0) for k in lim}, "limits": lim,
+            "spent": sorted({k.split("_")[0] for k, v in lim.items() if v is not None and v - b.get(k, 0) < (1 << 20)})}
+
+
 # ---------------------------------------------------------------- commands
 def cmd_status(a):
-    m = call(a, "GET", "me"); m["local"] = local_jobs(a)
+    m = call(a, "GET", "me"); m["local"] = local_jobs(a); m["local_budget"] = local_budget(a)
     if a.json: return m
     d = m["donor"]
     board = (f"on the leaderboard: #{d['rank']} of {d['on_board']}" if d["rank"] else
@@ -120,13 +145,27 @@ def cmd_status(a):
                                ("RUNNING", lambda w: ",".join(f"{r['job']}:{r['type']}" for r in w["running"]) or "-"),
                                ("COULD RUN", lambda w: w["could_run"] if w["could_run"] is not None else "-"),
                                ("LUMENS", lambda w: f"{w['lumens']:.2f}"),
+                               ("DATA LEFT", lambda w: budget_cell(w)),
                                ("FLAGS", lambda w: ",".join(k for k in ("trusted", "verifier", "quarantined", "disabled") if w[k]) or "-")]))
     for w in m["workers"]:
         if w["quarantined"]: print(f"\nworker {w['id']} is QUARANTINED: {w['quarantine_reason']} (ask the operator)")
+        b = w.get("budget")
+        if b and b["spent"]:
+            until = lt(b["reset"]) if b.get("reset") else "the next reset"
+            print(f"\nworker {w['id']}: data budget spent ({', '.join('download' if d == 'down' else 'upload' for d in b['spent'])}): "
+                  + ("only jobs whose inputs it already caches" if b["spent"] == ["down"] else "no new jobs") + f" until {until}; "
+                  "running jobs finish")
     q = m["queue"]["by_type"]
     print("\nqueue: " + ("; ".join(f"{t} {v['queued']} queued, {v['running']} running" for t, v in sorted(q.items())) or "empty"))
     if m["local"]:
         print("this machine: " + "; ".join(f"job {j['job']} ({j['type']}) {j['phase']} since {lt(j['since'])}" for j in m["local"]))
+    lb = m["local_budget"]
+    if lb and lb["limited"]:
+        parts = [f"{'download' if k.startswith('down') else 'upload'} {gb(lb['used'][k])} of {gb(v)} "
+                 + ("today" if k.endswith("_day") else "this month")
+                 for k, v in sorted(lb["limits"].items()) if v is not None]
+        print(f"data budget (this machine): {'; '.join(parts)} (day {lb['day']}, month from {lb['month']})"
+              + (f" -- SPENT: {', '.join(lb['spent'])}" if lb["spent"] else ""))
     return None
 
 

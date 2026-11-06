@@ -3,6 +3,7 @@
 Times are US Central (CST). Sections 1-7: v0 (w13 / w13b, 2026-11-04; they use the v0 names `rxm-queue`, `RXMQ_*`,
 `RXMW_*`, `rxmq`). Section 8: v0.2 (w24, 2026-11-05). Section 9: the donor CLI and the public status page (w25,
 2026-11-05). Sections 10-12: 0.3 (w47, 2026-11-06): verification by score, small cards, the CUDA image, the rename.
+Section 13: 0.4 (w57, 2026-11-06): bandwidth limits and the scheduling rules.
 Older sections describe the code and names of their time (the project lived in rad-exl3-mix's `volunteer/` and was
 called `radquant` until 0.3; the environment names in them were updated to `RQAH_*`). Machines: the VM (noop
 end-to-end, the server container, image builds), an RTX 4070 test box (the real quantizer runs, CPU checks), the
@@ -466,3 +467,65 @@ docker run --rm --gpus all --entrypoint python rad-quant-at-home-worker:cuda -c 
 MODE=docker WORK=/tmp/rqah-smoke CKPT=<Qwen3.5-0.8B dir> HESS=<its calib Hessians> IMAGE=rad-quant-at-home-worker:cuda \
   tests/cuda_smoke.sh                                 # expects "SMOKE PASS"; the host needs python3 + numpy for the server
 ```
+
+## 13. Bandwidth limits and scheduling (0.4, w57, 2026-11-06)
+
+All on the VM, no GPU (noop jobs); the server and workers ran as processes on localhost.
+
+| suite | when (CST) | result |
+|---|---|---|
+| `tests/e2e_noop.py`, 0.3 code (baseline before the changes) | 4:16-4:20 PM | **108/108** |
+| `tests/score_test.py`, `tests/statuspage_test.py`, 0.3 code | 4:16 PM | **31/31**, **19/19** |
+| `tests/sched_test.py` (new; in process, ~5 s) | 4:48 PM | **26/26** |
+| `tests/bandwidth_e2e.py` (new; ~2 min) | 4:41-4:43 PM | **22/22** |
+| `tests/e2e_noop.py`, server as a process, 0.4 code | 4:38-4:41 PM | **108/108** (one test fixed, below) |
+| same, server as the container (`rad-quant-at-home-server:0.4.0`, `--worktree`, 6 s build) | 4:44-4:48 PM | **115/115** |
+| `tests/score_test.py`, `tests/statuspage_test.py`, 0.4 code | 4:48 PM | **31/31**, **19/19** |
+
+**Rate caps** (`bandwidth_e2e.py`, `--max-down-mbps 2 --max-up-mbps 2`, i.e. 250,000 B/s). A noop job with a 7.5 MB
+input and a 7.5 MB output: fetch **29.77 s**, upload **29.77 s** (30 s expected, ±10% allowed; two runs: 29.76 /
+29.77 s). A Range-resumed fetch with half of the blob already in `<sha>.part`: 3,750,000 B in **14.76 s** (15 s). The
+bucket alone: 500 kB in 1.75 s (2 s minus the quarter-second burst). The worker paces its reads from the socket and
+the bytes it hands to it, so the link sees the cap after the first TCP window.
+
+**Budgets.** The counters, with a fake clock (TZ America/Chicago, reset day 15): the tighter of day and month; kept
+across instances; the next reset is local midnight when the day is spent, the 15th when the month is; a new day and a
+new budget month zero their counters; January 14 still counts in the month that began December 15. Running jobs'
+reservations come off the declared budget. End to end: with `--max-down-gb-day 0.0025` and four noop jobs with
+distinct 1 MB inputs, the worker was SIGKILLed after its first job. Its `bandwidth.json` held 1,000,000 B. Restarted,
+it took exactly **one** more job (2,000,000 B counted; 0.5 MB left is below the 1 MiB "spent" floor), then got
+`over_budget` from the server for the other two, logged "data budget spent (download) ... until <local midnight>"
+and idled out. `rqah status` shows the DATA LEFT column, the spent note and this machine's counters (`--json`:
+`workers[].budget`, `local_budget`). The status page shows "1 workers at their data cap until it resets". A job whose
+input was already cached still ran on the spent download budget (0 B down). `--max-up-gb-month 0.0025
+--budget-reset-day 5` with three 1 MB outputs: two uploaded (2,002,000 B counted), month key `...-05`, the third
+stayed queued.
+
+**Scheduler** (`sched_test.py`, `Queue.lease` in process):
+- `level_priority`: 3 → 40, 2.5 → 30, 2.25 → 20, 2.125 → 10, 2.0625 → 5, finer → 0, plus the boost.
+- `enqueue-level` on a fake datapack gives the same, with heads +1 and `--priority-boost`.
+- `reprioritize 'q-k2.*' --by-granularity --priority-boost 1` changes only the matching levels, and `--dry-run`
+  changes nothing. `--priority 7` leaves an accepted job alone, and a pattern that matches nothing is an error.
+- Classes strictly in order, and inside a class whole levels first: with ids interleaved A1 B1 A2 B2 A3, the
+  workers got A1 A2 A3 B1 B2.
+- Cache affinity inside a level: a cached A3 came before A1 and A2, B came after A, and a cached lower-class job came
+  last. A budgeted worker got the least download first.
+- Budget filter: only the cached job fit a 5000 B download budget. Otherwise the answer was `over_budget` with a
+  ≥ 60 s retry. An upload budget 1 byte short of a job's expected upload refused that job.
+- Randomized: 250 lease requests against 300 random jobs with random budgets and cache sets. 231 granted, 19 refused,
+  and **no grant over budget**. Every `expect` equalled the true uncached download and the upload.
+- Cache report protocol: an unknown rev → `cache_unknown`, the list is stored, the stored caps keep only the rev and
+  count, and after a restart the rev is unknown again.
+- Class-wait drain: a fresh higher-class job that does not fit now lets a lower-class job through. Aged past
+  `--class-wait-s`, it drains the worker (reservation), the worker gets nothing while draining, and it gets the job
+  once the room is free. An aged job does not drain a worker for work of its own class, nor for a job over the
+  worker's budget.
+- Lease cost: 29 ms per request with 5000 queued jobs in one class, 36 ms with a 1000-entry cache report and a
+  budget.
+
+**Changed test.** `e2e_noop.py`'s disk-cap scenario queued inputs a, b, c, a in one level and expected two evictions
+(FIFO). With cache affinity, the worker takes the second `a` job right after the first, because it holds that input,
+so only one eviction happened. The four jobs now get one level each, which keeps FIFO order and the two evictions.
+`bandwidth_e2e.py` checks the affinity itself with a real worker: jobs m1, m2, m1 of one level ran as m1, m1, m2, with
+1,000,000 / 0 / 1,000,000 B downloaded.
+

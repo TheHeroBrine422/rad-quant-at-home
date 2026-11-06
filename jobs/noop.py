@@ -30,6 +30,7 @@ def requires(p, info=None):
 def lumens(p): return round(0.1 + p["seconds"] / 60, 3)
 def inputs(p): return list(p.get("inputs", [])), []
 def outputs(p): return {"out.bin": p["size"]}
+def upload_bytes(p, sizes): return p["size"]
 def required_outputs(p): return {"out.bin"}
 
 
