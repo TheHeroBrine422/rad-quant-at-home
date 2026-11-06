@@ -11,7 +11,7 @@
 # from RXM_COMMIT unless RXM_WORKTREE=1.
 #
 # Env: RXM_REPO (default ../rad-exl3-mix next to this repo), RXM_COMMIT, IMAGE_REPO (default rad-quant-at-home-worker,
-# e.g. docker.io/<hub-user>/rad-quant-at-home-worker), VERSION (default ./VERSION), DOCKER (default docker),
+# e.g. ghcr.io/theherobrine422/rad-quant-at-home-worker), VERSION (default ./VERSION), DOCKER (default docker),
 # RADIANCE_IMAGE (rocm: the radiance image of our fork's qc-exl3-v3 branch), BUILD_ARGS (extra --build-arg ..., e.g.
 # "--build-arg TORCH_CUDA_ARCH=8.9 --build-arg MAX_JOBS=2" for a quick test build), DOCKER_BUILD_FLAGS.
 # Tags:
@@ -19,7 +19,7 @@
 #   $IMAGE_REPO:$VERSION-<variant>  e.g. 0.3.0-rocm                           moves with rebuilds of the same version
 #   $IMAGE_REPO:<variant>           e.g. rocm, cuda                           latest release of that variant
 #   $IMAGE_REPO:<variant>-<commit>[-rxm<commit>]                              the exact source commits
-# Publishing is a separate, manual step (README "Publishing the worker images"); this script never pushes.
+# Publishing is a separate, manual step (README "Publishing images (maintainer)"); this script never pushes.
 set -euo pipefail
 VAR=${1:-rocm}; R=$(cd "$(dirname "$0")/.." && pwd)
 RXM=${RXM_REPO:-$(cd "$R/.." && pwd)/rad-exl3-mix}

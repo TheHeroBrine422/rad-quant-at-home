@@ -18,10 +18,11 @@ the command line is `rad-quant-at-home` with the alias `rqah`, the environment i
 0.3 still reads the 0.2 variables `RADQUANT_*` (with a deprecation note); the v0 names `RXMQ_*` / `RXMW_*` are gone.
 
 Status: built and tested on CPU with fakes standing in for the GPU, and with real quantizer runs on an RTX 4070
-(TESTS.md). **Not deployed**: nothing listens beyond localhost, no image is published. Open: the Docker Hub namespace
-(`<hub-user>` placeholders), the server host and its volumes, the worker image builds (CUDA: its steps were built and
-run on the 4070 without Docker, `tests/cuda_rootfs.sh`, but the Docker build needs a host with ≥ 8 GB of free RAM per
-compile job; ROCm: with radiance inside), `docker run --gpus` on an NVIDIA host, and one real R9700 job of each type.
+(TESTS.md). **Not deployed**: nothing listens beyond localhost, no image is published. Open: publishing the images on
+GHCR (public packages; pulling needs no login), the server host and its volumes, the worker image builds (CUDA: its
+steps were built and run on the 4070 without Docker, `tests/cuda_rootfs.sh`, but the Docker build needs a host with
+≥ 8 GB of free RAM per compile job; ROCm: with radiance inside), `docker run --gpus` on an NVIDIA host, and one real
+R9700 job of each type.
 
 What is new in 0.3:
 - **Verification by score** (docs/VERIFY.md): a quant result is accepted when its codes, decoded on the server with
@@ -56,7 +57,7 @@ docker run -d --name rad-quant-at-home --restart unless-stopped --device /dev/kf
   --security-opt seccomp=unconfined --security-opt no-new-privileges --cap-drop ALL --memory 40g --stop-timeout 900 \
   -v rqah-state:/var/lib/rqah -v /etc/localtime:/etc/localtime:ro \
   -e RQAH_SERVER=https://<queue-url> -e RQAH_INVITE=<invite-code> -e RQAH_NAME=<name-for-the-leaderboard> \
-  docker.io/<hub-user>/rad-quant-at-home-worker:0.3.0-rocm7.14-gfx1201 --gpu-name r9700 --gpus 0 --vram-gb 32 --ram-gb 32 --cache-gb 200
+  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.3.0-rocm7.14-gfx1201 --gpu-name r9700 --gpus 0 --vram-gb 32 --ram-gb 32 --cache-gb 200
 ```
 
 NVIDIA (`--gpus all` hands the cards to the container; the worker's own `--gpus 0` picks among them):
@@ -66,7 +67,7 @@ docker run -d --name rad-quant-at-home --restart unless-stopped --gpus all \
   --security-opt no-new-privileges --cap-drop ALL --memory 24g --stop-timeout 900 \
   -v rqah-state:/var/lib/rqah -v /etc/localtime:/etc/localtime:ro \
   -e RQAH_SERVER=https://<queue-url> -e RQAH_INVITE=<invite-code> -e RQAH_NAME=<name-for-the-leaderboard> \
-  docker.io/<hub-user>/rad-quant-at-home-worker:0.3.0-cu128 --gpu-name rtx4070 --gpus 0 --vram-gb 12 --ram-gb 16 --cache-gb 50
+  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.3.0-cu128 --gpu-name rtx4070 --gpus 0 --vram-gb 12 --ram-gb 16 --cache-gb 50
 ```
 
 Declare the VRAM the worker may really use: a card that also drives your desktop has ~1 GB less (e.g. `--vram-gb 11`
@@ -623,18 +624,31 @@ RXM=/path/to/rad-exl3-mix STATE=... EXL3_SRC=... EXL3_PATH=... TORCH_EXT=... GPU
 A verifier (spot-check re-runs) is such a worker registered with `admin.py add-worker` and flagged
 `admin.py verifier ID`.
 
-### Publishing the worker images (you, on a host with Docker and ~40 GB free)
+### Publishing images (maintainer; a host with Docker and ~40 GB free)
+
+The images live on GHCR under `ghcr.io/theherobrine422/` as public packages, so donors pull them without a login.
+Pushing needs a classic GitHub token with `write:packages` (never stored in this repo or on a donor box):
+
+```bash
+echo $GHCR_TOKEN | docker login ghcr.io -u TheHeroBrine422 --password-stdin
+```
+
+Then build and push (below). After the first push of each image, in GitHub's package settings
+(github.com/TheHeroBrine422 > Packages > the image > Package settings): set the visibility to **public**, and link the
+package to this repository ("Connect repository"), so its page shows the source and the README.
+
+#### Worker images
 
 The build context is this repo at a commit plus the quantizer paths of a rad-exl3-mix checkout at a commit
 (`RXM_REPO`, default `../rad-exl3-mix`; `RXM_COMMIT`, default its HEAD): both are recorded in the image (`/opt/rqah/IMAGE`,
 labels).
 
 ```bash
-IMAGE_REPO=docker.io/<hub-user>/rad-quant-at-home-worker RXM_COMMIT=<rxm-commit> RADIANCE_IMAGE=radiance:<fork-commit> \
+IMAGE_REPO=ghcr.io/theherobrine422/rad-quant-at-home-worker RXM_COMMIT=<rxm-commit> RADIANCE_IMAGE=radiance:<fork-commit> \
   docker/build.sh rocm <commit>                      # never from --worktree
-IMAGE_REPO=docker.io/<hub-user>/rad-quant-at-home-worker RXM_COMMIT=<rxm-commit> docker/build.sh cuda <commit>
-docker image inspect docker.io/<hub-user>/rad-quant-at-home-worker:0.3.0-cu128 --format '{{json .Config.Labels}}'
-docker push docker.io/<hub-user>/rad-quant-at-home-worker --all-tags
+IMAGE_REPO=ghcr.io/theherobrine422/rad-quant-at-home-worker RXM_COMMIT=<rxm-commit> docker/build.sh cuda <commit>
+docker image inspect ghcr.io/theherobrine422/rad-quant-at-home-worker:0.3.0-cu128 --format '{{json .Config.Labels}}'
+docker push ghcr.io/theherobrine422/rad-quant-at-home-worker --all-tags
 ```
 
 The CUDA build compiles exllamav3 and the side extensions for `TORCH_CUDA_ARCH` (default `8.0;8.6;8.9;12.0`) with
@@ -647,8 +661,7 @@ Tags:
 - `rocm-<commit>-rxm<commit>`, `cuda-...`: the exact source commits.
 
 Bump `VERSION` with every release, and a job type's `VERSION` with any change of its meaning (above).
-Deploy the server first, then the new image. Before the first push, set the hub namespace in the default of
-`docker/worker/compose.yaml` (`RQAH_IMAGE`) and in the run line above. Run one real job with the built image on
+Deploy the server first, then the new image. Run one real job with the built image on
 our own R9700 first (`--max-jobs 1`). That checks the GPU flags and the read-only code paths, which no build host has
 exercised yet.
 
