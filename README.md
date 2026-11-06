@@ -316,7 +316,8 @@ type doesn't allow, a malformed eval_mix, a bad settings stamp. All were refused
 
 **What a worker can do to the server:** lease and finish jobs (as many at once as its slots, at most
 `--max-leases`), read only the files its own active leases list, upload only the declared outputs of its own leases
-within the caps (chunks ≤ 64 MB, JSON bodies ≤ 1 MB). A result is accepted only if its sha256 and size match and the
+within the caps (chunks ≤ 64 MB, JSON bodies ≤ 1 MB), declared by a non-negative `Content-Length`; a short body is
+truncated back to the acknowledged offset. A result is accepted only if its sha256 and size match and the
 type's structural check passes. Tokens are per worker, stored hashed, and can be disabled
 (`admin.py disable-worker ID`); a quarantined worker can no longer complete anything. With its token a donor reads
 its own donor's workers, jobs, lumens and events (`/api/v0/me...`), never another donor's, and writes only its

@@ -294,7 +294,6 @@ class Queue:
         p, cap = self._upload_target(w, job_id, lease_id, name)
         cur = os.path.getsize(p) if os.path.exists(p) else 0
         if offset != cur: raise HTTPError(409, "offset mismatch", size=cur)
-        if n > self.chunk_max: raise HTTPError(413, f"chunk too large (max {self.chunk_max} bytes)")
         if self.upload_max is not None: cap = min(cap, self.upload_max)
         if cur + n > cap: raise HTTPError(413, f"{name} over its cap of {cap} bytes")
         if self.spool_max is not None and self.spool_bytes() + n > self.spool_max:
@@ -305,7 +304,9 @@ class Queue:
                 b = rfile.read(min(left, 1 << 20))
                 if not b: break
                 f.write(b); left -= len(b)
-        if left: raise HTTPError(400, "short body", size=os.path.getsize(p))
+        if left:
+            os.truncate(p, cur)
+            raise HTTPError(400, "short body", size=cur)
         return {"size": cur + n}
 
     def spool_bytes(self):
@@ -440,9 +441,16 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in headers: self.send_header(k, v)
         self.end_headers(); self.wfile.write(b)
 
-    def _json(self, limit=JSON_MAX):
-        n = int(self.headers.get("Content-Length") or 0)
+    def _content_length(self, limit):
+        """the request body's declared length, refused when missing-but-required, negative or over the cap"""
+        try: n = int(self.headers.get("Content-Length") or 0)
+        except ValueError: raise HTTPError(400, "bad content-length")
+        if n < 0: raise HTTPError(400, "bad content-length")
         if n > limit: raise HTTPError(413, "body too large")
+        return n
+
+    def _json(self, limit=JSON_MAX):
+        n = self._content_length(limit)
         try:
             b = json.loads(self.rfile.read(n) or b"{}")
         except ValueError: raise HTTPError(400, "bad json")
@@ -491,10 +499,10 @@ class Handler(BaseHTTPRequestHandler):
                 if method == "GET": return self._send(200, Q.upload_size(w, job_id, lease_id, name))
                 if method == "PUT":
                     off = int(parse_qs(u.query).get("offset", ["0"])[0])
-                    return self._send(200, Q.upload(w, job_id, lease_id, name, off, int(self.headers.get("Content-Length") or 0), self.rfile))
+                    return self._send(200, Q.upload(w, job_id, lease_id, name, off, self._content_length(Q.chunk_max), self.rfile))
             raise HTTPError(404, "no such endpoint")
         except HTTPError as e:
-            if method == "PUT" and e.code != 200: self.close_connection = True    # unread body
+            if e.code != 200 and (method == "PUT" or e.msg == "bad content-length"): self.close_connection = True    # unread body
             self._send(e.code, {"error": e.msg, **e.extra})
         except (KeyError, ValueError, TypeError) as e:
             self.close_connection = True
