@@ -1,0 +1,6 @@
+runs: k2.5
+[PASS] the scorer's error equals ourq's logged proxy_err on every honest tensor (|ratio - 1| <= 2e-3) worst 1.64e-04
+[FAIL] honest seed spread at full size below the repeat tolerance (3%) max +nan
+scoring: 32.0 s per layer (mean of 1), max 32.0 s
+
+1/2 checks passed

@@ -1,0 +1,24 @@
+18:51:51 unit c: waiting for the lock
+18:59:24 unit c: lock held
+18:59:39 08 k2 K2 rc 0 13 tensors layer 6: 7s layer 7: 6s 
+18:59:50 08 k2.25 K2.25 rc 0 13 tensors layer 6: 6s layer 7: 3s 
+18:59:59 08 k2.5 K2.5 rc 0 13 tensors layer 6: 4s layer 7: 3s 
+19:00:07 08 k2.75 K2.75 rc 0 13 tensors layer 6: 4s layer 7: 3s 
+19:00:15 08 k3 K3 rc 0 13 tensors layer 6: 3s layer 7: 3s 
+19:00:23 08 k3.25 K3.25 rc 0 13 tensors layer 6: 4s layer 7: 3s 
+19:00:31 08 k3.5 K3.5 rc 0 13 tensors layer 6: 4s layer 7: 3s 
+19:00:38 08 k4 K4 rc 0 13 tensors layer 6: 3s layer 7: 3s 
+19:00:46 08 k3-s1 K3 rc 0 13 tensors layer 6: 3s layer 7: 3s 
+19:00:53 08 k3-s2 K3 rc 0 13 tensors layer 6: 3s layer 7: 3s 
+19:01:01 08 k3-s3 K3 rc 0 13 tensors layer 6: 3s layer 7: 3s 
+19:01:08 08 k3-s4 K3 rc 0 13 tensors layer 6: 3s layer 7: 3s 
+19:01:17 08 k2.5-s1 K2.5 rc 0 13 tensors layer 6: 4s layer 7: 3s 
+19:01:26 08 k2.5-s2 K2.5 rc 0 13 tensors layer 6: 4s layer 7: 3s 
+19:01:35 08 k2-wq K2 rc 0 13 tensors layer 6: 4s layer 7: 3s 
+19:01:44 08 att-retarget-k2 K3 rc 0 13 tensors layer 6: 3s layer 7: 3s 
+19:02:20 08 att-mul1 K3 rc 0 13 tensors layer 6: 3s layer 7: 3s 
+19:02:29 08 att-nohess K3 rc 0 13 tensors layer 6: 3s layer 7: 3s 
+19:04:17 27 l10-k2-s0 K2 rc 0 6 tensors layer 10: 107s 
+19:05:57 27 l10-k2-s1 K2 rc 0 6 tensors layer 10: 96s 
+19:07:43 27 l10-k2-s2 K2 rc 0 6 tensors layer 10: 103s 
+19:07:43 unit c: done, lock released

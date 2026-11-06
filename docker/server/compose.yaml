@@ -1,0 +1,93 @@
+# Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
+# The rad-quant-at-home queue server on a plain Linux host (README "Server container", RUNBOOK.md). Settings come from
+# .env next to this file (copy .env.example). Each *_DIR is a named volume by default; set it to a host path (with a /)
+# for a bind mount. Every RQAH_* setting also takes its 0.2 name RADQUANT_* (read in 0.3 only).
+#
+#   docker compose up -d                                  start (restarts on its own: unless-stopped)
+#   docker compose ps                                     health: "healthy" once /healthz answers
+#   docker compose exec server rqah admin list        admin commands inside the running container
+#   docker compose run --rm admin datapack ...            admin with read-write data (datapack, ladder-add, manifest, check)
+#   docker compose logs -f server; docker compose down    (down keeps the volumes; `down -v` deletes them)
+#
+# SELinux hosts (Fedora, RHEL, ...): set RQAH_SELINUX_RELABEL=1 so bind mounts get `:z` (shared container label;
+# it relabels the host dirs recursively). Without it the container cannot open its database there.
+#
+# Port: published on the host's loopback only by default. Put a TLS terminator / tunnel in front before anything
+# outside the host talks to it (the API is plain HTTP with bearer tokens).
+name: ${RQAH_PROJECT:-${RADQUANT_PROJECT:-rad-quant-at-home}}
+
+x-common: &common
+  image: ${RQAH_IMAGE:-${RADQUANT_IMAGE:-rad-quant-at-home-server:0.3.0}}
+  user: "${RQAH_UID:-${RADQUANT_UID:-10001}}:${RQAH_GID:-${RADQUANT_GID:-10001}}"
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  server:
+    <<: *common
+    command: ["serve"]
+    restart: unless-stopped
+    environment:
+      RQAH_LEASE_S: ${RQAH_LEASE_S:-${RADQUANT_LEASE_S:-120}}
+      RQAH_HEARTBEAT_S: ${RQAH_HEARTBEAT_S:-${RADQUANT_HEARTBEAT_S:-30}}
+      RQAH_RETRY_S: ${RQAH_RETRY_S:-${RADQUANT_RETRY_S:-30}}
+      RQAH_MAX_LEASES: ${RQAH_MAX_LEASES:-${RADQUANT_MAX_LEASES:-16}}
+      RQAH_CHUNK_MAX_MB: ${RQAH_CHUNK_MAX_MB:-${RADQUANT_CHUNK_MAX_MB:-64}}
+      RQAH_UPLOAD_MAX_MB: ${RQAH_UPLOAD_MAX_MB:-${RADQUANT_UPLOAD_MAX_MB:-0}}
+      RQAH_SPOOL_MAX_GB: ${RQAH_SPOOL_MAX_GB:-${RADQUANT_SPOOL_MAX_GB:-0}}
+      RQAH_ADMIN_TOKEN_FILE: ${RQAH_ADMIN_TOKEN_FILE:-${RADQUANT_ADMIN_TOKEN_FILE:-}}
+      RQAH_SEARCH_TOKEN_FILE: ${RQAH_SEARCH_TOKEN_FILE:-}
+      RQAH_SPOT_RATE: ${RQAH_SPOT_RATE:-0.04}
+      RQAH_SPOT_FIRST: ${RQAH_SPOT_FIRST:-1}
+      RQAH_SCORE_THREADS: ${RQAH_SCORE_THREADS:-0}         # 1: score score-mode quant results in the server (raise RQAH_MEM_LIMIT to 4g)
+      RQAH_GANG_WAIT_S: ${RQAH_GANG_WAIT_S:-0}
+      # the public status page (served at /); STATUS_DIR also writes it for a static host, e.g. /srv/rqah/out/status;
+      # CAMPAIGN defaults to campaign.json in the db directory
+      RQAH_STATUS_INTERVAL: ${RQAH_STATUS_INTERVAL:-60}
+      RQAH_STATUS_DIR: ${RQAH_STATUS_DIR:-}
+      RQAH_CAMPAIGN: ${RQAH_CAMPAIGN:-}
+      RQAH_RESERVE_MAX_S: ${RQAH_RESERVE_MAX_S:-21600}
+      RQAH_VERBOSE: ${RQAH_VERBOSE:-${RADQUANT_VERBOSE:-0}}
+    ports:
+      - "${RQAH_PUBLISH:-${RADQUANT_PUBLISH:-127.0.0.1:8740}}:8740"
+    volumes:
+      - ${RQAH_DB_DIR:-${RADQUANT_DB_DIR:-rqah-db}}:/srv/rqah/db${RQAH_SELINUX_RELABEL:+:z}
+      - ${RQAH_DATA_DIR:-${RADQUANT_DATA_DIR:-rqah-data}}:/srv/rqah/data:ro${RQAH_SELINUX_RELABEL:+,z}
+      - ${RQAH_OUT_DIR:-${RADQUANT_OUT_DIR:-rqah-out}}:/srv/rqah/out${RQAH_SELINUX_RELABEL:+:z}
+      - ${RQAH_SOURCES_DIR:-${RADQUANT_SOURCES_DIR:-rqah-sources}}:/srv/rqah/sources:ro${RQAH_SELINUX_RELABEL:+,z}
+      - ${RQAH_SECRETS_DIR:-${RADQUANT_SECRETS_DIR:-./secrets}}:/run/secrets/rqah:ro${RQAH_SELINUX_RELABEL:+,z}
+    healthcheck:
+      test: ["CMD", "python", "-I", "/opt/rqah/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      start_interval: 2s
+      retries: 3
+    stop_grace_period: 20s
+    mem_limit: ${RQAH_MEM_LIMIT:-${RADQUANT_MEM_LIMIT:-2g}}
+    pids_limit: 512
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
+  # one-off admin commands with read-write data: `docker compose run --rm admin COMMAND ...` (no network)
+  admin:
+    <<: *common
+    profiles: [admin]
+    entrypoint: ["rad-quant-at-home", "admin"]
+    network_mode: none
+    volumes:
+      - ${RQAH_DB_DIR:-${RADQUANT_DB_DIR:-rqah-db}}:/srv/rqah/db${RQAH_SELINUX_RELABEL:+:z}
+      - ${RQAH_DATA_DIR:-${RADQUANT_DATA_DIR:-rqah-data}}:/srv/rqah/data${RQAH_SELINUX_RELABEL:+:z}
+      - ${RQAH_OUT_DIR:-${RADQUANT_OUT_DIR:-rqah-out}}:/srv/rqah/out${RQAH_SELINUX_RELABEL:+:z}
+      - ${RQAH_SOURCES_DIR:-${RADQUANT_SOURCES_DIR:-rqah-sources}}:/srv/rqah/sources:ro${RQAH_SELINUX_RELABEL:+,z}
+    mem_limit: ${RQAH_ADMIN_MEM_LIMIT:-${RADQUANT_ADMIN_MEM_LIMIT:-8g}}
+    cpus: ${RQAH_ADMIN_CPUS:-${RADQUANT_ADMIN_CPUS:-8}}
+
+volumes:
+  rqah-db:
+  rqah-data:
+  rqah-out:
+  rqah-sources:

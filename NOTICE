@@ -1,0 +1,15 @@
+rad-quant-at-home
+Copyright 2026 Hero422
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+rad-quant-at-home donates compute to the rad-exl3-mix quantization project (https://github.com/TheHeroBrine422/rad-exl3-mix,
+Apache License 2.0): the worker images run that project's quantizer (quantize/ourq.py and its side extensions) at a
+pinned commit; its own NOTICE is copied into every image under /opt/rqah/rxm/NOTICE.
+
+- exllamav3 (https://github.com/turboderp-org/exllamav3), Copyright (c) 2025 Turboderp, MIT License (full text in
+  LICENSES/exllamav3-MIT.txt). checker/exl3dec.py is a numpy transcription of exllamav3's EXL3 trellis decode; the
+  worker images build exllamav3 at a pinned upstream commit with rad-exl3-mix's patch series.
+- radiance (https://codeberg.org/StillDeadcode/radiance), Copyright 2026 Deadcode and the radiance contributors,
+  Apache License 2.0: the ROCm worker image carries a radiance build (eval_mix, golden_record) with its own NOTICE;
+  common/radfile.py writes radiance's RAD2 container layout as rad-exl3-mix's mix/radmix.cpp does.

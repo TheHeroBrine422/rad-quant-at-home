@@ -1,0 +1,49 @@
+18:38:34 unit a: waiting for the lock
+18:39:01 unit a: lock held
+  K2-L39-k_proj:   model.language_model.layers.39.self_attn.k_proj              K2 proxy 1.364e-02 1.3s
+  K2-L39-v_proj:   model.language_model.layers.39.self_attn.v_proj              K2 proxy 3.052e-02 1.1s
+  K2-L39-q_proj:   model.language_model.layers.39.self_attn.q_proj              K2 proxy 9.041e-03 7.1s
+  K2-L39-o_proj:   model.language_model.layers.39.self_attn.o_proj              K2 proxy 3.128e-02 3.9s
+  K2-L10-in_proj_qkv:   model.language_model.layers.10.linear_attn.in_proj_qkv       K2 proxy 1.345e-02 6.0s
+  K2-L10-in_proj_z:   model.language_model.layers.10.linear_attn.in_proj_z         K2 proxy 6.397e-03 3.9s
+  K2-L10-out_proj:   model.language_model.layers.10.linear_attn.out_proj          K2 proxy 2.150e-02 4.0s
+  K2-L10-gate_proj:   model.language_model.layers.10.mlp.gate_proj                 K2 proxy 3.139e-02 10.0s
+  K2-L10-up_proj:   model.language_model.layers.10.mlp.up_proj                   K2 proxy 3.873e-02 9.9s
+  K2-L10-down_proj: refit_scales: OOM on the card, refit on the CPU
+  K2-L10-down_proj:   model.language_model.layers.10.mlp.down_proj                 K2 proxy 3.938e-02 61.7s
+  K4-L39-k_proj:   model.language_model.layers.39.self_attn.k_proj              K4 proxy 8.554e-04 1.1s
+  K4-L39-v_proj:   model.language_model.layers.39.self_attn.v_proj              K4 proxy 1.933e-03 1.1s
+  K4-L39-q_proj:   model.language_model.layers.39.self_attn.q_proj              K4 proxy 5.839e-04 6.6s
+  K4-L39-o_proj:   model.language_model.layers.39.self_attn.o_proj              K4 proxy 1.983e-03 3.6s
+  K4-L10-in_proj_qkv:   model.language_model.layers.10.linear_attn.in_proj_qkv       K4 proxy 8.473e-04 5.6s
+  K4-L10-in_proj_z:   model.language_model.layers.10.linear_attn.in_proj_z         K4 proxy 4.041e-04 3.5s
+  K4-L10-out_proj:   model.language_model.layers.10.linear_attn.out_proj          K4 proxy 1.358e-03 3.7s
+  K4-L10-gate_proj:   model.language_model.layers.10.mlp.gate_proj                 K4 proxy 1.989e-03 9.3s
+  K4-L10-up_proj:   model.language_model.layers.10.mlp.up_proj                   K4 proxy 2.459e-03 9.4s
+  K4-L10-down_proj: refit_scales: OOM on the card, refit on the CPU
+  K4-L10-down_proj:   model.language_model.layers.10.mlp.down_proj                 K4 proxy 2.517e-03 59.0s
+  K2-L10-down_proj-savewq: refit_scales: OOM on the card, refit on the CPU
+  K2-L10-down_proj-savewq:   model.language_model.layers.10.mlp.down_proj                 K2 proxy 3.938e-02 66.8s
+18:44:45 unit a: done, lock released
+18:45:25 unit b: waiting for the lock
+18:53:34 unit b: lock held
+  K6-L39-k_proj:   model.language_model.layers.39.self_attn.k_proj              K6 proxy 5.754e-05 2.6s
+  K6-L39-v_proj:   model.language_model.layers.39.self_attn.v_proj              K6 proxy 1.310e-04 2.1s
+  K6-L39-q_proj:   model.language_model.layers.39.self_attn.q_proj              K6 proxy 4.198e-05 14.5s
+  K6-L39-o_proj:   model.language_model.layers.39.self_attn.o_proj              K6 proxy 1.346e-04 7.7s
+  K6-L10-in_proj_qkv:   model.language_model.layers.10.linear_attn.in_proj_qkv       K6 proxy 5.745e-05 11.8s
+  K6-L10-in_proj_z:   model.language_model.layers.10.linear_attn.in_proj_z         K6 proxy 2.764e-05 7.1s
+  K6-L10-out_proj:   model.language_model.layers.10.linear_attn.out_proj          K6 proxy 9.214e-05 7.4s
+  K6-L10-gate_proj:   model.language_model.layers.10.mlp.gate_proj                 K6 proxy 1.348e-04 19.4s
+  K6-L10-up_proj:   model.language_model.layers.10.mlp.up_proj                   K6 proxy 1.662e-04 19.4s
+18:55:52 unit b: done, lock released
+18:56:57 unit d: waiting for the lock
+19:19:45 unit d: lock held
+  K3-L10-down_proj: refit_scales: OOM on the card, refit on the CPU
+  K3-L10-down_proj:   model.language_model.layers.10.mlp.down_proj                 K3 proxy 9.869e-03 63.6s
+  K5-L10-down_proj: refit_scales: OOM on the card, refit on the CPU
+  K5-L10-down_proj:   model.language_model.layers.10.mlp.down_proj                 K5 proxy 6.505e-04 63.8s
+  K6-L10-down_proj-smallws: refit_scales: OOM on the card, refit on the CPU
+  K6-L10-down_proj-smallws:   model.language_model.layers.10.mlp.down_proj                 K6 proxy 1.705e-04 72.4s
+  K8-L39-q_proj:   model.language_model.layers.39.self_attn.q_proj              K8 proxy 1.512e-05 8.1s
+19:24:25 unit d: done, lock released

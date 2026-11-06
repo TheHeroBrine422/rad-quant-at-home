@@ -1,0 +1,21 @@
+runs: att-mul1 att-nohess att-retarget-k2 k2 k2-wq k2.25 k2.5 k2.5-s1 k2.5-s2 k2.75 k3 k3-s1 k3-s2 k3-s3 k3-s4 k3.25 k3.5 k4
+[PASS] K3 level, first result per layer: provisional (no reference yet), an anchor re-run queued 
+[PASS] anchored by the verifier's re-run (another seed): every K3 result passes on the repeat basis ['pass', 'pass']
+[PASS] honest repeats (seeds 2-4, other donors): all pass ['pass', 'pass', 'pass', 'pass', 'pass', 'pass']
+  honest K3 spread over seeds (max/min - 1): in_proj_qkv@L6 +0.0184, in_proj_z@L6 +0.0411, out_proj@L6 +0.0025, down_proj@L6 +0.0029, gate_proj@L6 +0.0073, up_proj@L6 +0.0043, down_proj@L7 +0.0016, gate_proj@L7 +0.0089, up_proj@L7 +0.0036, k_proj@L7 +0.0125, o_proj@L7 +0.0042, q_proj@L7 +0.0341, v_proj@L7 +0.0110
+[PASS] honest levels in ladder order (K 2.5, 3.5, 2, 4, 2.25, 2.75, 3.25) all pass on the curve {2.5: ['pass', 'pass'], 3.5: ['pass', 'pass'], 2: ['pass', 'pass'], 4: ['pass', 'pass'], 2.25: ['pass', 'pass'], 2.75: ['pass', 'pass'], 3.25: ['pass', 'pass']} bases {2.5: ['interp'], 3.5: ['interp'], 2: ['extrap'], 4: ['extrap'], 2.25: ['interp'], 2.75: ['interp'], 3.25: ['interp']}
+[PASS] honest repeat k2.5-s1: pass ['pass', 'pass']
+[PASS] honest repeat k2.5-s2: pass ['pass', 'pass']
+[PASS] the scorer's error equals ourq's logged proxy_err on every honest tensor (|ratio - 1| <= 2e-3) worst 1.15e-04
+  honest K3 total rel per layer: {6: 0.0033, 7: 0.00237}
+[PASS] attack retarget-k2 (K3 codes of the K2 dequantized weights): fail ['fail', 'fail'] total rel [0.016298511712126006, 0.01176447875407865]
+  (info) mul1 codes declared i8: ['pass', 'pass'], total rel [0.0033335204624146617, 0.0023956282758984242] vs honest [0.0033039454370173385, 0.0023715668598923937]: judged on their quality as i8 codes, which is what the kernel will decode
+[PASS] attack Hessian ignored (sigma_reg 1.0): fail ['fail', 'fail'] total rel [0.003562331780053439, 0.0025907485758794634]
+[PASS] attack 1% of one tensor's trellis words changed: fail ['fail', 'fail'] total rel [0.010802670583672114, 0.0023745490869361667]
+[PASS] attack random codes: fail ['fail', 'fail'] total rel [1.4222332601417087, 1.3052640199491623]
+[PASS] attack K2 codes padded to the K3 shape: fail ['fail', 'fail'] total rel [9.429619814674682, 7.121237095486406]
+[PASS] attack a K2.75 shard declared K3 (lower K, honest codes): fail ['fail', 'fail'] total rel [None, None]
+[PASS] every K3 result of the honest donors and the verifier is still accepted after the attacks 
+scoring: 1.6 s per layer (mean of 16), max 2.2 s
+
+14/14 checks passed

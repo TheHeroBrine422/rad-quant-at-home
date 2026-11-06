@@ -1,0 +1,82 @@
+# Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
+# The rad-quant-at-home donor worker image, NVIDIA (CUDA 12.8): quantization jobs only (quant_layer, quant_head; our
+# eval kernels have no CUDA path, so there is no radiance here and the server never leases eval_mix / golden_record to
+# it: the worker declares its job types). Same code, same quantizer and patch series as Dockerfile.rocm; the stack is
+# the one our RTX 4070 test box runs (torch 2.11.0+cu128).
+#
+# Build with docker/build.sh cuda (context: app/ = this repo, rxm/ = the quantizer paths of rad-exl3-mix). The host
+# needs the NVIDIA driver (>= 570 for CUDA 12.8) and the NVIDIA Container Toolkit (`docker run --gpus ...`).
+# TORCH_CUDA_ARCH: compute capabilities compiled in (8.0 A100, 8.6 RTX 30xx / A-series, 8.9 RTX 40xx / L4, 12.0
+# RTX 50xx); exllamav3's kernels need 8.0 or newer. One arch (e.g. 8.9) builds ~4x faster for tests.
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+ARG CUDA_IMAGE
+ARG TORCH_SPEC="torch==2.11.0"
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+# exllamav3's run-time requirements (requirements.txt at a3bfbfd0), pinned as on our quantization boxes
+# (rad-exl3-mix quantize/exllamav3-environment.txt)
+ARG PY_DEPS="numpy==2.5.4 safetensors==0.8.0 ninja==1.13.2 tokenizers==0.23.3 rich==15.0.0 typing_extensions==4.16.0 \
+pillow==13.0.0 PyYAML==6.0.3 marisa-trie==1.4.1 pydantic==2.14.2 llguidance==1.9.1"
+ARG EXL3_REPO=https://github.com/turboderp-org/exllamav3
+ARG EXL3_COMMIT=a3bfbfd0
+ARG TORCH_CUDA_ARCH="8.0;8.6;8.9;12.0"
+ARG MAX_JOBS=8
+ARG VERSION=0.0.0-dev
+ARG REPO_COMMIT=unknown
+ARG RXM_COMMIT=unknown
+ARG IMAGE_TAG=rad-quant-at-home-worker:dev
+ARG SOURCE=https://github.com/TheHeroBrine422/rad-quant-at-home
+ARG CREATED=unknown
+
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv python3-dev git ninja-build ca-certificates \
+ && rm -rf /var/lib/apt/lists/* && python3 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+RUN pip install --no-cache-dir --index-url ${TORCH_INDEX} "${TORCH_SPEC}" \
+ && pip install --no-cache-dir ${PY_DEPS}
+
+COPY rxm /opt/rqah/rxm
+# exllamav3 at the pinned upstream commit + our patch series (rad-exl3-mix quantize/exl3-patches/README.md)
+RUN git clone ${EXL3_REPO} /opt/rqah/exllamav3 && cd /opt/rqah/exllamav3 && git checkout ${EXL3_COMMIT} \
+ && git -c user.name=build -c user.email=build@localhost am /opt/rqah/rxm/quantize/exl3-patches/000*.patch \
+ && TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH}" MAX_JOBS=${MAX_JOBS} python setup.py build_ext --inplace \
+ && rm -rf build .git
+# the side extensions ourq.py --qtf2 / --codebook build at run time (rxm/v3/e3/exl3frac2, exl3cb, exl3frac): compiled
+# now (no GPU needed), so donors never wait for nvcc and never compile; a failure fails the build
+ENV PYTHONPATH=/opt/rqah/exllamav3 TORCH_EXTENSIONS_DIR=/opt/rqah/torch_ext TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH}" \
+    MAX_JOBS=${MAX_JOBS} PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+COPY app /opt/rqah/app
+RUN python /opt/rqah/app/docker/warm.py /opt/rqah/rxm /opt/rqah/exllamav3/exllamav3/exllamav3_ext \
+ && python -c "import exllamav3.modules.quant.exl3_lib.quantize" \
+ && find /opt/rqah/torch_ext -name '*.o' -delete
+
+# the donor CLI (client/rqah.py): `docker exec rad-quant-at-home rqah status`
+RUN printf '#!/bin/sh\nexec python -I /opt/rqah/app/client/rqah.py "$@"\n' > /usr/local/bin/rad-quant-at-home \
+ && chmod 0755 /usr/local/bin/rad-quant-at-home && ln -s rad-quant-at-home /usr/local/bin/rqah \
+ && echo "rad-quant-at-home-worker ${VERSION} cuda ${TORCH_CUDA_ARCH} repo ${REPO_COMMIT} rad-exl3-mix ${RXM_COMMIT} exllamav3 ${EXL3_COMMIT}" > /opt/rqah/IMAGE \
+ && (userdel -r ubuntu 2>/dev/null || true) && useradd -u 10001 -m rqah && mkdir -p /var/lib/rqah && chown rqah /var/lib/rqah \
+ && chmod -R a-w /opt/rqah && chmod -R u+w /opt/rqah/torch_ext && chown -R rqah /opt/rqah/torch_ext
+# code read-only; torch's extension loader takes a lock file in TORCH_EXTENSIONS_DIR on every load, so that directory
+# stays writable by the worker user
+ENV RQAH_STATE=/var/lib/rqah RQAH_TOKEN_FILE=/var/lib/rqah/token RQAH_IMAGE_ID="${IMAGE_TAG}+${REPO_COMMIT}" \
+    RQAH_GPU_ENV=CUDA_VISIBLE_DEVICES
+LABEL org.opencontainers.image.title="rad-quant-at-home-worker" \
+      org.opencontainers.image.description="rad-quant-at-home donor worker: EXL3 quantization jobs (CUDA)" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.documentation="${SOURCE}/blob/main/README.md" \
+      org.opencontainers.image.revision="${REPO_COMMIT}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.licenses="Apache-2.0 AND MIT" \
+      org.opencontainers.image.base.name="${CUDA_IMAGE}" \
+      io.github.rad-quant-at-home.rad-exl3-mix_commit="${RXM_COMMIT}" \
+      io.github.rad-quant-at-home.exllamav3_commit="${EXL3_COMMIT}" io.github.rad-quant-at-home.torch="${TORCH_SPEC}" \
+      io.github.rad-quant-at-home.cuda_arch="${TORCH_CUDA_ARCH}"
+USER rqah
+VOLUME /var/lib/rqah
+# every path a job uses is fixed here (they enter ourq.py's code stamp); the donor adds the queue URL, the token and the
+# caps: --gpu-name, --gpus / --cards, --vram-gb, --ram-gb, --cache-gb, --window, --vram-cap-gb
+ENTRYPOINT ["python", "-I", "/opt/rqah/app/worker/worker.py", "--state", "/var/lib/rqah", \
+            "--ourq", "/opt/rqah/rxm/quantize/ourq.py", "--exl3-src", "/opt/rqah/exllamav3/exllamav3/exllamav3_ext", \
+            "--env", "PYTHONPATH=/opt/rqah/exllamav3", "--env", "TORCH_EXTENSIONS_DIR=/opt/rqah/torch_ext", \
+            "--env", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", \
+            "--python", "/opt/venv/bin/python", "--job-types", "noop,quant_layer,quant_head,quant_tensor"]

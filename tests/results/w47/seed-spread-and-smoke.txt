@@ -1,0 +1,42 @@
+K3 in_proj_qkv  L 6 n    6.29M  seeds 5  range 0.0182  sd 0.0073  sd*sqrt(n)   18.4
+K3 in_proj_z    L 6 n    2.10M  seeds 5  range 0.0403  sd 0.0166  sd*sqrt(n)   24.1
+K3 out_proj     L 6 n    2.10M  seeds 5  range 0.0025  sd 0.0010  sd*sqrt(n)    1.5
+K3 down_proj    L 6 n    3.67M  seeds 5  range 0.0029  sd 0.0012  sd*sqrt(n)    2.2
+K3 gate_proj    L 6 n    3.67M  seeds 5  range 0.0073  sd 0.0030  sd*sqrt(n)    5.7
+K3 up_proj      L 6 n    3.67M  seeds 5  range 0.0043  sd 0.0016  sd*sqrt(n)    3.0
+K3 down_proj    L 7 n    3.67M  seeds 5  range 0.0016  sd 0.0006  sd*sqrt(n)    1.2
+K3 gate_proj    L 7 n    3.67M  seeds 5  range 0.0088  sd 0.0033  sd*sqrt(n)    6.3
+K3 up_proj      L 7 n    3.67M  seeds 5  range 0.0036  sd 0.0014  sd*sqrt(n)    2.7
+K3 k_proj       L 7 n    0.52M  seeds 5  range 0.0124  sd 0.0045  sd*sqrt(n)    3.3
+K3 o_proj       L 7 n    2.10M  seeds 5  range 0.0041  sd 0.0016  sd*sqrt(n)    2.3
+K3 q_proj       L 7 n    4.19M  seeds 5  range 0.0335  sd 0.0127  sd*sqrt(n)   25.9
+K3 v_proj       L 7 n    0.52M  seeds 5  range 0.0110  sd 0.0043  sd*sqrt(n)    3.1
+sd*sqrt(n): median 3.1, max 25.9 over 13 tensors
+K2 in_proj_qkv  L10 n   52.43M  seeds 3  range 0.0002  sd 0.0001  sd*sqrt(n)    0.8
+K2 in_proj_z    L10 n   31.46M  seeds 3  range 0.0002  sd 0.0001  sd*sqrt(n)    0.5
+K2 out_proj     L10 n   31.46M  seeds 3  range 0.0010  sd 0.0005  sd*sqrt(n)    2.9
+K2 down_proj    L10 n   89.13M  seeds 3  range 0.0002  sd 0.0001  sd*sqrt(n)    1.1
+K2 gate_proj    L10 n   89.13M  seeds 3  range 0.0001  sd 0.0000  sd*sqrt(n)    0.4
+K2 up_proj      L10 n   89.13M  seeds 3  range 0.0001  sd 0.0001  sd*sqrt(n)    0.7
+sd*sqrt(n): median 0.8, max 2.9 over 6 tensors
+2026-11-06T19:54:56Z rootfs: checking the side extensions (compiled only if the tree moved)
+2026-11-06T19:55:01Z rootfs: extensions ready in 5 s
+2026-11-06T19:55:01Z waiting for the GPU lock
+2026-11-06T20:01:20Z lock held
+2026-11-06T20:01:25Z donor worker: rc 0 in 5 s
+2026-11-06T20:01:30Z verifier worker: rc 0 in 3 s
+2026-11-06T20:01:30Z lock released
+    1 quant_tensor L06   accepted  att 1/5 lvl smoke-k3     by 1 chk pass 
+    2 quant_tensor L06   queued    att 0/5 lvl smoke-k3     by - chk - 
+    3 quant_tensor L06   queued    att 0/5 lvl smoke-k3     by - chk - 
+    4 quant_tensor L06   queued    att 0/5 lvl smoke-k3     by - chk - 
+    5 quant_tensor L06   accepted  att 1/5 lvl -            by 2 chk pass 
+5 jobs
+     1 job     1 donor     K3      layers.6.linear_attn.in_proj_qkv           rel 3.7523e-03 pass        repeat  bound 4.0157e-03 39ea098985
+     2 job     1 donor     K3      layers.6.linear_attn.in_proj_z             rel 1.9837e-03 pass        repeat  bound 2.1987e-03 c5b9ae2102
+     3 job     5 trusted   K3      layers.6.linear_attn.in_proj_qkv           rel 3.7523e-03 pass        -       bound 0.0000e+00 39ea098985
+     4 job     5 trusted   K3      layers.6.linear_attn.in_proj_z             rel 1.9837e-03 pass        -       bound 0.0000e+00 c5b9ae2102
+   1 donor                          0.55 lumens      1 jobs 
+   2 verifier                       0.00 lumens      0 jobs V
+2026-11-06T20:01:33Z peak VRAM per process (MiB): 425268:1114 425450:1212 
+2026-11-06T20:01:33Z SMOKE PASS: the donor's job and its anchor re-run accepted and passed by score

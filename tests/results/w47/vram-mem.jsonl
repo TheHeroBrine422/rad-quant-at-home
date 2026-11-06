@@ -1,0 +1,36 @@
+{"tag": "K2-L39-k_proj", "status": "ok", "wall_s": 2.7, "cap_gb": 7.2, "peak_alloc_gb": 1.62, "peak_reserved_gb": 1.762, "peak_rss_gb": 1.754}
+{"tag": "K2-L39-v_proj", "status": "ok", "wall_s": 2.0, "cap_gb": 7.2, "peak_alloc_gb": 1.62, "peak_reserved_gb": 1.762, "peak_rss_gb": 1.759}
+{"tag": "K2-L39-q_proj", "status": "ok", "wall_s": 8.1, "cap_gb": 7.2, "peak_alloc_gb": 3.309, "peak_reserved_gb": 3.482, "peak_rss_gb": 1.864}
+{"tag": "K2-L39-o_proj", "status": "ok", "wall_s": 5.1, "cap_gb": 7.2, "peak_alloc_gb": 2.442, "peak_reserved_gb": 2.621, "peak_rss_gb": 1.917}
+{"tag": "K2-L10-in_proj_qkv", "status": "ok", "wall_s": 7.1, "cap_gb": 7.2, "peak_alloc_gb": 2.977, "peak_reserved_gb": 3.15, "peak_rss_gb": 1.848}
+{"tag": "K2-L10-in_proj_z", "status": "ok", "wall_s": 5.0, "cap_gb": 7.2, "peak_alloc_gb": 2.313, "peak_reserved_gb": 2.504, "peak_rss_gb": 1.806}
+{"tag": "K2-L10-out_proj", "status": "ok", "wall_s": 5.3, "cap_gb": 7.2, "peak_alloc_gb": 2.442, "peak_reserved_gb": 2.621, "peak_rss_gb": 1.916}
+{"tag": "K2-L10-gate_proj", "status": "ok", "wall_s": 11.1, "cap_gb": 7.2, "peak_alloc_gb": 3.768, "peak_reserved_gb": 4.145, "peak_rss_gb": 1.915}
+{"tag": "K2-L10-up_proj", "status": "ok", "wall_s": 11.0, "cap_gb": 7.2, "peak_alloc_gb": 3.768, "peak_reserved_gb": 4.145, "peak_rss_gb": 1.909}
+{"tag": "K2-L10-down_proj", "status": "ok", "wall_s": 63.9, "cap_gb": 7.2, "peak_alloc_gb": 6.237, "peak_reserved_gb": 6.586, "peak_rss_gb": 9.614}
+{"tag": "K4-L39-k_proj", "status": "ok", "wall_s": 2.4, "cap_gb": 7.2, "peak_alloc_gb": 0.864, "peak_reserved_gb": 1.0, "peak_rss_gb": 1.756}
+{"tag": "K4-L39-v_proj", "status": "ok", "wall_s": 2.0, "cap_gb": 7.2, "peak_alloc_gb": 0.864, "peak_reserved_gb": 1.0, "peak_rss_gb": 1.757}
+{"tag": "K4-L39-q_proj", "status": "ok", "wall_s": 7.6, "cap_gb": 7.2, "peak_alloc_gb": 2.553, "peak_reserved_gb": 2.74, "peak_rss_gb": 1.866}
+{"tag": "K4-L39-o_proj", "status": "ok", "wall_s": 4.8, "cap_gb": 7.2, "peak_alloc_gb": 1.686, "peak_reserved_gb": 1.859, "peak_rss_gb": 1.912}
+{"tag": "K4-L10-in_proj_qkv", "status": "ok", "wall_s": 6.7, "cap_gb": 7.2, "peak_alloc_gb": 2.221, "peak_reserved_gb": 2.389, "peak_rss_gb": 1.84}
+{"tag": "K4-L10-in_proj_z", "status": "ok", "wall_s": 4.4, "cap_gb": 7.2, "peak_alloc_gb": 1.557, "peak_reserved_gb": 1.742, "peak_rss_gb": 1.804}
+{"tag": "K4-L10-out_proj", "status": "ok", "wall_s": 4.8, "cap_gb": 7.2, "peak_alloc_gb": 1.686, "peak_reserved_gb": 1.859, "peak_rss_gb": 1.916}
+{"tag": "K4-L10-gate_proj", "status": "ok", "wall_s": 10.4, "cap_gb": 7.2, "peak_alloc_gb": 3.012, "peak_reserved_gb": 3.383, "peak_rss_gb": 1.911}
+{"tag": "K4-L10-up_proj", "status": "ok", "wall_s": 10.5, "cap_gb": 7.2, "peak_alloc_gb": 3.012, "peak_reserved_gb": 3.383, "peak_rss_gb": 1.911}
+{"tag": "K4-L10-down_proj", "status": "ok", "wall_s": 61.1, "cap_gb": 7.2, "peak_alloc_gb": 6.611, "peak_reserved_gb": 6.859, "peak_rss_gb": 9.785}
+{"tag": "K2-L10-down_proj-savewq", "status": "ok", "wall_s": 67.7, "cap_gb": 7.2, "peak_alloc_gb": 6.237, "peak_reserved_gb": 6.898, "peak_rss_gb": 10.239}
+{"tag": "K2-L10-down_proj-nofallback", "status": "error OutOfMemoryError('CUDA out of memory. Tried to allocate 1.13 GiB. GPU 0 has a total capacity of 11.67 GiB of which 939.44 MiB is free. Including non-PyTorch memory, this process has 6.59 GiB memory in use. 7.20 GiB allowed; Of the allocated memory 6.24 GiB is allocated by PyTorch, and 117.39 M", "wall_s": 13.1, "cap_gb": 7.2, "peak_alloc_gb": 6.237, "peak_reserved_gb": 6.586, "peak_rss_gb": 4.489}
+{"tag": "K6-L39-k_proj", "status": "ok", "wall_s": 4.5, "cap_gb": 7.2, "peak_alloc_gb": 0.675, "peak_reserved_gb": 0.824, "peak_rss_gb": 1.752}
+{"tag": "K6-L39-v_proj", "status": "ok", "wall_s": 3.1, "cap_gb": 7.2, "peak_alloc_gb": 0.675, "peak_reserved_gb": 0.824, "peak_rss_gb": 1.757}
+{"tag": "K6-L39-q_proj", "status": "ok", "wall_s": 15.7, "cap_gb": 7.2, "peak_alloc_gb": 2.364, "peak_reserved_gb": 2.545, "peak_rss_gb": 1.858}
+{"tag": "K6-L39-o_proj", "status": "ok", "wall_s": 9.0, "cap_gb": 7.2, "peak_alloc_gb": 1.497, "peak_reserved_gb": 1.664, "peak_rss_gb": 1.913}
+{"tag": "K6-L10-in_proj_qkv", "status": "ok", "wall_s": 13.1, "cap_gb": 7.2, "peak_alloc_gb": 2.032, "peak_reserved_gb": 2.213, "peak_rss_gb": 1.84}
+{"tag": "K6-L10-in_proj_z", "status": "ok", "wall_s": 8.1, "cap_gb": 7.2, "peak_alloc_gb": 1.368, "peak_reserved_gb": 1.547, "peak_rss_gb": 1.802}
+{"tag": "K6-L10-out_proj", "status": "ok", "wall_s": 8.4, "cap_gb": 7.2, "peak_alloc_gb": 1.497, "peak_reserved_gb": 1.664, "peak_rss_gb": 1.903}
+{"tag": "K6-L10-gate_proj", "status": "ok", "wall_s": 20.6, "cap_gb": 7.2, "peak_alloc_gb": 2.824, "peak_reserved_gb": 3.188, "peak_rss_gb": 1.897}
+{"tag": "K6-L10-up_proj", "status": "ok", "wall_s": 20.8, "cap_gb": 7.2, "peak_alloc_gb": 2.824, "peak_reserved_gb": 3.188, "peak_rss_gb": 1.912}
+{"tag": "K6-L10-down_proj", "status": "error RuntimeError('CUDA error: CUBLAS_STATUS_EXECUTION_FAILED when calling `cublasSgemmStridedBatched( handle, opa, opb, m, n, k, &alpha, a, lda, stridea, b, ldb, strideb, &beta, c, ldc, stridec, num_batches)`')", "wall_s": 20.7, "cap_gb": 7.2, "peak_alloc_gb": 5.653, "peak_reserved_gb": 7.174, "peak_rss_gb": 4.431}
+{"tag": "K3-L10-down_proj", "status": "ok", "wall_s": 127.2, "cap_gb": 7.2, "peak_alloc_gb": 6.863, "peak_reserved_gb": 7.113, "peak_rss_gb": 10.391}
+{"tag": "K5-L10-down_proj", "status": "ok", "wall_s": 64.8, "cap_gb": 7.2, "peak_alloc_gb": 6.382, "peak_reserved_gb": 7.135, "peak_rss_gb": 10.39}
+{"tag": "K6-L10-down_proj-smallws", "status": "ok", "wall_s": 73.3, "cap_gb": 7.2, "peak_alloc_gb": 6.469, "peak_reserved_gb": 7.035, "peak_rss_gb": 10.389}
+{"tag": "K8-L39-q_proj", "status": "ok", "wall_s": 9.1, "cap_gb": 7.2, "peak_alloc_gb": 2.304, "peak_reserved_gb": 2.486, "peak_rss_gb": 1.863}

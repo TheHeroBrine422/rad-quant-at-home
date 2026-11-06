@@ -1,0 +1,56 @@
+# Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
+# rad-quant-at-home donor worker on AMD GPUs (ROCm), as a compose file. Optional: the image runs just as well with the
+# `docker run` line in README.md ("For donors"); this file holds the same settings. Every RQAH_* setting
+# also takes its 0.2 name RADQUANT_* (read in 0.3 only).
+#
+#   cp .env.example .env     then set RQAH_SERVER, RQAH_INVITE (first start only), RENDER_GID, VIDEO_GID, caps
+#   docker compose up -d     registers with the invite on the first start; the token is kept in the state volume
+#   docker compose logs -f   docker compose stop   (stop = finish the current jobs, up to stop_grace_period)
+#   docker compose exec worker rqah status      your workers, jobs, lumens (rqah jobs | points | logs | config)
+#
+# Several cards: RQAH_GPUS=0,1,2,3 (one job per card at once, one cache and one RAM budget for all; jobs that need
+# several cards get them together). RQAH_RAM_GB is the host RAM all jobs together may use.
+name: rad-quant-at-home-worker
+
+services:
+  worker:
+    image: ${RQAH_IMAGE:-${RADQUANT_IMAGE:-rad-quant-at-home-worker:0.3.0-rocm7.14-gfx1201}}
+    restart: unless-stopped
+    devices: [/dev/kfd, /dev/dri]
+    group_add:                                  # the host's numeric ids: getent group video render
+      - "${VIDEO_GID:?set VIDEO_GID to the host's video group id (getent group video)}"
+      - "${RENDER_GID:?set RENDER_GID to the host's render group id (getent group render)}"
+    # ROCm's runtime makes NUMA memory-policy calls the default seccomp profile only allows with CAP_SYS_NICE; AMD's
+    # documented container setup turns seccomp off for the container. Everything else stays locked down.
+    security_opt: ["seccomp=unconfined", "no-new-privileges:true"]
+    cap_drop: [ALL]
+    environment:
+      RQAH_SERVER: ${RQAH_SERVER:-${RADQUANT_SERVER:?set RQAH_SERVER to the queue URL you were given}}
+      RQAH_INVITE: ${RQAH_INVITE:-${RADQUANT_INVITE:-}}     # one-time invite; ignored once the token file exists
+      RQAH_NAME: ${RQAH_NAME:-${RADQUANT_NAME:-donor}}      # your display name on the leaderboard, if you opt in:
+      RQAH_LEADERBOARD: ${RQAH_LEADERBOARD:-0}          # 1 = listed on the public status page (first start;
+                                                                # later: docker compose exec worker rqah config set ...)
+      # RQAH_TOKEN_FILE: /run/secrets/rqah_token        # instead of an invite: a token you already have
+      RQAH_GPU_NAME: ${RQAH_GPU_NAME:-${RADQUANT_GPU_NAME:-r9700}}
+      RQAH_GPUS: ${RQAH_GPUS:-0}                        # device indices; 0,1 for two cards
+      RQAH_VRAM_GB: ${RQAH_VRAM_GB:-${RADQUANT_VRAM_GB:-32}} # per card
+      RQAH_RAM_GB: ${RQAH_RAM_GB:-${RADQUANT_RAM_GB:-30}}   # host RAM for all jobs (27B: layer ~24 GB, head ~48 GB)
+      RQAH_CACHE_GB: ${RQAH_CACHE_GB:-${RADQUANT_CACHE_GB:-200}} # disk cap of the input cache in the state volume
+      RQAH_WINDOWS: ${RQAH_WINDOWS:-${RADQUANT_WINDOWS:-}}  # e.g. 22:00-08:00,12:00-13:00 (local time, TZ); empty: always
+      RQAH_ON_STOP: ${RQAH_ON_STOP:-${RADQUANT_ON_STOP:-finish}} # finish | abandon the current jobs on stop
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${RQAH_STATE_DIR:-${RADQUANT_STATE_DIR:-rqah-state}}:/var/lib/rqah   # token, current jobs, input cache
+    # secrets: [rqah_token]
+    mem_limit: ${RQAH_MEM_LIMIT:-${RADQUANT_MEM_LIMIT:-32g}}
+    stop_grace_period: ${RQAH_STOP_GRACE:-${RADQUANT_STOP_GRACE:-15m}}  # time to finish the current jobs on stop
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+
+volumes:
+  rqah-state:
+
+# secrets:
+#   rqah_token:
+#     file: ./rqah-token                    # one line; readable by uid 10001 (chmod 0444, or chown 10001)
