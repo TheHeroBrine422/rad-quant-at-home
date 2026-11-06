@@ -26,7 +26,7 @@ docker-e2e (inside dind): Docker 29.9.3, iptables v1.8.13 (nf_tables)
   ok    uninstall-firewall.sh --remove-network
   ok      nothing left (container, volume, network, rules, settings)
 --- selftest table with the nft firewall (as a volunteer would paste it) ---
-donor-kit selftest  2026-11-06 21:24 UTC  rad-quant-at-home-research lite (test only, no GPU stack) tailscale 1.104.5
+donor-kit selftest  2026-11-06 21:55 UTC  rad-quant-at-home-research lite (test only, no GPU stack) tailscale 1.104.5
 
 [sandbox]
   PASS  not root                                    uid 10010
@@ -70,20 +70,20 @@ donor-kit selftest  2026-11-06 21:24 UTC  rad-quant-at-home-research lite (test 
   PASS  private sample 172.31.255.254               blocked: no answer (2 probes)
   PASS  private sample 192.168.255.254              blocked: no answer (2 probes)
   PASS  private sample 198.18.0.1                   blocked: no answer (2 probes)
-  PASS  private sample 10.177.15.118                blocked: no answer (2 probes)
-  PASS  private sample 172.22.39.80                 blocked: no answer (2 probes)
-  PASS  private sample 192.168.162.112              blocked: no answer (2 probes)
+  PASS  private sample 10.193.174.222               blocked: no answer (2 probes)
+  PASS  private sample 172.18.164.187               blocked: no answer (2 probes)
+  PASS  private sample 192.168.232.36               blocked: rejected by the firewall, no answer (2 probes)
   PASS  IPv6 (ULA, link-local, the LAN's prefix)    the container has no IPv6 route
 
 [internet]
   INFO  resolver                                    127.0.0.11 (Docker's embedded DNS forwards to the public resolvers the container was started with)
   PASS  DNS (huggingface.co)                        52.84.217.102, 52.84.217.103, 52.84.217.69
   PASS  TCP to the internet (1.1.1.1:443)           open
-  PASS  Hugging Face API                            HTTP 200, 491 B, 0.11 s
-  PASS  Hugging Face file download                  HTTP 200, 665 B, 0.18 s
-  PASS  PyPI                                        HTTP 200, 109293 B, 0.10 s
-  PASS  GitHub                                      HTTP 200, 525593 B, 0.44 s
+  PASS  Hugging Face API                            HTTP 200, 491 B, 0.22 s
+  PASS  Hugging Face file download                  HTTP 200, 665 B, 0.56 s
+  PASS  PyPI                                        HTTP 200, 109293 B, 0.22 s
+  PASS  GitHub                                      HTTP 200, 525816 B, 0.91 s
   WARN  Tailscale node                              NeedsLogin, donor-e2e, untagged (no auth key yet? see VOLUNTEER.md)
 
-SELFTEST PASS: 48 passed, 0 failed, 1 warnings (5 s)
+SELFTEST PASS: 48 passed, 0 failed, 1 warnings (6 s)
 DOCKER-E2E PASS
