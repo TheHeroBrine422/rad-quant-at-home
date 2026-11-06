@@ -1,0 +1,9 @@
+image: rad-quant-at-home-research cuda 8.0;8.6;8.9;12.0 torch==2.11.0+cu128 tailscale 1.104.5 kit 7df04f3
+python: 3.12.3, box: Ubuntu 24.04.1 LTS, nvcc: Cuda compilation tools, release 12.8, V12.8.93
+NVIDIA GeForce RTX 4070, 3487 MiB, 12282 MiB, 615.71.09
+waiting for /data/yb/gpu.lock
+lock held after 41 s
+{"ok": true, "detail": "torch 2.11.0+cu128 (CUDA 12.8); cuda:0 NVIDIA GeForce RTX 4070 12 GiB (8 free), bf16 56 TFLOP/s, rel err 3.1e-03"}
+extension: built in 13 s, max err 4.8e-07 OK
+GPU part 16 s
+CUDA-SMOKE PASS

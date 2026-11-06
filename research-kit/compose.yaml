@@ -1,0 +1,68 @@
+# Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
+# The research container as a compose file: the same settings as `./run.sh up` (run.sh is the simpler way; it also
+# checks the firewall first and keeps the Tailscale key out of the container's configuration).
+#
+#   sudo ./firewall/install-firewall.sh               (once: the network donor-research and its firewall)
+#   cp donor.env.example .env                         (edit; compose reads .env)
+#   docker compose --profile rocm up -d               (AMD)   or   docker compose --profile cuda up -d   (NVIDIA)
+#   docker compose --profile rocm stop | start | down (down removes the container, the volume stays)
+#
+# With compose the auth key is passed as TS_AUTHKEY (docker inspect shows it to anyone with Docker access on this
+# host: it is single-use, so it is worthless once the container has logged in; remove it from .env afterwards).
+name: donor-research
+
+x-common: &common
+  restart: unless-stopped
+  init: true
+  networks: [donor-research]
+  dns: [1.1.1.1, 9.9.9.9]
+  cap_drop: [ALL]
+  read_only: true
+  tmpfs:
+    - /tmp:rw,exec,nosuid,nodev,size=2g
+    - /run/tailscale:rw,nosuid,nodev,size=16m,uid=10010,gid=10010,mode=0700
+  cpus: ${DONOR_CPUS:-8}
+  mem_limit: ${DONOR_MEM:-24g}
+  memswap_limit: ${DONOR_MEM:-24g}
+  pids_limit: ${DONOR_PIDS:-4096}
+  shm_size: ${DONOR_SHM:-8g}
+  ulimits: {nofile: 65536}
+  stop_grace_period: 30s
+  hostname: ${TS_HOSTNAME:?set TS_HOSTNAME (e.g. donor-yourname)}
+  environment:
+    TS_HOSTNAME: ${TS_HOSTNAME}
+    TS_AUTHKEY: ${TS_AUTHKEY:-}
+  volumes: ["${DONOR_DATA:-donor-research-data}:/data"]
+  labels: {org.rad-quant-at-home.research-kit: "1"}
+
+services:
+  research-rocm:
+    <<: *common
+    profiles: [rocm]
+    container_name: donor-research
+    image: ${DONOR_IMAGE:-ghcr.io/theherobrine422/rad-quant-at-home-research:0.3.0-rocm}
+    devices: [/dev/kfd, /dev/dri]
+    group_add:                                        # the host's numeric ids: getent group video render
+      - "${VIDEO_GID:?set VIDEO_GID (getent group video | cut -d: -f3)}"
+      - "${RENDER_GID:?set RENDER_GID (getent group render | cut -d: -f3)}"
+    # Docker's default seccomp profile + the NUMA memory-policy calls ROCm makes (tools/mkseccomp.py)
+    security_opt: ["no-new-privileges:true", "seccomp=./seccomp-rocm.json"]
+
+  research-cuda:
+    <<: *common
+    profiles: [cuda]
+    container_name: donor-research
+    image: ${DONOR_IMAGE:-ghcr.io/theherobrine422/rad-quant-at-home-research:0.3.0-cuda}
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+
+networks:
+  donor-research:
+    external: true                                    # made by firewall/install-firewall.sh, with its firewall
+
+volumes:
+  donor-research-data:
+    name: donor-research-data

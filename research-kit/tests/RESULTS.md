@@ -1,0 +1,19 @@
+# research-kit test results (2026-11-06)
+
+All on our own machines; nothing touched a real tailnet or a donor host. Logs: `results/`.
+
+| test | where | what it proves | result |
+|---|---|---|---|
+| `netns-firewall.sh nft iptables` | coordination VM, three network namespaces (fake host, container, LAN + internet); Fedora 44 kernel 6.19, iptables 1.8.11 legacy, nft 1.1.6 | per backend: with no rules every target answers (the probe sees holes) and the entrypoint guard refuses; installed: host (gateway, LAN, public address), LAN router / NAS, 10/8, 172.16/12, metadata, CGNAT, 198.18/15, a neighbour on the host's public subnet, IPv6 ULA, a LAN device with a *public* IPv6 address and the host's IPv6 addresses blocked; internet v4 / v6 and DNS open (also after flushing neighbour caches); nothing opens a connection into the container; the selftest's whole `[blocked]` section PASS; install twice = identical rules; a simulated Docker restart (FORWARD rebuilt) keeps it blocked; switching backend leaves one rule set; uninstall restores everything and leaves nothing | **PASS** (2 × 18 checks + render) |
+| `docker-e2e.sh` | Docker-in-Docker on the VM (Docker 29.9.3, iptables 1.8.13 nf_tables), the lite image (`Dockerfile.lite`: the research image without the GPU stack) | `run.sh up` refuses without the firewall; forced past it, the entrypoint guard keeps the container off Tailscale at every restart; `install-firewall.sh` (nft); `run.sh up`; tailscaled runs as uid 10010; full selftest PASS with this VM's real LAN address and gateway blocked, internet / HF / PyPI / GitHub open; the resume hook relaunches a registered queue after restart and after stop / start, and not once DONE holds; uninstall makes the selftest FAIL (the gateway answers); the iptables backend with Docker's real `DOCKER-USER`; purge + uninstall leave nothing | **PASS** (27 checks) |
+| `headscale-ssh.sh` | VM Docker, internal network, headscale v0.29.7, Tailscale 1.104.5, the lite image with the shipped entrypoint and the run.sh flags | two donors log in with single-use tagged keys (tailscaled as uid 10010, no capabilities, no-new-privileges, read-only root); the key file is deleted; the user reaches both donors by Tailscale SSH as `research` (non-interactive `ssh host cmd` gets the research environment and `/data`); `root` refused by the policy; donor → user and donor → donor reach nothing | **PASS** (14 checks) |
+| `cuda-smoke-rootfs.sh` | RTX 4070 box (a container itself, so no Docker there): the CUDA image's `/opt` copied out, run under the shared GPU lock | the image's torch 2.11.0+cu128 sees the card, bf16 matmul correct (rel err 3e-3, 56 TFLOP/s), a CUDA extension builds with nvcc 12.8 and runs correctly; GPU part 16 s | **PASS** |
+| seccomp profile | VM Docker | `get_mempolicy` fails with EPERM under Docker's default profile, works under `seccomp-rocm.json` (still seccomp mode 2, no capabilities), also through compose | **PASS** |
+| ROCm image, no GPU | VM Docker, run flags (non-root, no caps, kit seccomp, read-only) | torch 2.15.0+rocm7.14 imports (HIP 7.14), `hipcc` builds a torch extension with gfx1201 code objects, `rocminfo` / `amd-smi` present, `pip check` clean | **PASS** (no GPU: the runtime is untested) |
+| image builds | VM Docker 29.8.2 | `build.sh rocm` 15.6 GB (4.1 GB compressed), `build.sh cuda` 27 GB (9.5 GB compressed) | built |
+| `docker compose config` | VM | both profiles parse (needs `TS_HOSTNAME`, and `VIDEO_GID` / `RENDER_GID` for rocm) | **PASS** |
+
+Not testable here (OPERATOR.md "What still has to be tested on a real donor host"): the systemd unit across a reboot
+and a Docker restart on a real host, firewalld reloads, the ROCm runtime on an R9700 (and whether Docker's plain
+default seccomp profile suffices), `--gpus` on an NVIDIA host, Tailscale's own control plane (the policy file's
+tests, tagged keys together with `--advertise-tags`, Tailscale SSH), a LAN with IPv6.

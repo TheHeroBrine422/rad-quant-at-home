@@ -1,0 +1,44 @@
+// rad-quant-at-home research-kit: the parts of YOUR tailnet policy file (admin console > Access controls) that make
+// donor containers reachable only by you, and let donors reach nothing. Merge these sections into your policy; replace
+// <you@example.com> with your login. OPERATOR.md "Tailscale" has the steps, the auth keys and how to revoke a donor.
+//
+// Tailscale denies everything that no rule allows. Donors stay locked out as long as NO rule anywhere in the policy
+// has tag:donor in its "src" -- including through "*" or "autogroup:tagged". So:
+//   * DELETE the default allow-all rule if your policy still has it:
+//       {"action": "accept", "src": ["*"], "dst": ["*:*"]}      (acls)   or   {"src": ["*"], "dst": ["*"], "ip": ["*"]}  (grants)
+//     and replace it with rules whose sources are people or groups (autogroup:member does NOT include tagged devices).
+//   * Never list tag:donor under autoApprovers (routes, exitNode), in a rule's src, or in nodeAttrs "funnel".
+// The "tests" below are checked every time the policy is saved: the save fails if a donor could reach you, our agent
+// machine or another donor, so a later edit cannot silently open a hole.
+{
+	"tagOwners": {
+		// only admins may create auth keys for these tags
+		"tag:donor":          ["autogroup:admin"],
+		// optional: our agent VM joins as a tagged node so the agents can reach donor boxes too
+		"tag:research-agent": ["autogroup:admin"],
+	},
+
+	"grants": [
+		// you (and the agent VM) -> donor containers, any port (Tailscale SSH, rsync over it, a notebook port).
+		// There is deliberately no grant with tag:donor as the source.
+		{"src": ["<you@example.com>", "tag:research-agent"], "dst": ["tag:donor"], "ip": ["*"]},
+	],
+
+	"ssh": [
+		// Tailscale SSH into a donor container: only as its unprivileged user `research` (tailscaled runs as that user,
+		// so no other login is possible anyway). "accept", not "check": the agents log in unattended.
+		{"action": "accept", "src": ["<you@example.com>", "tag:research-agent"], "dst": ["tag:donor"], "users": ["research"]},
+	],
+
+	"tests": [
+		// a donor reaches nothing: not your devices, not the agent VM, not another donor
+		{"src": "tag:donor", "deny": ["<you@example.com>:22", "<you@example.com>:443", "<you@example.com>:3389",
+		                             "tag:research-agent:22", "tag:research-agent:443", "tag:donor:22", "tag:donor:8888"]},
+		// you reach the donors
+		{"src": "<you@example.com>", "accept": ["tag:donor:22", "tag:donor:8888"]},
+	],
+
+	"sshTests": [
+		{"src": "<you@example.com>", "dst": ["tag:donor"], "accept": ["research"], "deny": ["root"]},
+	],
+}

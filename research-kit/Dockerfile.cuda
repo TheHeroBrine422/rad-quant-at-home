@@ -1,0 +1,74 @@
+# Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
+# rad-quant-at-home-research, NVIDIA (CUDA 12.8): the research shell a trusted volunteer lends us (README.md in this
+# folder). NOT the job-queue worker (../docker/Dockerfile.cuda): no worker code, no queue token; a toolchain (nvcc
+# included: our kernels build as torch extensions), Tailscale, and the start hook.
+#
+#   build:  ./build.sh cuda      (passes the CUDA base and torch pins of ../docker/Dockerfile.cuda, the stack of our
+#                                 RTX 4070 box: CUDA 12.8.1 devel, Ubuntu 24.04, torch 2.11.0+cu128)
+#   run:    ./run.sh up          (firewall first: firewall/install-firewall.sh)
+#   image:  ghcr.io/theherobrine422/rad-quant-at-home-research:<version>-cuda
+#
+# The host needs the NVIDIA driver (>= 570) and the NVIDIA Container Toolkit (docker run --gpus).
+# Runs as the unprivileged user `research` (uid 10010) with a read-only root; everything that grows is on /data.
+ARG CUDA_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+ARG CUDA_IMAGE
+ARG TORCH_SPEC="torch==2.11.0"
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG TORCH_CUDA_ARCH="8.0;8.6;8.9;12.0"
+ARG PY_DEPS="numpy==2.5.4 safetensors==0.8.0 ninja==1.13.2 huggingface_hub==2.4.0 transformers==5.22.1 \
+flash-linear-attention==0.6.0 scipy pandas matplotlib tqdm pytest ipython"
+ARG TS_VERSION=1.104.5
+ARG TS_SHA256=720cbbccbfc03d8b55df72afc19e5a72e31b0f65934700aa6fa38074d4ad7bf7
+ARG UID=10010
+ARG KIT_COMMIT=unknown
+ARG VERSION=0.0.0-dev
+ARG CREATED=unknown
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-dev \
+        ca-certificates curl wget git git-lfs build-essential cmake ninja-build pkg-config gdb strace \
+        rsync tmux screen htop less vim-tiny nano procps psmisc numactl jq file xz-utils zstd pigz unzip \
+        iproute2 iputils-ping netcat-openbsd dnsutils openssh-client pciutils lsof time bc \
+    && rm -rf /var/lib/apt/lists/* \
+    && (userdel -r ubuntu 2> /dev/null || true)
+
+RUN python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir --index-url ${TORCH_INDEX} "${TORCH_SPEC}" \
+ && /opt/venv/bin/pip install --no-cache-dir ${PY_DEPS} \
+ && mkdir -p /opt/donor-kit \
+ && printf 'export CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST="%s" STACK_PATH=/usr/local/cuda/bin LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\n' \
+      "${TORCH_CUDA_ARCH}" > /opt/donor-kit/stack.env \
+ && /opt/venv/bin/pip freeze > /opt/donor-kit/pip-freeze.txt
+
+# Tailscale (static build, checksum pinned): tailscaled runs in userspace-networking mode as `research`
+RUN curl -fsSL -o /tmp/ts.tgz https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_amd64.tgz \
+ && echo "${TS_SHA256}  /tmp/ts.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/ts.tgz -C /tmp && install -m 0755 /tmp/tailscale_${TS_VERSION}_amd64/tailscale \
+      /tmp/tailscale_${TS_VERSION}_amd64/tailscaled /usr/local/bin/ && rm -rf /tmp/ts.tgz /tmp/tailscale_*
+
+# the research user: home on the data volume; no sudo, no password, no setuid helpers needed
+RUN useradd -u ${UID} -U -d /data/home -M -s /bin/bash research \
+ && mkdir -p /data /run/tailscale && chown research:research /data /run/tailscale && chmod 0750 /data
+COPY entrypoint.sh resume-queues.sh selftest.py selftest.sh gpucheck.py research-env.sh /opt/donor-kit/
+RUN install -m 0644 /opt/donor-kit/research-env.sh /etc/profile.d/research-env.sh \
+ && sed -i '1i [ -f /etc/profile.d/research-env.sh ] && . /etc/profile.d/research-env.sh' /etc/bash.bashrc /etc/skel/.bashrc \
+ && ln -s /opt/donor-kit/selftest.sh /usr/local/bin/selftest \
+ && ln -s /opt/donor-kit/resume-queues.sh /usr/local/bin/resume-queues \
+ && chmod 0755 /opt/donor-kit/*.sh /opt/donor-kit/*.py \
+ && echo "rad-quant-at-home-research cuda ${TORCH_CUDA_ARCH} ${TORCH_SPEC}+cu128 tailscale ${TS_VERSION} kit ${VERSION} ${KIT_COMMIT}" \
+      > /opt/donor-kit/IMAGE
+LABEL org.opencontainers.image.title="rad-quant-at-home-research" \
+      org.opencontainers.image.description="research shell for trusted volunteers (CUDA), reached over Tailscale" \
+      org.opencontainers.image.source="https://github.com/TheHeroBrine422/rad-quant-at-home" \
+      org.opencontainers.image.revision="${KIT_COMMIT}" org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.licenses="Apache-2.0" org.opencontainers.image.base.name="${CUDA_IMAGE}"
+# the CUDA base image's NVIDIA_* variables tell the container toolkit which driver parts to mount; keep them
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+USER research
+WORKDIR /data
+ENV HOME=/data/home
+VOLUME /data
+ENTRYPOINT ["/opt/donor-kit/entrypoint.sh"]

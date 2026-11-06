@@ -112,6 +112,15 @@ RQAH_LEADERBOARD=1` (the name is `RQAH_NAME`), or later `docker exec rad-quant-a
 --leaderboard on --display-name "Your Name"`. Off again with `--leaderboard off`. Several boxes count as one donor
 once linked (`rqah link`, below).
 
+## Research access (trusted volunteers only)
+
+Separate from the job queue, and optional. **The queue needs no trust**: it runs only the job types built into the
+worker, and every result is verified by its score before it counts. **Research access is different: we get a shell
+on your machine** (in a locked-down container we reach over Tailscale) and run our own experiments there. It is only
+for people who know us personally. What we can and cannot do, the protections (a firewall that keeps the container
+off your LAN, no root, limits) and how to stop it: [research-kit/VOLUNTEER.md](research-kit/VOLUNTEER.md). The kit
+itself: [research-kit/](research-kit/README.md).
+
 ## Architecture
 
 ```
@@ -659,6 +668,13 @@ Tags:
 - `0.3.0-rocm7.14-gfx1201`, `0.3.0-cu128`: what donors pin.
 - `0.3.0-rocm` / `0.3.0-cuda` and `rocm` / `cuda`: these move.
 - `rocm-<commit>-rxm<commit>`, `cuda-...`: the exact source commits.
+
+#### Research images (research-kit/)
+
+```bash
+research-kit/build.sh rocm && research-kit/build.sh cuda   # ghcr.io/theherobrine422/rad-quant-at-home-research:<VERSION>-rocm / -cuda
+docker push ghcr.io/theherobrine422/rad-quant-at-home-research --all-tags
+```
 
 Bump `VERSION` with every release, and a job type's `VERSION` with any change of its meaning (above).
 Deploy the server first, then the new image. Run one real job with the built image on

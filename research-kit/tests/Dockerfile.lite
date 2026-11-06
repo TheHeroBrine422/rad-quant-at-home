@@ -1,0 +1,25 @@
+# Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
+# Test-only: the research image without the GPU stack (same user, files, Tailscale, entrypoint), for docker-e2e.sh on
+# a box without a GPU. Build context: image/. Not for donors.
+ARG PY_IMAGE=python:3.14-slim
+FROM ${PY_IMAGE}
+ARG TS_VERSION=1.104.5
+ARG TS_SHA256=720cbbccbfc03d8b55df72afc19e5a72e31b0f65934700aa6fa38074d4ad7bf7
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps iproute2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL -o /tmp/ts.tgz https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_amd64.tgz \
+ && echo "${TS_SHA256}  /tmp/ts.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/ts.tgz -C /tmp && install -m 0755 /tmp/tailscale_${TS_VERSION}_amd64/tailscale \
+      /tmp/tailscale_${TS_VERSION}_amd64/tailscaled /usr/local/bin/ && rm -rf /tmp/ts.tgz /tmp/tailscale_*
+RUN useradd -u 10010 -U -d /data/home -M -s /bin/bash research \
+ && mkdir -p /data /run/tailscale /opt/donor-kit && chown research:research /data /run/tailscale && chmod 0750 /data
+COPY entrypoint.sh resume-queues.sh selftest.py selftest.sh gpucheck.py research-env.sh /opt/donor-kit/
+RUN install -m 0644 /opt/donor-kit/research-env.sh /etc/profile.d/research-env.sh \
+ && sed -i '1i [ -f /etc/profile.d/research-env.sh ] && . /etc/profile.d/research-env.sh' /etc/bash.bashrc /etc/skel/.bashrc \
+ && ln -s /opt/donor-kit/selftest.sh /usr/local/bin/selftest && ln -s /opt/donor-kit/resume-queues.sh /usr/local/bin/resume-queues && chmod 0755 /opt/donor-kit/*.sh /opt/donor-kit/*.py \
+ && echo "rad-quant-at-home-research lite (test only, no GPU stack) tailscale ${TS_VERSION}" > /opt/donor-kit/IMAGE
+USER research
+WORKDIR /data
+ENV HOME=/data/home
+VOLUME /data
+ENTRYPOINT ["/opt/donor-kit/entrypoint.sh"]

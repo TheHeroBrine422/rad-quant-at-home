@@ -1,0 +1,87 @@
+# Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
+# rad-quant-at-home-research, ROCm (gfx1201 = Radeon AI PRO R9700 / RX 9070): the research shell a trusted volunteer
+# lends us (README.md in this folder). NOT the job-queue worker (../docker/Dockerfile.rocm): no worker code, no queue
+# token; a toolchain, Tailscale, and the start hook.
+#
+#   build:  ./build.sh rocm      (passes the torch / ROCm / Python pins of ../docker/Dockerfile.rocm, so the two images
+#                                 run the stack of our GPU box: torch 2.15.0+rocm7.14 + TheRock rocm 7.14.1, Python 3.14)
+#   run:    ./run.sh up          (firewall first: firewall/install-firewall.sh)
+#   image:  ghcr.io/theherobrine422/rad-quant-at-home-research:<version>-rocm
+#
+# The host needs only the amdgpu kernel driver (/dev/kfd, /dev/dri); ROCm itself comes as pip wheels in /opt/venv.
+# Runs as the unprivileged user `research` (uid 10010) with a read-only root; everything that grows is on /data.
+ARG PY_IMAGE=python:3.14-slim-bookworm
+FROM ${PY_IMAGE}
+ARG PY_IMAGE
+# the index our own gfx1201 box installs torch from; it carries torch 2.15.0+rocm7.14
+# and the TheRock rocm 7.14.1 SDK wheels it depends on (rocm-sdk-devel = hipcc etc. for extension builds)
+ARG ROCM_INDEX=https://download.pytorch.org/whl/rocm7.14
+ARG TORCH_SPEC="torch==2.15.0+rocm7.14"
+ARG ROCM_SPEC="rocm[libraries,devel]==7.14.1"
+ARG GPU_ARCH=gfx1201
+ARG PY_DEPS="numpy==2.5.4 safetensors==0.8.0 ninja==1.13.2 huggingface_hub==2.4.0 transformers==5.22.1 \
+flash-linear-attention==0.6.0 scipy pandas matplotlib tqdm pytest ipython"
+ARG TS_VERSION=1.104.5
+ARG TS_SHA256=720cbbccbfc03d8b55df72afc19e5a72e31b0f65934700aa6fa38074d4ad7bf7
+ARG UID=10010
+ARG KIT_COMMIT=unknown
+ARG VERSION=0.0.0-dev
+ARG CREATED=unknown
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl wget git git-lfs build-essential cmake ninja-build pkg-config gdb strace \
+        rsync tmux screen htop less vim-tiny nano procps psmisc numactl jq file xz-utils zstd pigz unzip \
+        iproute2 iputils-ping netcat-openbsd dnsutils openssh-client pciutils lsof time bc libnuma1 libdrm2 \
+        libdrm-amdgpu1 libelf1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ROCm + torch as TheRock wheels (the stack of our gfx1201 box), into one venv. torch's wheel asks for
+# rocm[device-all] (the GPU code objects of ~25 architectures, ~15 GB); we install its other requirements (from its
+# METADATA) and only the device package of GPU_ARCH, then torch itself with --no-deps (so `pip check` lists the other
+# device packages as missing: expected). ROCM_DEVICE_EXTRA=device-all builds the full set.
+ARG ROCM_DEVICE_EXTRA=device-${GPU_ARCH}
+ARG TORCH_REQS="filelock typing-extensions>=4.13.0 setuptools>=77.0.3 sympy>=1.13.3 networkx>=2.5.1 jinja2 fsspec>=0.8.5 \
+triton-rocm~=3.9.0"
+RUN python3 -m venv /opt/venv \
+ && ROCM_PKG=$(echo "${ROCM_SPEC}" | sed "s/\]/,${ROCM_DEVICE_EXTRA}]/") \
+ && /opt/venv/bin/pip install --no-cache-dir --index-url ${ROCM_INDEX} --extra-index-url https://pypi.org/simple \
+      "$ROCM_PKG" ${TORCH_REQS} \
+ && /opt/venv/bin/pip install --no-cache-dir --no-deps --index-url ${ROCM_INDEX} "${TORCH_SPEC}" \
+ && /opt/venv/bin/pip install --no-cache-dir ${PY_DEPS} \
+ && (/opt/venv/bin/rocm-sdk init || true) \
+ && ROOT=$(/opt/venv/bin/rocm-sdk path --root) && BIN=$(/opt/venv/bin/rocm-sdk path --bin) \
+ && mkdir -p /opt/donor-kit \
+ && printf 'export ROCM_PATH=%s HIP_PATH=%s ROCM_HOME=%s PYTORCH_ROCM_ARCH=%s HSA_TOOLS_LIB= STACK_PATH=%s\n' \
+      "$ROOT" "$ROOT" "$ROOT" "${GPU_ARCH}" "$BIN" > /opt/donor-kit/stack.env \
+ && ln -sf "$BIN/rocminfo" /usr/local/bin/rocminfo && ln -sf "$BIN/amd-smi" /usr/local/bin/amd-smi \
+ && /opt/venv/bin/pip freeze > /opt/donor-kit/pip-freeze.txt
+
+# Tailscale (static build, checksum pinned): tailscaled runs in userspace-networking mode as `research`
+RUN curl -fsSL -o /tmp/ts.tgz https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_amd64.tgz \
+ && echo "${TS_SHA256}  /tmp/ts.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/ts.tgz -C /tmp && install -m 0755 /tmp/tailscale_${TS_VERSION}_amd64/tailscale \
+      /tmp/tailscale_${TS_VERSION}_amd64/tailscaled /usr/local/bin/ && rm -rf /tmp/ts.tgz /tmp/tailscale_*
+
+# the research user: home on the data volume; no sudo, no password, no setuid helpers needed
+RUN useradd -u ${UID} -U -d /data/home -M -s /bin/bash research \
+ && mkdir -p /data /run/tailscale && chown research:research /data /run/tailscale && chmod 0750 /data
+COPY entrypoint.sh resume-queues.sh selftest.py selftest.sh gpucheck.py research-env.sh /opt/donor-kit/
+RUN install -m 0644 /opt/donor-kit/research-env.sh /etc/profile.d/research-env.sh \
+ && sed -i '1i [ -f /etc/profile.d/research-env.sh ] && . /etc/profile.d/research-env.sh' /etc/bash.bashrc /etc/skel/.bashrc \
+ && ln -s /opt/donor-kit/selftest.sh /usr/local/bin/selftest \
+ && ln -s /opt/donor-kit/resume-queues.sh /usr/local/bin/resume-queues \
+ && chmod 0755 /opt/donor-kit/*.sh /opt/donor-kit/*.py \
+ && echo "rad-quant-at-home-research rocm ${GPU_ARCH} ${TORCH_SPEC} ${ROCM_SPEC} tailscale ${TS_VERSION} kit ${VERSION} ${KIT_COMMIT}" \
+      > /opt/donor-kit/IMAGE
+LABEL org.opencontainers.image.title="rad-quant-at-home-research" \
+      org.opencontainers.image.description="research shell for trusted volunteers (ROCm ${GPU_ARCH}), reached over Tailscale" \
+      org.opencontainers.image.source="https://github.com/TheHeroBrine422/rad-quant-at-home" \
+      org.opencontainers.image.revision="${KIT_COMMIT}" org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${CREATED}" \
+      org.opencontainers.image.licenses="Apache-2.0" org.opencontainers.image.base.name="${PY_IMAGE}"
+USER research
+WORKDIR /data
+ENV HOME=/data/home
+VOLUME /data
+ENTRYPOINT ["/opt/donor-kit/entrypoint.sh"]

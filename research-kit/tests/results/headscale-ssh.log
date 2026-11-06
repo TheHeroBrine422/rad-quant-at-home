@@ -1,0 +1,16 @@
+headscale-ssh: headscale/headscale:v0.29.7, 1.104.5
+  ok    donor 1 logged in (tagged key, userspace, uid 10010)
+  ok    donor 2 logged in
+  ok    user node logged in
+  ok      donor 1 is tagged tag:donor
+  ok      the auth key file is gone after login
+  ok    user -> donor 1: Tailscale SSH as research (non-interactive command)
+  ok      the research environment is loaded in 'ssh host cmd'
+  ok      the session sees the donor's data volume and queues
+  ok    user -> donor 1 as root: refused by the policy
+  ok    user -> donor 2: Tailscale SSH as research too
+  ok    donor 1 -> user: nothing (Tailscale SSH port of the user node)
+  ok    donor 1 -> donor 2: nothing
+  ok      (control: the user node's SSH port does answer the user itself)
+  ok    donor container still has no capabilities, NoNewPrivs
+HEADSCALE-SSH PASS

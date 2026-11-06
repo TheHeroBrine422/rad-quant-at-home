@@ -1,0 +1,89 @@
+docker-e2e (inside dind): Docker 29.9.3, iptables v1.8.13 (nf_tables)
+  ok    build the lite image
+  ok    run.sh up refuses without the firewall
+  ok      (forced past run.sh) the entrypoint guard keeps it offline, at every restart
+  ok    install-firewall.sh (auto backend; existing network reused)
+  ok      status: ACTIVE
+  ok    run.sh up
+  ok      entrypoint: LAN guard passed, tailscaled up, not logged in
+  ok      the guard line
+  ok      tailscaled runs as uid 10010
+  ok    selftest (nft): runs
+  ok      [sandbox] all PASS
+  ok      [blocked] all PASS (incl. this box's LAN address and gateway)
+  ok      [internet] DNS, HF, PyPI, GitHub PASS
+  ok    resume hook: queue launched after a restart
+  ok      resume-queues --status: running
+  ok      relaunched after docker stop / start
+  ok      not relaunched once DONE holds
+  ok    uninstall-firewall.sh
+  ok      selftest now FAILS [blocked] (it sees the holes)
+  ok      ... the gateway answers
+  ok    install-firewall.sh --backend iptables (Docker's DOCKER-USER)
+  ok      DOCKER-USER jumps to DONOR-FWD
+  ok      selftest (iptables): [blocked] all PASS
+  ok    run.sh purge
+  ok    uninstall-firewall.sh --remove-network
+  ok      nothing left (container, volume, network, rules, settings)
+--- selftest table with the nft firewall (as a volunteer would paste it) ---
+donor-kit selftest  2026-11-06 21:24 UTC  rad-quant-at-home-research lite (test only, no GPU stack) tailscale 1.104.5
+
+[sandbox]
+  PASS  not root                                    uid 10010
+  PASS  no capabilities                             CapEff 0000000000000000, CapBnd 0000000000000000
+  PASS  no-new-privileges                           NoNewPrivs 1
+  PASS  seccomp filter                              Seccomp mode 2 (2 = filter)
+  PASS  no container-engine socket                  none
+  PASS  no block devices (host disks)               none
+  INFO  devices                                     GPU nodes: none
+  PASS  resource limits                             memory 2.0 GiB, swap 0, 2 CPUs, pids 512
+  PASS  read-only image                             Read-only file system
+
+[blocked]
+  PASS  host via the bridge gateway (172.31.254.1)  blocked: rejected by the firewall, no answer (17 probes)
+  PASS  host address 1                              blocked: no answer (17 probes)
+  PASS  host address 2                              blocked: no answer (17 probes)
+  PASS  LAN gateway 1                               blocked: no answer (5 probes)
+  PASS  LAN gateway 2                               blocked: no answer (5 probes)
+  PASS  common router address 192.168.0.1           blocked: no answer (3 probes)
+  PASS  common router address 192.168.1.1           blocked: no answer (3 probes)
+  PASS  common router address 192.168.1.254         blocked: rejected by the firewall, no answer (3 probes)
+  PASS  common router address 192.168.0.254         blocked: no answer (3 probes)
+  PASS  common router address 192.168.2.1           blocked: no answer (3 probes)
+  PASS  common router address 192.168.10.1          blocked: no answer (3 probes)
+  PASS  common router address 192.168.50.1          blocked: no answer (3 probes)
+  PASS  common router address 192.168.86.1          blocked: no answer (3 probes)
+  PASS  common router address 192.168.88.1          blocked: no answer (3 probes)
+  PASS  common router address 192.168.100.1         blocked: no answer (3 probes)
+  PASS  common router address 192.168.178.1         blocked: no answer (3 probes)
+  PASS  common router address 10.0.0.1              blocked: no answer (3 probes)
+  PASS  common router address 10.0.0.138            blocked: no answer (3 probes)
+  PASS  common router address 10.0.1.1              blocked: no answer (3 probes)
+  PASS  common router address 10.1.1.1              blocked: no answer (3 probes)
+  PASS  common router address 172.16.0.1            blocked: no answer (3 probes)
+  PASS  cloud metadata 169.254.169.254              blocked: no answer (2 probes)
+  PASS  link-local 169.254.1.1                      blocked: no answer (2 probes)
+  PASS  CGNAT / tailnet 100.64.0.1                  blocked: no answer (2 probes)
+  PASS  Tailscale quad100 100.100.100.100           blocked: no answer (3 probes)
+  PASS  private sample 10.255.255.254               blocked: no answer (2 probes)
+  PASS  private sample 172.16.0.2                   blocked: no answer (2 probes)
+  PASS  private sample 172.31.255.254               blocked: no answer (2 probes)
+  PASS  private sample 192.168.255.254              blocked: no answer (2 probes)
+  PASS  private sample 198.18.0.1                   blocked: no answer (2 probes)
+  PASS  private sample 10.177.15.118                blocked: no answer (2 probes)
+  PASS  private sample 172.22.39.80                 blocked: no answer (2 probes)
+  PASS  private sample 192.168.162.112              blocked: no answer (2 probes)
+  PASS  IPv6 (ULA, link-local, the LAN's prefix)    the container has no IPv6 route
+
+[internet]
+  INFO  resolver                                    127.0.0.11 (Docker's embedded DNS forwards to the public resolvers the container was started with)
+  PASS  DNS (huggingface.co)                        52.84.217.102, 52.84.217.103, 52.84.217.69
+  PASS  TCP to the internet (1.1.1.1:443)           open
+  PASS  Hugging Face API                            HTTP 200, 491 B, 0.11 s
+  PASS  Hugging Face file download                  HTTP 200, 665 B, 0.18 s
+  PASS  PyPI                                        HTTP 200, 109293 B, 0.10 s
+  PASS  GitHub                                      HTTP 200, 525593 B, 0.44 s
+  WARN  Tailscale node                              NeedsLogin, donor-e2e, untagged (no auth key yet? see VOLUNTEER.md)
+
+SELFTEST PASS: 48 passed, 0 failed, 1 warnings (5 s)
+DOCKER-E2E PASS

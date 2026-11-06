@@ -1,0 +1,10 @@
+// tests/headscale-ssh.sh: tailscale/policy.hujson in headscale's dialect (users are "name@"; acls instead of grants).
+{
+	"tagOwners": {"tag:donor": ["donors@"]},
+	"acls": [
+		{"action": "accept", "src": ["admin@"], "dst": ["tag:donor:*"]},
+	],
+	"ssh": [
+		{"action": "accept", "src": ["admin@"], "dst": ["tag:donor"], "users": ["research"]},
+	],
+}

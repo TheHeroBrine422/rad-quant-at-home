@@ -1,0 +1,41 @@
+netns-firewall.sh: 6.19.10-300.fc44.x86_64, iptables v1.8.11 (legacy), nftables v1.1.6 (Commodore Bullmoose #7)
+== backend nft
+  ok    no rules: every target answers (the probe sees holes)
+  ok    no rules: the LAN can open a connection into the container
+  ok    no rules: the entrypoint guard refuses to go online
+  ok    install (nft)
+  ok    installed: LAN / host / special ranges blocked, internet open
+  ok    installed: nothing opens a connection into the container
+  ok    installed: the entrypoint guard passes
+  ok    installed: selftest [blocked] section all PASS
+  ok    install again: identical rules (idempotent)
+  ok      ... rule sets equal
+  ok      ... one jump each into our chains
+  ok    Docker restart (FORWARD rebuilt): still blocked
+  ok    switch to iptables: still blocked
+  ok      ... only the iptables rules are left
+  ok    uninstall
+  ok    uninstalled: every target answers again
+  ok    uninstalled: nothing of ours is left
+  ok    uninstall again (idempotent)
+== backend iptables
+  ok    no rules: every target answers (the probe sees holes)
+  ok    no rules: the LAN can open a connection into the container
+  ok    no rules: the entrypoint guard refuses to go online
+  ok    install (iptables)
+  ok    installed: LAN / host / special ranges blocked, internet open
+  ok    installed: nothing opens a connection into the container
+  ok    installed: the entrypoint guard passes
+  ok    installed: selftest [blocked] section all PASS
+  ok    install again: identical rules (idempotent)
+  ok      ... rule sets equal
+  ok      ... one jump each into our chains
+  ok    Docker restart (FORWARD rebuilt): still blocked
+  ok    switch to nft: still blocked
+  ok      ... only the nft rules are left
+  ok    uninstall
+  ok    uninstalled: every target answers again
+  ok    uninstalled: nothing of ours is left
+  ok    uninstall again (idempotent)
+  ok    render (dry run) prints the nft rules
+NETNS-FIREWALL PASS
