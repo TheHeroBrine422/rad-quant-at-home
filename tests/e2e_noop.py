@@ -12,8 +12,9 @@ Scenarios (TESTS.md): tokens / invites, 3 workers with one killed mid-job (lease
 once), a killed worker restarted before / after its lease expired, duplicate completion, corrupted upload, upload
 caps, disk-cap eviction and the disk-based lease filter, Range resume of a partial download, data access rules,
 malformed jobs from the real server (known type, bad params) and from a fake malicious server (unknown type, extra
-keys, path traversal, inputs the type does not allow, a malformed eval_mix, a bad stamp), graceful stop (finish /
-abandon), time windows, env-only configuration (RQAH_*, then the 0.2 RADQUANT_* names).
+keys, path traversal, inputs the type does not allow, a malformed eval_mix, a bad stamp, a job id that is a path, an
+empty lease id), graceful stop (finish / abandon), time windows, env-only configuration (RQAH_*, then the 0.2
+RADQUANT_* names).
 
 0.2 (run_v02, TESTS.md section 8; the GPU side faked by tests/fakes.py, fake_radiance.py, fake_mkgold27.py):
 requirements (VRAM / RAM classes), a 4-card worker (one process per card, device variables, the RAM budget), gang
@@ -394,14 +395,18 @@ def run(procs, srv):
                   dict(good, id=5, type="eval_mix", version=0, params={"model": "m", "revision": "r", "recipe": "a", "golden": "g", "kv": "bf16"}),
                   dict(good, id=6, type="quant_layer", params={"model": "m", "revision": "r", "arch": "qwen3_5", "K": 3, "codebook": "i8",
                        "level": "l", "layer": 1, "stamp": "0" * 16, "settings": {"sigma_reg": 0.025, "sigma_reg_in": None, "sigma_reg_out": None,
-                       "scaled_hessian": True, "qtf2": True, "hout": None, "seed_offset": 0}})]
+                       "scaled_hessian": True, "qtf2": True, "hout": None, "seed_offset": 0}}),
+                  dict(good, id=f"{W}/escape/x", lease_id="f" * 32),
+                  dict(good, id=7, lease_id="")]
     fs = ThreadingHTTPServer(("127.0.0.1", PORT + 1), Fake); threading.Thread(target=fs.serve_forever, daemon=True).start()
     lf = open(f"{W}/fake.log", "w")
     p = subprocess.Popen([PY, "-I", f"{HERE}/worker/worker.py", "--server", f"http://127.0.0.1:{PORT + 1}", "--token", "t", "--state", f"{W}/fake",
                           "--poll", "0.2", "--idle-exit", "3"], stdout=lf, stderr=subprocess.STDOUT); procs.append(p); p.wait(30); fs.shutdown()
     rej = {f["job_id"]: f for f in Fake.fails}
-    ok("fake server: all 6 bad jobs rejected", sorted(rej) == [1, 2, 3, 4, 5, 6] and all(f.get("reject") for f in rej.values()),
-       "; ".join(f"{k}: {v['error'][19:80]}" for k, v in sorted(rej.items())))
+    ok("fake server: all 8 bad jobs rejected", sorted(rej, key=str) == sorted([1, 2, 3, 4, 5, 6, 7, f"{W}/escape/x"], key=str)
+       and all(f.get("reject") for f in rej.values()), "; ".join(f"{k}: {v['error'][19:80]}" for k, v in sorted(rej.items(), key=lambda kv: str(kv[0]))))
+    ok("fake server: a job id that is a path creates nothing", not os.path.exists(f"{W}/escape") and
+       not glob.glob(f"{W}/fake/current/*escape*") and not glob.glob(f"{W}/fake/jobs/*escape*"))
     ok("fake server: no download attempted", not Fake.data_hits, str(Fake.data_hits))
 
     # ---- graceful stop: finish, then abandon

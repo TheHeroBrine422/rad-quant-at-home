@@ -309,7 +309,8 @@ nll by ~1e-2: `eval/gold27/README.md`).
 - Send code, shell commands or argv. ourq's and radiance's command lines are built by `jobs/` from validated values
   and run without a shell.
 - Make the worker read or upload any other local file, point it at another host, run it outside its time windows,
-  or make it open a port: the worker only makes outgoing requests.
+  or make it open a port: the worker only makes outgoing requests (the job and lease ids the server sends are checked
+  before they name any path).
 
 Tested against a fake malicious server (TESTS.md): unknown types, extra parameters, path traversal, inputs the
 type doesn't allow, a malformed eval_mix, a bad settings stamp. All were refused, with no download attempted.
