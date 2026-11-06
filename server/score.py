@@ -33,7 +33,7 @@ import jobs
 from common.util import stamp
 from jobs import quant_common as Q
 from checker import exl3dec
-from checker.check import ST, hessian
+from checker.check import ST, hessian, validity, LIMIT_SCALE
 
 # tolerances in log rel: a base per basis (the curve's own scatter, 27B levels) + Z x the honest seed noise of the
 # tensor, NOISE / sqrt(in x out) (a quant's error is a sum over many independent tiles); docs/VERIFY.md
@@ -44,7 +44,6 @@ FAMILY = {f: {"repeat": 0.02, "interp": 0.08, "extrap": 0.08, "extrap_per_bit": 
 NOISE = {f: 30.0 for f in ("q_proj", "k_proj", "v_proj", "in_proj_qkv", "in_proj_z")}
 NOISE_DEFAULT, Z = 8.0, 4.0
 SLOPE = {"mul1": 1.37, "i8": 1.37, "i8c": 1.37, "i4": 1.37}   # -d log rel / dK; 27B i8 levels: 1.358-1.370 (2 ln 2 = 1.386)
-LIMIT_SCALE = 1e3                               # |suh|, |svh| above this (or 0, or not finite): invalid codes
 
 def is_score(p): return isinstance(p, dict) and p.get("verify") == "score"
 
@@ -124,18 +123,6 @@ def codes_sha(t):
     h = hashlib.sha256()
     for x in ("trellis", "suh", "svh"): h.update(np.ascontiguousarray(t[x]).tobytes())
     return h.hexdigest()
-
-
-def validity(key, t, K):
-    """format checks beyond the shapes (Q.check_shard): finite, non-zero, bounded scales; the mul1 marker"""
-    for x in ("suh", "svh"):
-        a = t[x].astype(np.float32)
-        if not np.isfinite(a).all(): return f"{key}.{x}: not finite"
-        if (a == 0).any(): return f"{key}.{x}: zero scale"
-        if np.abs(a).max() > LIMIT_SCALE: return f"{key}.{x}: scale above {LIMIT_SCALE:g}"
-    if int(t["mul1"]) & 0xFFFFFFFF != exl3dec.MUL1: return f"{key}.mul1: marker {int(t['mul1']) & 0xFFFFFFFF:#x}"
-    if t["trellis"].shape[-1] != round(16 * K): return f"{key}.trellis: {t['trellis'].shape[-1]} words per tile, K{K} needs {round(16 * K)}"
-    return None
 
 
 def den_of(S, model_key, key, Wt, H):

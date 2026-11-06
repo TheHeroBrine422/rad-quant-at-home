@@ -396,7 +396,8 @@ For each returned shard:
 
    Tolerance: `|ratio − 1| ≤ 2e-3`. Measured spread for honest results is ≤ 1.7e-4, which comes from fp16
    rounding of the stored scales. Results are not bit-identical across GPUs, but the check compares the codes a
-   worker returned with that worker's own numbers, so cross-GPU nondeterminism doesn't enter it.
+   worker returned with that worker's own numbers, so cross-GPU nondeterminism doesn't enter it. A comparison that is
+   not a finite number, or a shard whose scales are not finite or zero, fails.
 3. Valid-but-bad codes with an honest log pass this check; the spot checks below catch them (a trusted re-run's
    proxy error per tensor, within the seed spread).
 
