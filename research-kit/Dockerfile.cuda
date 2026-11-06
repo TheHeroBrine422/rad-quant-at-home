@@ -21,9 +21,6 @@ flash-linear-attention==0.6.0 scipy pandas matplotlib tqdm pytest ipython"
 ARG TS_VERSION=1.104.5
 ARG TS_SHA256=720cbbccbfc03d8b55df72afc19e5a72e31b0f65934700aa6fa38074d4ad7bf7
 ARG UID=10010
-ARG KIT_COMMIT=unknown
-ARG VERSION=0.0.0-dev
-ARG CREATED=unknown
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -51,6 +48,10 @@ RUN curl -fsSL -o /tmp/ts.tgz https://pkgs.tailscale.com/stable/tailscale_${TS_V
 # the research user: home on the data volume; no sudo, no password, no setuid helpers needed
 RUN useradd -u ${UID} -U -d /data/home -M -s /bin/bash research \
  && mkdir -p /data /run/tailscale && chown research:research /data /run/tailscale && chmod 0750 /data
+# per-build values: declared here, after the heavy layers, so a new commit does not invalidate their cache
+ARG KIT_COMMIT=unknown
+ARG VERSION=0.0.0-dev
+ARG CREATED=unknown
 COPY entrypoint.sh resume-queues.sh selftest.py selftest.sh gpucheck.py research-env.sh /opt/donor-kit/
 RUN install -m 0644 /opt/donor-kit/research-env.sh /etc/profile.d/research-env.sh \
  && sed -i '1i [ -f /etc/profile.d/research-env.sh ] && . /etc/profile.d/research-env.sh' /etc/bash.bashrc /etc/skel/.bashrc \
