@@ -13,8 +13,8 @@ once), a killed worker restarted before / after its lease expired, duplicate com
 caps, disk-cap eviction and the disk-based lease filter, Range resume of a partial download, data access rules,
 malformed jobs from the real server (known type, bad params) and from a fake malicious server (unknown type, extra
 keys, path traversal, inputs the type does not allow, a malformed eval_mix, a bad stamp, a job id that is a path, an
-empty lease id), graceful stop (finish / abandon), time windows, env-only configuration (RQAH_*, then the 0.2
-RADQUANT_* names).
+empty lease id, a job id that tries to forge a log line), graceful stop (finish / abandon), time windows, env-only
+configuration (RQAH_*, then the 0.2 RADQUANT_* names).
 
 0.2 (run_v02, TESTS.md section 8; the GPU side faked by tests/fakes.py, fake_radiance.py, fake_mkgold27.py):
 requirements (VRAM / RAM classes), a 4-card worker (one process per card, device variables, the RAM budget), gang
@@ -397,14 +397,19 @@ def run(procs, srv):
                        "level": "l", "layer": 1, "stamp": "0" * 16, "settings": {"sigma_reg": 0.025, "sigma_reg_in": None, "sigma_reg_out": None,
                        "scaled_hessian": True, "qtf2": True, "hout": None, "seed_offset": 0}}),
                   dict(good, id=f"{W}/escape/x", lease_id="f" * 32),
-                  dict(good, id=7, lease_id="")]
+                  dict(good, id=7, lease_id=""),
+                  dict(good, id="x\n2026-01-01T00:00:00Z job 1 done: {}\x1b[2J", lease_id="f" * 32)]   # a forged log line + a terminal code
     fs = ThreadingHTTPServer(("127.0.0.1", PORT + 1), Fake); threading.Thread(target=fs.serve_forever, daemon=True).start()
     lf = open(f"{W}/fake.log", "w")
     p = subprocess.Popen([PY, "-I", f"{HERE}/worker/worker.py", "--server", f"http://127.0.0.1:{PORT + 1}", "--token", "t", "--state", f"{W}/fake",
                           "--poll", "0.2", "--idle-exit", "3"], stdout=lf, stderr=subprocess.STDOUT); procs.append(p); p.wait(30); fs.shutdown()
     rej = {f["job_id"]: f for f in Fake.fails}
-    ok("fake server: all 8 bad jobs rejected", sorted(rej, key=str) == sorted([1, 2, 3, 4, 5, 6, 7, f"{W}/escape/x"], key=str)
-       and all(f.get("reject") for f in rej.values()), "; ".join(f"{k}: {v['error'][19:80]}" for k, v in sorted(rej.items(), key=lambda kv: str(kv[0]))))
+    forged = "x\n2026-01-01T00:00:00Z job 1 done: {}\x1b[2J"
+    ok("fake server: all 9 bad jobs rejected", sorted(rej, key=str) == sorted([1, 2, 3, 4, 5, 6, 7, f"{W}/escape/x", forged], key=str)
+       and all(f.get("reject") for f in rej.values()), "; ".join(f"{k!r}: {v['error'][19:80]}" for k, v in sorted(rej.items(), key=lambda kv: str(kv[0]))))
+    lf.close(); flog = open(f"{W}/fake.log", "rb").read()
+    ok("fake server: a hostile job id cannot forge a log line or drive the terminal", b"\x1b" not in flog and
+       not any(l.startswith(b"2026-01-01T00:00:00Z") for l in flog.splitlines()) and b"REJECTED: bad job id or lease id" in flog)
     ok("fake server: a job id that is a path creates nothing", not os.path.exists(f"{W}/escape") and
        not glob.glob(f"{W}/fake/current/*escape*") and not glob.glob(f"{W}/fake/jobs/*escape*"))
     ok("fake server: no download attempted", not Fake.data_hits, str(Fake.data_hits))

@@ -313,7 +313,7 @@ nll by ~1e-2: `eval/gold27/README.md`).
   before they name any path).
 
 Tested against a fake malicious server (TESTS.md): unknown types, extra parameters, path traversal, inputs the
-type doesn't allow, a malformed eval_mix, a bad settings stamp, a job id that is a path, an empty lease id. All were refused, with no download attempted.
+type doesn't allow, a malformed eval_mix, a bad settings stamp, a job id that is a path, an empty lease id, a job id carrying a newline and a terminal escape. All were refused, with no download attempted.
 
 **What a worker can do to the server:** lease and finish jobs (as many at once as its slots, at most
 `--max-leases`), read only the files its own active leases list, upload only the declared outputs of its own leases
@@ -739,7 +739,7 @@ exercised yet.
 
 ### Tests
 
-- `tests/e2e_noop.py`: no GPU, ~5 min, 109 checks (116 with the container). Runs the server as a subprocess, or
+- `tests/e2e_noop.py`: no GPU, ~5 min, 110 checks (117 with the container). Runs the server as a subprocess, or
   `E2E_SERVER=docker` for the container; the workers always run on the host. The GPU side is faked on the CPU (`tests/fakes.py`,
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
   privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record; w25: the donor CLI (every
