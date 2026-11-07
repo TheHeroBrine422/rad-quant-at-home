@@ -270,6 +270,7 @@ class Queue:
             self.store.end_lease(db, l, {"abandon": "abandoned", "reject": "rejected", "fail": "failed"}[kind],
                                  error=err, count_attempt=kind != "abandon")
             self.store.event(db, kind, j["id"], w["id"], l["id"], {"error": err[:500]})
+        shutil.rmtree(os.path.join(self.spool, str(int(b["job_id"])), str(b["lease_id"])), ignore_errors=True)
         return {"ok": True}
 
     # ------------------------------------------------------------ uploads
@@ -315,6 +316,23 @@ class Queue:
                 try: n += os.path.getsize(os.path.join(dp, f))
                 except OSError: pass
         return n
+
+    def sweep_spool(self):
+        """uploads that can no longer complete: whole jobs that are accepted / failed / cancelled, and inside open
+        jobs the leases that ended other than by expiry (an expired lease may still finish: the late-result rule)"""
+        try: jobs_ = os.listdir(self.spool)
+        except OSError: return
+        for jd in jobs_:
+            if not jd.isdigit(): continue
+            j = self.store.q("SELECT state FROM jobs WHERE id=?", (int(jd),))
+            if not j or j[0]["state"] in ("accepted", "failed", "cancelled"):
+                shutil.rmtree(os.path.join(self.spool, jd), ignore_errors=True); continue
+            try: leases_ = os.listdir(os.path.join(self.spool, jd))
+            except OSError: continue                       # removed by complete() or fail() meanwhile
+            for ld in leases_:
+                l = self.store.q("SELECT state FROM leases WHERE id=?", (ld,))
+                if not l or l[0]["state"] not in ("active", "expired"):
+                    shutil.rmtree(os.path.join(self.spool, jd, ld), ignore_errors=True)
 
     # ------------------------------------------------------------ completion
     def complete(self, w, b):
@@ -638,7 +656,7 @@ def main():
     def reaper():
         while True:
             time.sleep(min(5.0, a.lease_s / 4))
-            try: Handler.Q.store.expire()
+            try: Handler.Q.store.expire(); Handler.Q.sweep_spool()
             except Exception: traceback.print_exc()
     threading.Thread(target=reaper, daemon=True).start()
     if a.status_interval > 0:

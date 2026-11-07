@@ -329,6 +329,16 @@ def run(procs, srv):
     req("POST", "/api/v0/fail", {"job_id": job2["id"], "lease_id": job2["lease_id"], "error": "test", "abandon": True}, token=t_client)
     r2 = db().execute("SELECT state, attempts FROM jobs WHERE id=?", (job2["id"],)).fetchone()
     ok("abandon returns the job without counting an attempt", tuple(r2) == ("queued", 0), str(tuple(r2)))
+    # the spool of an ended lease is deleted (issue #6): on fail at once, on cancel by the reaper
+    c, r = req("POST", "/api/v0/lease", caps, token=t_client); jf = r["job"]
+    uf = f"/api/v0/upload/{jf['id']}/{jf['lease_id']}/out.bin"
+    req("PUT", f"{uf}?offset=0", body[:3000], token=t_client)
+    req("POST", "/api/v0/fail", {"job_id": jf["id"], "lease_id": jf["lease_id"], "error": "test"}, token=t_client)
+    ok("spool: a failed lease's uploads are deleted at once", not os.path.exists(f"{SPOOL}/{jf['id']}/{jf['lease_id']}"))
+    c, r = req("POST", "/api/v0/lease", caps, token=t_client); jc = r["job"]
+    req("PUT", f"/api/v0/upload/{jc['id']}/{jc['lease_id']}/out.bin?offset=0", body[:3000], token=t_client)
+    admin("cancel", str(jc["id"]))
+    ok("spool: a cancelled job's uploads are deleted by the reaper", wait(lambda: not os.path.exists(f"{SPOOL}/{jc['id']}"), 10))
     admin("cancel", str(job2["id"]))
     # the server-wide upload ceiling (--upload-max-mb 48 = 50331648 B) under a job type's own cap (64 MiB)
     admin("enqueue-noop", "1", "--seconds", "0", "--size", str(64 << 20), "--seed", "250", "--tag", "bigout")

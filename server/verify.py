@@ -149,6 +149,7 @@ def quarantine(S, db, results, wid, reason):
     if w is None: return 0
     db.execute("UPDATE workers SET quarantined=1, quarantine_reason=? WHERE id=?", (reason[:500], wid))
     now = time.time()
+    # its spool dirs: Queue.sweep_spool (the reaper)
     for l in db.execute("SELECT * FROM leases WHERE worker_id=? AND state='active'", (wid,)).fetchall():
         db.execute("UPDATE leases SET state='cancelled', ended=? WHERE id=?", (now, l["id"]))
         db.execute("UPDATE jobs SET state='queued', lease_id=NULL, lease_owner=NULL, lease_expires=NULL, exclude_worker=?, "
