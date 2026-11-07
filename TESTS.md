@@ -32,13 +32,14 @@ see section 7.
 | disk cap eviction | cache cap 700 kB, four 300 kB inputs a, b, c, a → 2 evictions, cache ≤ cap; a job needing 900 kB is not leased to this worker | pass |
 | Range resume | 120 kB of a 300 kB input already in `<sha>.part` → 180 kB downloaded, sha256 verified | pass |
 | malformed jobs from our server | `noop` with `seconds: "3"` and with an extra key `cmd` (injected into the DB) → every worker rejects, the job fails after `max_attempts` (2) with 2 `reject` events; workers keep running | pass |
-| fake malicious server | 6 crafted leases (unknown type `shell`; extra key `argv`; input `test/../../etc/passwd`; an input the type does not allow; `eval_mix` (unimplemented); `quant_layer` with a wrong settings stamp) → all 6 rejected via `fail` with `reject`, **no download attempted** | pass |
+| fake malicious server | 9 crafted leases (unknown type `shell`; extra key `argv`; input `test/../../etc/passwd`; an input the type does not allow; `eval_mix` (unimplemented); `quant_layer` with a wrong settings stamp; a job id that is a path; an empty lease id; a job id carrying a newline and a terminal escape) → all 9 rejected via `fail` with `reject`, **no download attempted**, no file created at the path the job id names, the hostile id escaped in the worker log | pass |
 | graceful stop | SIGTERM → finishes the current job, exits 0; `--on-stop abandon` → job handed back within 5 s, attempt not counted | pass |
 | time windows | window arithmetic incl. across midnight; a worker outside its window leases nothing | pass |
 
 Request overhead: a 1 s noop job takes 1.01 s lease-to-complete on localhost.
 
 Security fix round (issue #1, the three Content-Length cases above): macOS dev box, 2026-11-06, **111/111** (plain process).
+Security fix round (issue #2, the three lease-id cases above): macOS dev box, 2026-11-06, **110/110** (plain process).
 
 ## 2. Server throughput (the queue host, loopback, niced)
 

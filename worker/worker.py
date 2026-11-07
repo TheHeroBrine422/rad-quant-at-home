@@ -278,8 +278,11 @@ class Worker:
         self.stats_path = os.path.join(a.state, "worker.jsonl")
         legacy = os.path.join(a.state, "current.json")                       # a v0 state dir: one job
         if os.path.exists(legacy):
-            c = read_json(legacy); c.setdefault("devices", self.gpus[:1])
-            write_json_atomic(self.cur_path(c["job"]), c); os.remove(legacy)
+            c = read_json(legacy)
+            if not (c and self.ids_ok(c.get("job") or {})): log(f"{legacy}: bad job or lease id; leaving it in place")
+            else:
+                c.setdefault("devices", self.gpus[:1])
+                write_json_atomic(self.cur_path(c["job"]), c); os.remove(legacy)
         tok = a.token or (open(a.token_file).read().strip() if a.token_file and os.path.exists(a.token_file) else None)
         self.c = Client(a.server, tok)
         if not tok:
@@ -417,9 +420,23 @@ class Worker:
         self.meter.reserve(job["id"], down, up)
         return None
 
+    @staticmethod
+    def ids_ok(job):
+        """the job id and lease id the server (or a state file) gave us are what the server itself produces: a
+        non-negative integer and 32 hex characters; nothing builds a path from them before this is true"""
+        jid, lid = job.get("id"), job.get("lease_id")
+        return isinstance(jid, int) and not isinstance(jid, bool) and jid >= 0 and isinstance(lid, str) and bool(re.fullmatch(r"[0-9a-f]{32}", lid))
+
+    @classmethod
+    def shown_id(cls, job):
+        """a job id for the log: plain when it passed ids_ok, else escaped and cut (a hostile server's id must not
+        forge log lines or drive the terminal)"""
+        return job.get("id") if cls.ids_ok(job) else ascii(str(job.get("id"))[:80])
+
     def validate(self, job):
         """is this a job we run, with parameters and inputs it allows? (no code from the server, ever) -> (module,
         its requirements); raises jobs.Rejected"""
+        if not self.ids_ok(job): raise jobs.Rejected("bad job id or lease id")
         m = jobs.check_params(job["type"], job["params"])
         if not m.IMPLEMENTED: raise jobs.Rejected(f"{job['type']} is not implemented in this worker")
         if job["type"] not in self.types: raise jobs.Rejected(f"{job['type']} not enabled here")
@@ -436,7 +453,7 @@ class Worker:
         """check a leased (or resumed) job, give it its cards and RAM and a thread; refuse what does not fit"""
         try: m, own = self.validate(job)
         except jobs.Rejected as e:
-            log(f"job {job['id']}: REJECTED: {e}")
+            log(f"job {self.shown_id(job)}: REJECTED: {e}")
             self.fail(job, f"rejected by worker: {e}", reject=True)
             if cur: self.cleanup(cur)
             return
@@ -461,6 +478,8 @@ class Worker:
 
     def resume(self, cur):
         j = cur["job"]
+        if not self.ids_ok(j):
+            log(f"state file for job {self.shown_id(j)}: bad id or lease id; ignoring it"); return
         try: hb = self.c.api("POST", "heartbeat", {"job_id": j["id"], "lease_id": j["lease_id"]}, tries=5)
         except Exception as e: hb = {"ok": False, "cancel": True, "error": repr(e)}
         if hb.get("cancel"):
