@@ -331,16 +331,16 @@ def run(procs, srv):
     ok("abandon returns the job without counting an attempt", tuple(r2) == ("queued", 0), str(tuple(r2)))
     admin("cancel", str(job2["id"]))
     # a worker that failed a job is not leased it again until the operator requeues it (issue #5)
-    def lease_until(jid):
-        """lease with t_client until job jid is offered (abandon anything else) -> the lease, or None when it never is"""
+    def lease_until(jid, tok=t_client):
+        """lease with tok until job jid is offered (abandon anything else) -> the lease, or None when it never is"""
         for _ in range(10):
-            c, r = req("POST", "/api/v0/lease", caps, token=t_client); j = r.get("job")
+            c, r = req("POST", "/api/v0/lease", caps, token=tok); j = r.get("job")
             if not j: return None
             if j["id"] == jid: return j
-            req("POST", "/api/v0/fail", {"job_id": j["id"], "lease_id": j["lease_id"], "error": "skip", "abandon": True}, token=t_client)
+            req("POST", "/api/v0/fail", {"job_id": j["id"], "lease_id": j["lease_id"], "error": "skip", "abandon": True}, token=tok)
         return None
-    def give_back(j):
-        if j: req("POST", "/api/v0/fail", {"job_id": j["id"], "lease_id": j["lease_id"], "error": "skip", "abandon": True}, token=t_client)
+    def give_back(j, tok=t_client):
+        if j: req("POST", "/api/v0/fail", {"job_id": j["id"], "lease_id": j["lease_id"], "error": "skip", "abandon": True}, token=tok)
     admin("enqueue-noop", "1", "--seconds", "0", "--size", "100", "--seed", "260", "--tag", "failonce")
     jfo = jobs_of("failonce")[0]
     got = lease_until(jfo)
@@ -353,6 +353,17 @@ def run(procs, srv):
     ok("a worker that failed a job is not leased it again until admin requeue; another worker runs it",
        got is not None and again is None and tuple(att) == ("queued", 1) and back is not None and states()[jfo] == "accepted",
        f"again={again is not None} {tuple(att)} back={back is not None} {states()[jfo]}")
+    tv = admin("add-worker", "verif-x").split()[3]
+    admin("verifier", str(db().execute("SELECT id FROM workers WHERE name=?", ("verif-x",)).fetchone()[0]))
+    admin("enqueue-noop", "1", "--seconds", "0", "--size", "100", "--seed", "261", "--tag", "vfail", "--priority", "20")  # ahead of the queued spot re-runs (10)
+    jvf = jobs_of("vfail")[0]
+    # a verifier is never excluded: a spot-check re-run that every verifier failed once must not stay queued forever
+    v1 = lease_until(jvf, tv)
+    if v1: req("POST", "/api/v0/fail", {"job_id": jvf, "lease_id": v1["lease_id"], "error": "test"}, token=tv)
+    v2 = lease_until(jvf, tv); give_back(v2, tv)
+    admin("cancel", str(jvf))
+    ok("a verifier that failed a job is offered it again (re-runs must not strand)",
+       v1 is not None and v2 is not None, f"v1={v1 is not None} v2={v2 is not None}")
     # the server-wide upload ceiling (--upload-max-mb 48 = 50331648 B) under a job type's own cap (64 MiB)
     admin("enqueue-noop", "1", "--seconds", "0", "--size", str(64 << 20), "--seed", "250", "--tag", "bigout")
     c, r = req("POST", "/api/v0/lease", caps, token=t_client); job3 = r["job"]

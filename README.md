@@ -178,7 +178,7 @@ itself: [research-kit/](research-kit/README.md).
   leasing). It filters by the worker's declared data budget (each job type declares its expected upload,
   `upload_bytes`), and a higher-class job that a busy worker keeps passing over drains that worker after
   `--class-wait-s`. A worker that failed, rejected or let expire a lease on a job is not offered that job again until
-  the operator requeues it (`admin.py requeue` also gives a still-queued job this fresh chance).
+  the operator requeues it (verifier workers are never excluded) (`admin.py requeue` also gives a still-queued job this fresh chance).
 - **Admin** (`server/admin.py`): data (`datapack`, `ladder-add`, `golden-add`, `corpus-add`, `manifest`), jobs
   (`enqueue-level`, `enqueue-golden`, `batch-submit` / `-status` / `-collect`, `list`, `queue`, `reprioritize`, `events`,
   `requeue`, `cancel`),
@@ -739,7 +739,7 @@ exercised yet.
 
 ### Tests
 
-- `tests/e2e_noop.py`: no GPU, ~5 min, 108 checks (115 with the container). Runs the server as a subprocess, or
+- `tests/e2e_noop.py`: no GPU, ~5 min, 110 checks (117 with the container). Runs the server as a subprocess, or
   `E2E_SERVER=docker` for the container; the workers always run on the host. The GPU side is faked on the CPU (`tests/fakes.py`,
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
   privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record; w25: the donor CLI (every

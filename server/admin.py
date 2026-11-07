@@ -17,7 +17,7 @@ the 0.2 names $RADQUANT_* are still read in 0.3)
   enqueue-noop N [--seconds S] [--size B] [--inputs a,b] [--tag T]
   list [--state S] [--level L] [--type T]   jobs
   events [JOB]                           the audit log
-  requeue IDS|--level L|--state S [--force]   back to the queue (accepted ones only with --force)
+  requeue IDS|--level L|--state S [--force]   back to the queue (accepted ones only with --force); a queued job: attempts and per-worker exclusions reset
   cancel IDS|--level L
   export --level L OUT [--partial]       accepted shards of a level in ourq.py's layout (q-LNN.safetensors + index)
   check --level L [--rows-frac F]        run checker/check.py on the level's accepted results, store the verdict
