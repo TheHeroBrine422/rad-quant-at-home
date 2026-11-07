@@ -9,7 +9,9 @@ affinity inside a level but never across classes; a budgeted worker gets the lea
 filter (download = uncached inputs only, upload = the type's expected upload) and a randomized property check that no
 granted job exceeds the declared budget; the over-budget answer; the cache report protocol (full list, rev only,
 unknown rev after a server restart); the class-wait drain (a busy worker passing over an aged higher-class job is
-drained for it, not for a same-class one, not before the window); the expect field of a granted job."""
+drained for it, not for a same-class one, not before the window); the expect field of a granted job; /data only
+while a lease is live (#15); a lease's hard deadline (#7: renewals stop at it, the job is reissued, a late result
+still counts, abandon + lease again keeps the clock)."""
 import argparse, json, os, random, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -289,6 +291,59 @@ def main():
     with S.tx() as db: db.execute("UPDATE leases SET expires=? WHERE job_id=?", (time.time() - 1, j))     # the reaper has not run yet
     ok("may_read: an active lease past its expiry no longer opens its inputs (before the reaper marks it) (#15)",
        r.get("job") and before and not Q.may_read(w, "test/f1") and not Q.may_read(w, "test/f2"))
+
+    # ---------------------------------------------------------------- #7: a lease's hard deadline
+    import hashlib, io
+    d, a = setup("deadline")
+    manifest(d, files)
+    Q = Queue(a); S = Q.store
+    j = noop(S, size=1000, sizes=sizes)
+    wa, wb = worker(S, "w11"), worker(S, "w12")
+    ra = Q.lease(wa, caps())
+    la = S.q("SELECT * FROM leases WHERE job_id=?", (j,))[0]
+    ok("a lease carries a deadline: max(2 h, 3 x the type's reference minutes) after it was issued (#7)",
+       ra.get("job") and abs(la["deadline"] - la["issued"] - 7200) < 1e-6 and ra["job"]["lease_deadline"] == la["deadline"]
+       and Q.lease_cap("noop", {"seconds": 3600, "size": 1, "seed": 0}) == 3 * 60 * 60.1)
+    with S.tx() as db: db.execute("UPDATE leases SET deadline=? WHERE id=?", (time.time() + 10, la["id"]))
+    hb = Q.heartbeat(wa, {"job_id": j, "lease_id": la["id"]})
+    ok("heartbeats renew a lease only up to its deadline", hb["ok"] and hb["lease_expires"] == hb["lease_deadline"] and
+       hb["lease_expires"] < time.time() + a.lease_s - 60, hb)
+    with S.tx() as db: db.execute("UPDATE leases SET deadline=? WHERE id=?", (time.time() - 1, la["id"]))
+    hb = Q.heartbeat(wa, {"job_id": j, "lease_id": la["id"]})
+    st = S.q("SELECT l.state ls, j.state js FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.id=?", (la["id"],))[0]
+    ok("past its deadline a heartbeating lease expires and the job is requeued; the worker is told it may still finish",
+       hb.get("ok") is False and hb.get("cancel") is False and hb.get("deadline") and tuple(st) == ("expired", "queued"), (hb, tuple(st)))
+    rb = Q.lease(wb, caps()); ra2 = Q.lease(wa, caps())
+    ok("the job is reissued to another worker (not to the one that held it: #5's exclusion)",
+       rb.get("job") and rb["job"]["id"] == j and not ra2.get("job"), (rb.get("job", {}).get("id"), ra2.get("job")))
+    body = jobs.get("noop").content(0, 1000)
+    Q.upload(wa, j, la["id"], "out.bin", 0, len(body), io.BytesIO(body))
+    rc = Q.complete(wa, {"job_id": j, "lease_id": la["id"], "files": {"out.bin": {"sha256": hashlib.sha256(body).hexdigest(), "size": 1000}}})
+    lb = S.q("SELECT state FROM leases WHERE id=?", (rb["job"]["lease_id"],))[0][0]
+    ok("a late result from the expired lease still counts while no other result is accepted (the late-result rule)",
+       rc.get("duplicate") is False and S.q("SELECT accepted_by FROM jobs WHERE id=?", (j,))[0][0] == wa["id"] and lb == "superseded", (rc, lb))
+    # abandon and lease again: the same clock
+    j2 = noop(S, size=10, sizes=sizes)
+    wc, wd = worker(S, "w13"), worker(S, "w14")
+    r1 = Q.lease(wc, caps()); l1 = S.q("SELECT * FROM leases WHERE id=?", (r1["job"]["lease_id"],))[0]
+    Q.fail(wc, {"job_id": j2, "lease_id": l1["id"], "abandon": True, "error": "x"})
+    time.sleep(0.01)
+    r2 = Q.lease(wc, caps()); l2 = S.q("SELECT * FROM leases WHERE id=?", (r2["job"]["lease_id"],))[0]
+    ok("abandon + lease again keeps the first lease's deadline (a worker's leases of one job share one clock)",
+       r2["job"]["id"] == j2 and abs(l2["deadline"] - (l1["issued"] + 7200)) < 1e-6 and l2["issued"] > l1["issued"])
+    Q.fail(wc, {"job_id": j2, "lease_id": l2["id"], "abandon": True, "error": "x"})
+    with S.tx() as db: db.execute("UPDATE leases SET issued=issued-7300 WHERE id=?", (l1["id"],))
+    r3, r4 = Q.lease(wc, caps()), Q.lease(wd, caps())
+    ok("... and once that clock has run out the worker is not offered the job again; another worker is",
+       not r3.get("job") and r4.get("job") and r4["job"]["id"] == j2 and
+       S.q("SELECT attempts FROM jobs WHERE id=?", (j2,))[0][0] == 1, (r3.get("job"), r4.get("job", {}).get("id")))
+    # the reaper: an idle lease whose expiry reached its deadline is logged as such
+    j3 = noop(S, size=10, sizes=sizes); we = worker(S, "w15"); r5 = Q.lease(we, caps())
+    with S.tx() as db: db.execute("UPDATE leases SET deadline=?, expires=? WHERE id=?", (time.time() - 1, time.time() - 1, r5["job"]["lease_id"]))
+    S.expire()
+    ev = S.q("SELECT detail FROM events WHERE kind='expire' AND lease_id=?", (r5["job"]["lease_id"],))
+    ok("the reaper expires a lease at its deadline (event: past its deadline)", ev and "deadline" in (ev[0][0] or "") and
+       S.q("SELECT state FROM jobs WHERE id=?", (j3,))[0][0] == "queued")
 
     n = sum(1 for _, p in RESULTS if p)
     print(f"\n{n}/{len(RESULTS)} checks passed")

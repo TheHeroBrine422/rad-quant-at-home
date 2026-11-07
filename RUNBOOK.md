@@ -90,7 +90,9 @@ $A manifest --jobs 8                                                            
   are one person: `$A link WORKER DONOR`. Donors see their own side with `radquant status | jobs | points | logs`.
 - A job that keeps failing: `$A events JOB` (worker errors are in the `fail` events), fix, `$A requeue JOB`. A queued
   job no worker takes (every capable worker failed it within the last `--refail-s`, default 1 h): `$A requeue JOB`
-  resets its attempts and the exclusions at once.
+  resets its attempts and the exclusions at once. A lease ends at its deadline even while it heartbeats
+  (`RQAH_LEASE_CAP_X` 3 × the type's reference runtime, at least `RQAH_LEASE_CAP_MIN_S` 2 h; `expire` events with
+  "past its deadline"): the job is reissued, and the old holder's result still counts if it comes first.
   A level to redo: `$A requeue --level L --force` (accepted results are moved aside). Stop work: `$A cancel --level L`.
 - A gang job waits for a multi-card worker to drain (`reserve` events); a drain that has not finished after
   `RQAH_RESERVE_MAX_S` is given up and may be retried by another worker.

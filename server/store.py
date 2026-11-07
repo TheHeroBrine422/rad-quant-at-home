@@ -22,7 +22,9 @@ rel, codes sha256, kind donor | trusted | published, state pass | fail | provisi
 per tensor, computed once).
 
 0.4: jobs.requeued (the last admin requeue / invalidate: a worker's failed, rejected or expired leases before it no
-longer exclude it, #5)."""
+longer exclude it, #5).
+
+0.5: leases.deadline (#7: heartbeats renew a lease only up to it; then it expires like a missed heartbeat)."""
 import hashlib, json, os, secrets, sqlite3, threading, time
 
 SCHEMA = """
@@ -66,7 +68,7 @@ MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "ve
            ("jobs", "needs", "TEXT"), ("jobs", "verify_of", "INTEGER"), ("jobs", "verify_state", "TEXT"),
            ("jobs", "verify_detail", "TEXT"), ("jobs", "exclude_worker", "INTEGER"),
            ("workers", "donor_id", "INTEGER"), ("invites", "personal", "INTEGER NOT NULL DEFAULT 0"), ("invites", "donor_id", "INTEGER"),
-           ("jobs", "requeued", "REAL")]
+           ("jobs", "requeued", "REAL"), ("leases", "deadline", "REAL")]
 
 
 def h(s): return hashlib.sha256(s.encode()).hexdigest()
@@ -172,14 +174,20 @@ class Store:
             if getattr(self, "reserve_max_s", None):
                 db.execute("DELETE FROM reservations WHERE t < ?", (now - self.reserve_max_s,))
             for l in db.execute("SELECT * FROM leases WHERE state='active' AND expires<?", (now,)).fetchall():
-                db.execute("UPDATE leases SET state='expired', ended=? WHERE id=?", (now, l["id"]))
-                j = db.execute("SELECT * FROM jobs WHERE id=?", (l["job_id"],)).fetchone()
-                if j and j["state"] == "leased" and j["lease_id"] == l["id"]:
-                    st = "failed" if j["attempts"] >= j["max_attempts"] else "queued"
-                    db.execute("UPDATE jobs SET state=?, lease_id=NULL, lease_owner=NULL, lease_expires=NULL, updated=?, "
-                               "error=COALESCE(error, '') || ? WHERE id=?", (st, now, f"[lease {l['id'][:8]} expired]", j["id"]))
-                self.event(db, "expire", l["job_id"], l["worker_id"], l["id"]); n += 1
+                past = l["deadline"] is not None and l["expires"] >= l["deadline"]
+                self.expire_lease(db, l, now, why="past its deadline" if past else "expired"); n += 1
         return n
+
+    def expire_lease(self, db, l, now, why="expired"):
+        """lease l ends as expired; its job goes back to the queue (or fails: no attempts left). The worker may still
+        finish it: a late result counts while the job is open (Queue.complete)"""
+        db.execute("UPDATE leases SET state='expired', ended=? WHERE id=?", (now, l["id"]))
+        j = db.execute("SELECT * FROM jobs WHERE id=?", (l["job_id"],)).fetchone()
+        if j and j["state"] == "leased" and j["lease_id"] == l["id"]:
+            st = "failed" if j["attempts"] >= j["max_attempts"] else "queued"
+            db.execute("UPDATE jobs SET state=?, lease_id=NULL, lease_owner=NULL, lease_expires=NULL, updated=?, "
+                       "error=COALESCE(error, '') || ? WHERE id=?", (st, now, f"[lease {l['id'][:8]} {why}]", j["id"]))
+        self.event(db, "expire", l["job_id"], l["worker_id"], l["id"], None if why == "expired" else {"why": why})
 
     def end_lease(self, db, lease, state, job_state=None, error=None, count_attempt=True):
         now = time.time()

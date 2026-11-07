@@ -92,9 +92,9 @@ def fixture(db):
                        json.dumps({"gpu": True, "cards": cards}), state, level, ids.get(by), t if state == "accepted" else None,
                        check, verify, t - 600, t, err, needs, f"{jid[0]:032x}" if state == "accepted" else None))
             if state == "accepted":
-                d.execute("INSERT INTO leases VALUES(?,?,?,?,?, 'done', ?, NULL)", (f"{jid[0]:032x}", jid[0], ids[by], t - 300, t + 60, t))
+                d.execute("INSERT INTO leases(id, job_id, worker_id, issued, expires, state, ended) VALUES(?,?,?,?,?, 'done', ?)", (f"{jid[0]:032x}", jid[0], ids[by], t - 300, t + 60, t))
             if state == "leased":
-                d.execute("INSERT INTO leases VALUES(?,?,?,?,?, 'active', NULL, NULL)", (f"{jid[0]:032x}", jid[0], ids[by], t, NOW + 60))
+                d.execute("INSERT INTO leases(id, job_id, worker_id, issued, expires, state) VALUES(?,?,?,?,?, 'active')", (f"{jid[0]:032x}", jid[0], ids[by], t, NOW + 60))
             return jid[0]
         qp = lambda lvl, l: {"model": "q", "revision": "1", "level": lvl, "layer": l, "K": 3, "codebook": "i8",
                              "settings": {"hout": "/srv/secret/hout/private-snap"}, "stamp": "x"}

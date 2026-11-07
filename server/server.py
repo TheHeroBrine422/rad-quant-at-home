@@ -105,6 +105,7 @@ class Queue:
         self.upload_max = int(a.upload_max_mb * (1 << 20)) if a.upload_max_mb else None
         self.spool_max = int(a.spool_max_gb * 1e9) if a.spool_max_gb else None
         self.refail_s = float(getattr(a, "refail_s", 3600))
+        self.cap_x, self.cap_min_s = float(getattr(a, "lease_cap_x", 3.0)), float(getattr(a, "lease_cap_min_s", 7200))
         # bytes in the spool, cached: an os.walk per upload chunk grew with the orphans; uploads add, fail / complete
         # subtract, and the reaper's recount (sweep_spool, every tick) keeps it honest
         self.spool_lock = threading.Lock()
@@ -195,6 +196,9 @@ class Queue:
             failed = frozenset() if wr["verifier"] else {r["job_id"] for r in db.execute(
                 "SELECT DISTINCT l.job_id FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND j.state='queued' "
                 "AND l.state IN ('failed','rejected','expired') AND l.issued > COALESCE(j.requeued, 0)" + win, (w["id"],))}
+            if not wr["verifier"]:                          # #7: abandon + lease again does not restart the deadline
+                failed = set(failed) | {jid for jid, t0 in self._held(db, w["id"]).items()
+                                        if (c := self._cap_of(db, jid)) is not None and t0 + c <= now}
             eligible = job_filter(wr, caps, failed)
             tr = SCH.Transfers(self.manifest(), self.up_memo)
 
@@ -248,10 +252,36 @@ class Queue:
                     "why": f"{over} queued jobs this worker could run need more data than its budget has left"}
         return {"job": None, "retry_s": self.a.retry_s}
 
+    def lease_cap(self, jtype, params):
+        """#7: the longest a lease may be held, renewed or not: --lease-cap-x times the type's reference runtime
+        (lumens(p) = R9700 card-minutes), at least --lease-cap-min-s; None = no cap (--lease-cap-x 0)"""
+        if self.cap_x <= 0: return None
+        try: lum = float(jobs.get(jtype).lumens(params))
+        except Exception: lum = 0.0
+        return max(self.cap_min_s, self.cap_x * 60 * lum)
+
+    def _cap_of(self, db, job_id):
+        j = db.execute("SELECT type, params FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return self.lease_cap(j["type"], json.loads(j["params"])) if j else None
+
+    @staticmethod
+    def _held(db, wid, job_id=None):
+        """{job id: when this worker first leased it} over its abandoned leases of still-queued jobs since their last
+        requeue: a worker's leases of one job share one deadline"""
+        q = ("SELECT l.job_id, MIN(l.issued) t0 FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND "
+             "l.state='abandoned' AND l.issued > COALESCE(j.requeued, 0)")
+        a = [wid]
+        if job_id is not None: q += " AND l.job_id=?"; a.append(job_id)
+        return {r["job_id"]: r["t0"] for r in db.execute(q + " GROUP BY l.job_id", a)}
+
     def _grant(self, db, w, j, r, now, tr=None, cached=frozenset()):
-        lid = secrets.token_hex(16); exp = now + self.lease_s
+        lid = secrets.token_hex(16)
+        cap = self.lease_cap(j["type"], json.loads(j["params"]))
+        deadline = None if cap is None else min(now, self._held(db, w["id"], j["id"]).get(j["id"], now)) + cap
+        exp = now + self.lease_s if deadline is None else min(now + self.lease_s, deadline)
         db.execute("DELETE FROM reservations WHERE job_id=?", (j["id"],))
-        db.execute("INSERT INTO leases VALUES(?,?,?,?,?, 'active', NULL, NULL)", (lid, j["id"], w["id"], now, exp))
+        db.execute("INSERT INTO leases(id, job_id, worker_id, issued, expires, state, deadline) VALUES(?,?,?,?,?, 'active', ?)",
+                   (lid, j["id"], w["id"], now, exp, deadline))
         db.execute("UPDATE jobs SET state='leased', attempts=attempts+1, lease_id=?, lease_owner=?, lease_expires=?, "
                    "updated=? WHERE id=?", (lid, w["id"], exp, now, j["id"]))
         self.store.event(db, "lease", j["id"], w["id"], lid)
@@ -261,7 +291,7 @@ class Queue:
                         "expect": {"down": tr.down(j, cached)[0], "up": tr.up(j)},
                         "inputs": [{"name": n, "sha256": man[n]["sha256"], "size": man[n]["size"]} for n in json.loads(j["inputs"])],
                         "outputs": jobs.get(j["type"]).outputs(params), "requires": r,
-                        "lease_id": lid, "lease_expires": exp, "heartbeat_s": self.hb_s}}
+                        "lease_id": lid, "lease_expires": exp, "lease_deadline": deadline, "heartbeat_s": self.hb_s}}
 
     def _lease(self, db, w, job_id, lease_id):
         l = db.execute("SELECT * FROM leases WHERE id=? AND job_id=?", (str(lease_id), job_id)).fetchone()
@@ -277,10 +307,15 @@ class Queue:
             if l["state"] != "active" or j["state"] in ("accepted", "cancelled", "failed"):
                 late_ok = l["state"] == "expired" and j["state"] in ("queued", "leased")
                 return {"ok": False, "cancel": not late_ok, "state": l["state"], "job_state": j["state"]}
-            exp = now + self.lease_s
+            if l["deadline"] is not None and now >= l["deadline"]:
+                # #7: held as long as the job type may take (x3, >= 2 h): the job goes back to the queue. The worker may
+                # still finish: its result counts if it arrives before another one is accepted
+                self.store.expire_lease(db, l, now, why="past its deadline")
+                return {"ok": False, "cancel": False, "state": "expired", "job_state": "queued", "deadline": True}
+            exp = now + self.lease_s if l["deadline"] is None else min(now + self.lease_s, l["deadline"])
             db.execute("UPDATE leases SET expires=? WHERE id=?", (exp, l["id"]))
             db.execute("UPDATE jobs SET lease_expires=? WHERE id=?", (exp, j["id"]))
-            return {"ok": True, "cancel": False, "lease_expires": exp}
+            return {"ok": True, "cancel": False, "lease_expires": exp, "lease_deadline": l["deadline"]}
 
     def fail(self, w, b):
         with self.store.tx() as db:
@@ -678,6 +713,11 @@ def main():
     ap.add_argument("--refail-s", type=float, default=env("REFAIL_S", 3600, float),
                     help="a worker that failed / let expire a job may lease it again after this many seconds (0: only "
                          "after the job is requeued; default 1 h)")
+    ap.add_argument("--lease-cap-x", type=float, default=env("LEASE_CAP_X", 3.0, float),
+                    help="a lease expires after this many times its job type's reference runtime even while it heartbeats "
+                         "(#7; the job is requeued, a late result still counts while the job is open; 0: no cap)")
+    ap.add_argument("--lease-cap-min-s", type=float, default=env("LEASE_CAP_MIN_S", 7200, float),
+                    help="... but never before this many seconds (default 2 h)")
     ap.add_argument("--admin-token-file", default=env("ADMIN_TOKEN_FILE"),
                     help="enables the read-only GET /api/v0/admin/summary for this bearer token")
     ap.add_argument("--status-interval", type=float, default=env("STATUS_INTERVAL", 60, float),

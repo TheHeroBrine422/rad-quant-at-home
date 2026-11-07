@@ -169,7 +169,9 @@ itself: [research-kit/](research-kit/README.md).
 - **Server** (`server/server.py`, Python stdlib only): workers register with an invite code and get a token (only
   its sha256 is stored). The job table holds type, params, inputs, requirements, state, lease owner / expiry,
   attempts, result, spot-check state. A reaper thread puts jobs whose leases missed their heartbeat back in the queue
-  and deletes the spooled uploads of leases that can no longer complete (an expired lease's upload is kept while its
+  (0.5: also leases past their deadline, `--lease-cap-x` 3 × the job type's reference runtime and at least
+  `--lease-cap-min-s` 2 h after the lease was issued, however often they heartbeat; abandoning and leasing the job again
+  does not restart that clock) and deletes the spooled uploads of leases that can no longer complete (an expired lease's upload is kept while its
   job is still open: the late-result rule); a job fails for good after `max_attempts` (default 5). Completion is
   idempotent: once a job is accepted, any later completion or upload for it is acknowledged and ignored. A late
   result from an expired lease is still accepted if nobody has finished the job yet, and the newer lease is then
