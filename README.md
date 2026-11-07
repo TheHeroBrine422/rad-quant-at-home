@@ -24,6 +24,12 @@ steps were built and run on the 4070 without Docker, `tests/cuda_rootfs.sh`, but
 ≥ 8 GB of free RAM per compile job; ROCm: with radiance inside), `docker run --gpus` on an NVIDIA host, and one real
 R9700 job of each type.
 
+What is new on this branch (after 0.4.0):
+- **Credit by display name:** the leaderboard has one row per public display name (case-insensitive); use the same
+  name on every machine. `rqah link` is gone.
+- **Open registration:** an invite is optional. Without one a worker starts on probation (server-scored quantization
+  jobs only, one at a time until a few pass; evaluations later), rate-limited per address.
+
 What is new in 0.4:
 - **Bandwidth limits for donors** on data caps or slow links: rate caps (`--max-down-mbps`, `--max-up-mbps`) and day /
   month data budgets (`--max-down-gb-day` ...). The server offers a worker only jobs whose downloads and uploads fit
@@ -66,7 +72,10 @@ will be allowed to do, and writes `worker.env` (mode 0600), `compose.yaml` and `
 `--answers FILE` runs it without questions. It needs no sudo, and it uses the network only if you ask it to pull the
 image or start the worker. Details: [docs/SETUP.md](docs/SETUP.md). Or write the line yourself:
 
-**Run it** (one line; the invite code and the queue URL come from us). AMD:
+**Run it** (one line; the queue URL comes from us, and so does an invite code if you have one). **The invite is
+optional:** without `RQAH_INVITE` the worker registers on its own and starts **on probation**: quantization jobs only
+(checked by the server itself), one at a time until 3 of its results pass, evaluations after 5 (`rqah status` shows
+how far). An invite skips that. AMD:
 
 ```bash
 docker run -d --name rad-quant-at-home --restart unless-stopped --device /dev/kfd --device /dev/dri \
@@ -168,8 +177,8 @@ itself: [research-kit/](research-kit/README.md).
             worker.py  (donor: lease -> fetch into a capped cache -> run built-in job on its cards -> upload -> complete)
 ```
 
-- **Server** (`server/server.py`, Python stdlib only): workers register with an invite code and get a token (only
-  its sha256 is stored). The job table holds type, params, inputs, requirements, state, lease owner / expiry,
+- **Server** (`server/server.py`, Python stdlib only): workers register, with an invite code or without one (open
+  registration: on probation, rate-limited; "Open registration" below), and get a token (only its sha256 is stored). The job table holds type, params, inputs, requirements, state, lease owner / expiry,
   attempts, result, spot-check state. A reaper thread puts jobs whose leases missed their heartbeat back in the queue
   (0.5: also leases past their deadline, `--lease-cap-x` 3 × the job type's reference runtime and at least
   `--lease-cap-min-s` 2 h after the lease was issued, however often they heartbeat; abandoning and leasing the job again
@@ -349,8 +358,20 @@ nll by ~1e-2: `eval/gold27/README.md`).
 Tested against a fake malicious server (TESTS.md): unknown types, extra parameters, path traversal, inputs the
 type doesn't allow, a malformed eval_mix, a bad settings stamp, a job id that is a path, an empty lease id, a job id carrying a newline and a terminal escape. All were refused, with no download attempted.
 
+**Open registration** (`POST /api/v0/register` without an invite; `--open-registration`, default on,
+`--no-open-registration` = invites only): the new worker is on **probation**: it is offered only quant jobs verified
+by the server's own scorer (`"verify": "score"`: no card time of ours), one lease at a time until `--probation-pass`
+(3) of its results passed and earned lumens, and eval_mix and every other type whose check takes our hardware
+(replicate-mode quant, golden_record) only after `--eval-unlock` (5). A quarantined probation worker never unlocks
+(`admin.py probation ID --off` is the operator's override; `probation ID` puts any worker on it). Registrations without
+an invite are limited per client address (`--reg-per-ip-day` 5; IPv6 per /64) and in total (`--reg-global-hour` 60):
+429 with `retry_s`. The address is the TCP peer's, or, only when the peer is one of `--trusted-proxy`, the rightmost
+`X-Forwarded-For` entry that is not a trusted proxy; the database keeps a keyed hash of it for a day, never the
+address. An invite (operator-issued) skips probation. The tier is shown to the donor (`rqah status`, `/me`), never on
+the public page. docs/VERIFY.md ("Identity") has the reasoning.
+
 **What a worker can do to the server:** lease and finish jobs (as many at once as its slots, at most
-`--max-leases`), read only the files its own active leases list, upload only the declared outputs of its own leases
+`--max-leases`; on probation one), read only the files its own active leases list, upload only the declared outputs of its own leases
 within the caps (chunks ≤ 64 MB, JSON bodies ≤ 1 MB), declared by a non-negative `Content-Length`; a short body is
 truncated back to the acknowledged offset. A result is accepted only if its sha256 and size match and the
 type's structural check passes. Tokens are per worker, stored hashed, and can be disabled
@@ -604,8 +625,9 @@ $A manifest --jobs 8
 $A enqueue-level --model qwen38-27b --rev <rev> --K 3 --codebook i8 --level k3-i8 \
    --sigma-reg 0.025 --sigma-reg-in 0.005 --scaled-hessian --qtf2 --verify score --head [--copies 2] [--unit group]
 python3 -I server/server.py --db Q.sqlite --data DATA --spool SPOOL --results RESULTS --bind 127.0.0.1 --port 8740 \
-   --score-threads 1 [--search-token-file F] [--admin-token-file F]   # expose only through a TLS terminator / tunnel
-$A invite --uses 1                       # one per donor
+   --score-threads 1 [--search-token-file F] [--admin-token-file F] \
+   [--trusted-proxy ADDR] [--no-open-registration]    # expose only through a TLS terminator / tunnel
+$A invite --uses 1                       # optional per donor: skips probation (open registration needs none)
 $A list --level k3-i8; $A scores --level k3-i8; $A export --level k3-i8 OUT --checked; $A points
 # replicate mode (0.2) instead: no --verify score, then $A check --level k3-i8 --rows-frac 0.25
 ```
@@ -686,6 +708,9 @@ Toolkit on the host; the worker's own `--gpus` then picks among the cards the co
 - `RQAH_INVITE`: a one-time invite. The worker registers on its first start and keeps the token in the state
   volume (`/var/lib/rqah/token`, mode 0600). The invite stays visible in `docker inspect`, which is harmless
   because it is used up.
+- nothing: the worker registers without an invite on its first start (open registration; probation) and keeps the
+  token the same way. A server with open registration off refuses (the worker exits with the reason); a rate limit
+  (429) is waited out.
 - `RQAH_TOKEN_FILE`: a file mounted read-only.
 - `RQAH_TOKEN`: the token in an env variable. This shows in `docker inspect`, so prefer the other two.
 
@@ -693,7 +718,7 @@ Worker options (each flag also `RQAH_<FLAG>`, e.g. `--max-up-gb-month` = `RQAH_M
 
 | option [default] | meaning |
 |---|---|
-| `--server`, `--token-file` / `--invite` + `--name` | the queue and how to authenticate (see above) |
+| `--server`, `--token-file` / `--invite` (optional) + `--name` | the queue and how to authenticate (see above) |
 | `--state` [`/var/lib/rqah` in the image] | token, running jobs, input cache, `worker.jsonl`, `bandwidth.json` |
 | `--gpus 0,1,...` / `--cards N`, `--gpu-name`, `--vram-gb` (per card) | the cards jobs may use |
 | `--slots` [one per card] | jobs at once |
@@ -803,6 +828,10 @@ Every push to main and every pull request runs the no-GPU suites below on GitHub
   spot checks of a few documents, adoption and `exclude-donor` (#4); w25: the donor CLI (every
   command, `--json`, exit codes, isolation, personal invites, credit by display name, `link` gone) and the served
   status page.
+- `tests/probation_test.py`: open registration and probation in process, a few seconds: registration without an
+  invite, the per-address (IPv6 /64) and global limits, `X-Forwarded-For` only behind `--trusted-proxy`, no address
+  stored, closed registration, the probation tiers (score-mode quant only, one lease, eval_mix after 5), invites skip
+  it, a quarantined probation worker stays locked.
 - `tests/sched_test.py` (0.4): the scheduling rules in process, a few seconds (docs/SCHED.md): K-granularity
   priorities, `reprioritize`, class order, level-first, cache affinity, the budget filter (incl. a randomized
   check), the cache report protocol, the class-wait drain.

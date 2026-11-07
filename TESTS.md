@@ -623,3 +623,43 @@ New checks (`statuspage_test.py`, fixture `byname.sqlite`):
 
 The #4 sibling machine (`fake5b`) now joins fake5's donor by a direct database update, as a personal invite would
 (it used `admin.py link`). Not run here: Python 3.12 (not on the VM; CI runs it).
+
+## 16. Open registration and probation (w74, 2026-11-07)
+
+`POST /register` without an invite makes a worker on probation (docs/VERIFY.md, "Identity"); invites are optional.
+Runs on the VM (Python 3.14, Docker 29.8), CST, on the tree with sections 15 and 16:
+
+| suite | when | result |
+|---|---|---|
+| `tests/probation_test.py` (new, in process, ~5 s) | 4:35 AM | **16/16** |
+| `tests/score_test.py`, `sched_test.py`, `checker_nan_test.py`, `statuspage_test.py`, `setup_test.py` | 4:35 AM | **40/40**, **40/40**, **12/12**, **26/26**, **126/126** |
+| `tests/bandwidth_e2e.py` | 4:30 AM | **22/22** |
+| `tests/e2e_noop.py`, server as a process (1 new check) | 4:25–4:29 AM | **135/135** |
+| same, server as the container (image built `--worktree` under a private tag) | 4:29–4:34 AM | **142/142** |
+
+`tests/probation_test.py`:
+
+| check | result |
+|---|---|
+| no invite → 200, `probation: true`, `workers.probation` 1, its token works (`status` tier `probation`); an invite → no probation; a wrong invite → 403 | pass |
+| per-address limit 2/day: the third → 429, `retry_s` ≈ 1 day; invites not limited | pass |
+| `X-Forwarded-For` from a peer that is not a trusted proxy: ignored | pass |
+| behind a trusted proxy: the rightmost entry is the client; entries the client prepends do not reset the limit | pass |
+| IPv6 per /64: three hosts of one /64 → the third refused; another /64 fine | pass |
+| global limit 8/h: the 9th from a fresh address → 429 | pass |
+| no client address in the database file (WAL included); `reg_log` holds 8 keyed hashes | pass |
+| `--no-open-registration`: no invite → 403 with the reason; an invite still registers | pass |
+| probation: exactly one job, a score-mode quant job, although a replicate-mode level (priority 200), an eval_mix and a noop (100) are queued; the refusal names the rule | pass |
+| 3 passed results: 4 at once (4 cards), all score-mode quant | pass |
+| 5 passed results: the replicate-mode level, eval_mix and noop come first | pass |
+| `/me` tier probation 0 → quant 3 → full 5 with the thresholds; `could_run` = the score-mode jobs, then everything queued | pass |
+| passed results that earned no lumens (duplicates) do not count | pass |
+| an invited / operator-added worker: replicate quant and eval_mix at once | pass |
+| a quarantined probation worker: locked (`probation` 2) even after unquarantine with 6 passed results; `admin.py probation ID --off` lifts it | pass |
+| the status page never mentions probation or tiers | pass |
+
+`e2e_noop.py`: a worker started with neither token nor invite registers without an invite (log says probation),
+writes its token file 0600, and the queued noop job is not leased to it.
+
+Not tested: a real reverse proxy in front of the container (the trusted-proxy logic is tested in process with
+`X-Forwarded-For` from loopback); Python 3.12 (CI runs it).

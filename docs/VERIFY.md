@@ -138,6 +138,7 @@ are not re-checked.
 | collusion on quality | several donors return the same slightly-worse quant | the trusted bound (anchors / imports) and re-checks against neighbouring K | 1/8-bit-worse test, re-check test |
 | griefing honest donors | one result a few % better than honest, so that honest repeats fall out of a band centred on it | the all-rows center is the upper median; an all-only fail with the trusted bound passing is suspect, decided by an anchor, never a quarantine (#12) | better-than-honest-then-honest test |
 | wrong data | quantizing another tensor, another layer, other weights | rel against our weights: garbage-level | (follows from the decode) |
+| throwaway identities | registering many workers without an invite, to grab leases, eat bandwidth or verifier time, or start over after a quarantine | probation: score-mode quant only (no verifier time), one lease at a time, eval_mix and replicate quant after 5 passed results; a quarantined probation worker never unlocks; registrations limited per address (IPv6 /64) and per hour ("Identity" below) | `tests/probation_test.py` |
 
 **What it does not catch** (and why that is acceptable):
 
@@ -158,9 +159,9 @@ are not re-checked.
 
 Quarantine, the spot-check draw (a worker's first result of each type, then a random share) and the exclusion of a
 worker from a job it was caught on all key on the worker id. A person can hold several ids (a personal invite with
-`--uses N`, more invites), so a caught person's other machines keep working until the operator acts.
-Keying these on the donor instead would not stop a cheater: registering again with a fresh invite makes a new donor
-as easily as a new worker, so donor-wide automation would cost complexity and protect nothing. What it would do is
+`--uses N`, more invites, or simply registering again: open registration needs no invite), so a caught person's
+other machines keep working until the operator acts. Keying these on the donor instead would not stop a cheater:
+registering again makes a new donor as easily as a new worker, so donor-wide automation would cost complexity and protect nothing. What it would do is
 punish honest donors for one broken machine (a bad card or driver fails a re-run; its siblings are fine). So:
 
 - **Every worker is checked on its own.** A new token's first result of each type is always re-run (or scored), so a
@@ -172,8 +173,39 @@ punish honest donors for one broken machine (a bad card or driver fails a re-run
 - **Donor-wide action is the operator's call:** `admin.py exclude-donor DONOR --reason ...` quarantines every worker
   of the donor and invalidates every result of theirs that nothing confirmed (lumens revoked, jobs requeued for
   others, the search's batches see them as invalidated). `disable-worker` revokes a token.
-- **Later, if re-registration becomes a real problem:** limits on invites (they are the only way in, and the operator
-  hands them out), and blocks by IP range at the reverse proxy.
+- **Throwaway identities are cheap to make and cheap to carry: probation and rate limits** (below), not invites,
+  bound what one costs us. Beyond that: closing open registration (`--no-open-registration`: invites only again) and
+  blocks by IP range at the reverse proxy.
+
+**Open registration and probation.** `POST /register` without an invite makes a worker on probation (`workers.probation`
+1). Its tier (server/sched.py `tier()`), from its quant results that passed and earned lumens:
+
+| passed results | it may lease | at once |
+|---|---|---|
+| < `--probation-pass` (3) | quant jobs verified by score (`"verify": "score"`) | 1 |
+| < `--eval-unlock` (5) | the same | its slots |
+| ≥ `--eval-unlock` | everything a worker with an invite gets (eval_mix, replicate-mode quant, noop; trusted-only types still need `trust`) | its slots |
+
+A quarantined probation worker is locked at the first row for good (`probation` 2), even if the operator lifts the
+quarantine (`admin.py probation ID --off` is the explicit override). An invite skips probation. What a throwaway
+worker can cost us, and what bounds it:
+
+- **Our hardware's time:** none while on probation. Score-mode quant results are checked by the server's scorer on
+  CPU (~20–30 s per 27B layer); there are no replication re-runs, eval spot checks or full trusted re-runs, which are
+  what take a verifier card, until a worker has 5 passed results, i.e. ~5 honest layer jobs of real GPU work. A
+  provisional or suspect score can still be anchored once on a verifier (once per tensor, not per worker).
+- **Scorer CPU and bandwidth:** one lease at a time, so one job's inputs (~1.5 GB for a 27B layer) and one result in
+  flight per throwaway; leases have deadlines (#7) and one attempt per worker per job (#5). Making many throwaways is
+  limited per client address (`--reg-per-ip-day` 5, IPv6 per /64) and in total (`--reg-global-hour` 60). One lease
+  at a time bounds concurrency, not total volume: a worker that keeps leasing and abandoning pulls one job's inputs
+  after another; that is visible in the events (`abandon`), and `disable-worker` / the proxy's IP blocks stop it.
+- **Held leases:** one per probation worker, with the lease deadline; an expired or abandoned lease returns the job.
+- **Points:** nothing changes: lumens come only from results that passed the scorer, and a duplicate of another
+  donor's codes earns none (it does not count towards unlocking either).
+
+The rate limits read the TCP peer's address, or `X-Forwarded-For` only when the peer is one of `--trusted-proxy`
+(the rightmost entry that is not a trusted proxy: entries further left are whatever the client sent). The database
+keeps an HMAC of the address (key: a server-local secret in `meta`) for one day, never the address itself.
 
 **Credentials are stored hashed.** The database keeps only `workers.token_hash` (sha256 of the worker token, looked
 up on every request) and `invites.code_hash` (sha256 of the invite code); the admin and search tokens live in files
