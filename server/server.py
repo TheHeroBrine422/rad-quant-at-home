@@ -104,6 +104,7 @@ class Queue:
         self.chunk_max = int(a.chunk_max_mb * (1 << 20))
         self.upload_max = int(a.upload_max_mb * (1 << 20)) if a.upload_max_mb else None
         self.spool_max = int(a.spool_max_gb * 1e9) if a.spool_max_gb else None
+        self.refail_s = float(getattr(a, "refail_s", 3600))
         # bytes in the spool, cached: an os.walk per upload chunk grew with the orphans; uploads add, fail / complete
         # subtract, and the reaper's recount (sweep_spool, every tick) keeps it honest
         self.spool_lock = threading.Lock()
@@ -188,9 +189,12 @@ class Queue:
             free_cards = cards - sum(r["cards"] for r in used); free_ram = caps.get("ram_gb", 0) - sum(r["ram_gb"] for r in used)
 
             # verifiers are never excluded: a re-run every verifier failed once would stay queued forever (verify_state='pending')
-            failed = frozenset() if wr["verifier"] else {r["job_id"] for r in db.execute(  # one attempt per worker per job until requeued (#5)
+            # one attempt per worker per job (#5), for --refail-s after that lease ended (donors switch machines off
+            # and on; a transient error should not bench a worker from a job for good); 0 = until the job is requeued
+            win = "" if self.refail_s <= 0 else f" AND COALESCE(l.ended, l.issued) > {time.time() - self.refail_s:.3f}"
+            failed = frozenset() if wr["verifier"] else {r["job_id"] for r in db.execute(
                 "SELECT DISTINCT l.job_id FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND j.state='queued' "
-                "AND l.state IN ('failed','rejected','expired') AND l.issued > COALESCE(j.requeued, 0)", (w["id"],))}
+                "AND l.state IN ('failed','rejected','expired') AND l.issued > COALESCE(j.requeued, 0)" + win, (w["id"],))}
             eligible = job_filter(wr, caps, failed)
             tr = SCH.Transfers(self.manifest(), self.up_memo)
 
@@ -670,6 +674,9 @@ def main():
                     help="ceiling per uploaded file on top of each job type's own caps (0: the type caps only)")
     ap.add_argument("--spool-max-gb", type=float, default=env("SPOOL_MAX_GB", 0, float),
                     help="refuse upload chunks (507, the worker retries) while the spool holds this much (0: no cap)")
+    ap.add_argument("--refail-s", type=float, default=env("REFAIL_S", 3600, float),
+                    help="a worker that failed / let expire a job may lease it again after this many seconds (0: only "
+                         "after the job is requeued; default 1 h)")
     ap.add_argument("--admin-token-file", default=env("ADMIN_TOKEN_FILE"),
                     help="enables the read-only GET /api/v0/admin/summary for this bearer token")
     ap.add_argument("--status-interval", type=float, default=env("STATUS_INTERVAL", 60, float),

@@ -395,6 +395,17 @@ def run(procs, srv):
     ok("a worker that failed a job is not leased it again until admin requeue; another worker runs it",
        got is not None and again is None and tuple(att) == ("queued", 1) and back is not None and states()[jfo] == "accepted",
        f"again={again is not None} {tuple(att)} back={back is not None} {states()[jfo]}")
+    # ... but only for --refail-s (default 1 h) after that lease ended: backdate it and the job is offered again
+    admin("enqueue-noop", "1", "--seconds", "0", "--size", "100", "--seed", "262", "--tag", "failwin")
+    jfw = jobs_of("failwin")[0]
+    gw = lease_until(jfw)
+    req("POST", "/api/v0/fail", {"job_id": jfw, "lease_id": gw["lease_id"], "error": "test"}, token=t_client)
+    blocked = lease_until(jfw); give_back(blocked)
+    with sqlite3.connect(DBP, timeout=30) as d_: d_.execute("UPDATE leases SET ended=ended-4000, issued=issued-4000 WHERE id=?", (gw["lease_id"],))
+    after = lease_until(jfw); give_back(after)
+    admin("cancel", str(jfw))
+    ok("the one-attempt exclusion expires --refail-s (1 h) after the failed lease ended",
+       gw is not None and blocked is None and after is not None, f"blocked={blocked is not None} after={after is not None}")
     tv = admin("add-worker", "verif-x").split()[3]
     admin("verifier", str(db().execute("SELECT id FROM workers WHERE name=?", ("verif-x",)).fetchone()[0]))
     admin("enqueue-noop", "1", "--seconds", "0", "--size", "100", "--seed", "261", "--tag", "vfail", "--priority", "20")  # ahead of the queued spot re-runs (10)

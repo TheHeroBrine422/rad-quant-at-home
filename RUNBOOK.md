@@ -89,7 +89,8 @@ $A manifest --jobs 8                                                            
   `$A donor ID --hide` (`--unhide`; `--display-name` / `--leaderboard on|off` to correct an entry). Two donors who
   are one person: `$A link WORKER DONOR`. Donors see their own side with `radquant status | jobs | points | logs`.
 - A job that keeps failing: `$A events JOB` (worker errors are in the `fail` events), fix, `$A requeue JOB`. A queued
-  job no worker takes (every capable worker failed it once): `$A requeue JOB` resets its attempts and the exclusions.
+  job no worker takes (every capable worker failed it within the last `--refail-s`, default 1 h): `$A requeue JOB`
+  resets its attempts and the exclusions at once.
   A level to redo: `$A requeue --level L --force` (accepted results are moved aside). Stop work: `$A cancel --level L`.
 - A gang job waits for a multi-card worker to drain (`reserve` events); a drain that has not finished after
   `RQAH_RESERVE_MAX_S` is given up and may be retried by another worker.

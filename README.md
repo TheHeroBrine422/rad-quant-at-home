@@ -178,9 +178,10 @@ itself: [research-kit/](research-kit/README.md).
   order, whole levels first inside a class, then the jobs whose inputs the worker caches (it reports its cache when
   leasing). It filters by the worker's declared data budget (each job type declares its expected upload,
   `upload_bytes`), and a higher-class job that a busy worker keeps passing over drains that worker after
-  `--class-wait-s`. A worker that failed, rejected or let expire a lease on a job is not offered that job again until
-  the operator requeues it (`admin.py requeue` also gives a still-queued job this fresh chance; verifier workers are
-  never excluded).
+  `--class-wait-s`. A worker that failed, rejected or let expire a lease on a job is not offered that job again for
+  `--refail-s` (default 1 h) after that lease ended, so a donor who switches a machine off and on, or hits a transient
+  error, is not benched from it for good (`--refail-s 0`: only after the operator requeues it; `admin.py requeue` also
+  gives a still-queued job this fresh chance; verifier workers are never excluded).
 - **Admin** (`server/admin.py`): data (`datapack`, `ladder-add`, `golden-add`, `corpus-add`, `manifest`), jobs
   (`enqueue-level`, `enqueue-golden`, `batch-submit` / `-status` / `-collect`, `list`, `queue`, `reprioritize`, `events`,
   `requeue`, `cancel`),
@@ -748,7 +749,7 @@ exercised yet.
 
 ### Tests
 
-- `tests/e2e_noop.py`: no GPU, ~5 min, 118 checks (125 with the container). Runs the server as a subprocess, or
+- `tests/e2e_noop.py`: no GPU, ~5 min, 119 checks (126 with the container). Runs the server as a subprocess, or
   `E2E_SERVER=docker` for the container; the workers always run on the host. The GPU side is faked on the CPU (`tests/fakes.py`,
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
   privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record; w25: the donor CLI (every
