@@ -299,8 +299,12 @@ def link(S, w, other_token):
         old = w["donor_id"]
         if old is None: n = db.execute("UPDATE workers SET donor_id=? WHERE id=?", (o["donor_id"], w["id"])).rowcount
         else:
+            od = db.execute("SELECT * FROM donors WHERE id=?", (old,)).fetchone()
             n = db.execute("UPDATE workers SET donor_id=? WHERE donor_id=?", (o["donor_id"], old)).rowcount
+            if od is not None:          # the operator's hide survives the merge; the old name only fills a missing one
+                db.execute("UPDATE donors SET hidden=MAX(hidden, ?), display_name=COALESCE(display_name, ?) WHERE id=?",
+                           (od["hidden"], od["display_name"], o["donor_id"]))
             db.execute("DELETE FROM donors WHERE id=?", (old,))
             db.execute("UPDATE invites SET donor_id=? WHERE donor_id=?", (o["donor_id"], old))
-        S.event(db, "link", worker_id=w["id"], detail={"donor": o["donor_id"], "with_worker": o["id"], "moved": n})
+        S.event(db, "link", worker_id=w["id"], detail={"donor": o["donor_id"], "from_donor": old, "with_worker": o["id"], "moved": n})
     return {"ok": True, "donor": o["donor_id"], "moved": n}
