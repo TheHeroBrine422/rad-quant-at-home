@@ -419,6 +419,7 @@ class Worker:
                 return f"over this worker's data budget: {d}load {fmt_bytes(n)}, {fmt_bytes(left)} left"
         self.meter.reserve(job["id"], down, up)
         return None
+
     @staticmethod
     def ids_ok(job):
         """the job id and lease id the server (or a state file) gave us are what the server itself produces: a
