@@ -28,6 +28,7 @@ see section 7.
 | caps | upload of a name that is not an output → 403; over the per-file cap → 413 | pass |
 | another worker's lease | heartbeat on someone else's lease → 403 | pass |
 | abandon | `fail` with `abandon` → job back to `queued`, attempt not counted | pass |
+| one attempt per worker | a worker fails a job → it is not leased that job again (attempts stays 1); after `admin requeue` it is offered again; another worker runs it to accepted | pass |
 | disk cap eviction | cache cap 700 kB, four 300 kB inputs a, b, c, a → 2 evictions, cache ≤ cap; a job needing 900 kB is not leased to this worker | pass |
 | Range resume | 120 kB of a 300 kB input already in `<sha>.part` → 180 kB downloaded, sha256 verified | pass |
 | malformed jobs from our server | `noop` with `seconds: "3"` and with an extra key `cmd` (injected into the DB) → every worker rejects, the job fails after `max_attempts` (2) with 2 `reject` events; workers keep running | pass |

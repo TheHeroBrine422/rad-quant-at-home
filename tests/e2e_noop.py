@@ -330,6 +330,29 @@ def run(procs, srv):
     r2 = db().execute("SELECT state, attempts FROM jobs WHERE id=?", (job2["id"],)).fetchone()
     ok("abandon returns the job without counting an attempt", tuple(r2) == ("queued", 0), str(tuple(r2)))
     admin("cancel", str(job2["id"]))
+    # a worker that failed a job is not leased it again until the operator requeues it (issue #5)
+    def lease_until(jid):
+        """lease with t_client until job jid is offered (abandon anything else) -> the lease, or None when it never is"""
+        for _ in range(10):
+            c, r = req("POST", "/api/v0/lease", caps, token=t_client); j = r.get("job")
+            if not j: return None
+            if j["id"] == jid: return j
+            req("POST", "/api/v0/fail", {"job_id": j["id"], "lease_id": j["lease_id"], "error": "skip", "abandon": True}, token=t_client)
+        return None
+    def give_back(j):
+        if j: req("POST", "/api/v0/fail", {"job_id": j["id"], "lease_id": j["lease_id"], "error": "skip", "abandon": True}, token=t_client)
+    admin("enqueue-noop", "1", "--seconds", "0", "--size", "100", "--seed", "260", "--tag", "failonce")
+    jfo = jobs_of("failonce")[0]
+    got = lease_until(jfo)
+    req("POST", "/api/v0/fail", {"job_id": jfo, "lease_id": got["lease_id"], "error": "test"}, token=t_client)
+    again = lease_until(jfo); give_back(again)
+    att = db().execute("SELECT state, attempts FROM jobs WHERE id=?", (jfo,)).fetchone()
+    admin("requeue", str(jfo))
+    back = lease_until(jfo); give_back(back)
+    w = worker("wc", toks["wc"], "--idle-exit", "2"); procs.append(w); w.wait(30)
+    ok("a worker that failed a job is not leased it again until admin requeue; another worker runs it",
+       got is not None and again is None and tuple(att) == ("queued", 1) and back is not None and states()[jfo] == "accepted",
+       f"again={again is not None} {tuple(att)} back={back is not None} {states()[jfo]}")
     # the server-wide upload ceiling (--upload-max-mb 48 = 50331648 B) under a job type's own cap (64 MiB)
     admin("enqueue-noop", "1", "--seconds", "0", "--size", str(64 << 20), "--seed", "250", "--tag", "bigout")
     c, r = req("POST", "/api/v0/lease", caps, token=t_client); job3 = r["job"]

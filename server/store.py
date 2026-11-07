@@ -62,7 +62,8 @@ MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "ve
            ("workers", "quarantined", "INTEGER NOT NULL DEFAULT 0"), ("workers", "quarantine_reason", "TEXT"),
            ("jobs", "needs", "TEXT"), ("jobs", "verify_of", "INTEGER"), ("jobs", "verify_state", "TEXT"),
            ("jobs", "verify_detail", "TEXT"), ("jobs", "exclude_worker", "INTEGER"),
-           ("workers", "donor_id", "INTEGER"), ("invites", "personal", "INTEGER NOT NULL DEFAULT 0"), ("invites", "donor_id", "INTEGER")]
+           ("workers", "donor_id", "INTEGER"), ("invites", "personal", "INTEGER NOT NULL DEFAULT 0"), ("invites", "donor_id", "INTEGER"),
+           ("jobs", "requeued", "REAL")]
 
 
 def h(s): return hashlib.sha256(s.encode()).hexdigest()

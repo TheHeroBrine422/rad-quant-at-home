@@ -136,7 +136,7 @@ def invalidate(S, db, results, j, why, exclude=None):
     db.execute("UPDATE scores SET state='void' WHERE job_id=? AND state<>'fail'", (j["id"],))     # no longer a reference
     db.execute("UPDATE jobs SET state='queued', attempts=0, accepted_lease=NULL, accepted_by=NULL, accepted_at=NULL, "
                "result=NULL, files=NULL, check_state=NULL, check_detail=NULL, verify_state=NULL, exclude_worker=?, "
-               "error=?, updated=? WHERE id=?", (exclude, why[:2000], time.time(), j["id"]))
+               "error=?, requeued=?, updated=? WHERE id=?", (exclude, why[:2000], time.time(), time.time(), j["id"]))
     for r in db.execute("SELECT id FROM jobs WHERE verify_of=? AND state IN ('queued','leased')", (j["id"],)).fetchall():
         db.execute("UPDATE leases SET state='cancelled', ended=? WHERE job_id=? AND state='active'", (time.time(), r["id"]))
         db.execute("UPDATE jobs SET state='cancelled', lease_id=NULL, lease_owner=NULL, lease_expires=NULL WHERE id=?", (r["id"],))
