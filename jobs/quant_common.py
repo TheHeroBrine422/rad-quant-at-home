@@ -6,7 +6,7 @@ verify (0.3, VERSION 3): "replicate" (default: the 0.2 path, ourq --save-wq + th
 checker, spot-check re-runs) or "score" (docs/VERIFY.md: the server scores the codes themselves; no --save-wq, no
 rowerr step, so less time, VRAM and host RAM). Not part of the settings stamp: it changes what is uploaded, not the
 quantization."""
-import json, os, re, shutil, time
+import ast, json, os, re, shutil, struct, time, zipfile
 from common.util import stamp, st_header, write_json_atomic
 from . import qwen
 
@@ -265,17 +265,29 @@ def check_log(p, plan, proxy_path, job_path):
     return rows, meta
 
 def check_claims(plan, hdr, path):
-    """the per-row claim (rowerr.npz) is a zip of float arrays <key>.err / <key>.ref, one pair per tensor of the plan,
-    each as long as the tensor has output rows (so the checker can sample it and nothing malformed reaches np.load
-    in admin.py check)"""
-    import numpy as np
-    try: z = np.load(path, allow_pickle=False); files = set(z.files)
-    except Exception as e: raise ValueError(f"rowerr.npz: not a valid npz ({type(e).__name__})")
+    """the per-row claim (rowerr.npz) is an uncompressed zip (np.savez) of float arrays <key>.err / <key>.ref, one pair
+    per tensor of the plan, each as long as the tensor has output rows. Read from the zip directory and the .npy headers
+    only, with the stdlib: no array is loaded (a member could declare any size) and nothing malformed reaches np.load
+    in admin.py check"""
     keys = qwen.keys(plan)
-    want = {f"{k}.{x}" for k in keys for x in ("err", "ref")}
-    if files != want: raise ValueError(f"rowerr.npz: keys differ from the plan (missing {sorted(want - files)[:3]}, extra {sorted(files - want)[:3]})")
-    for k in keys:
-        n = hdr[f"{k}.svh"]["shape"][0]
-        for x in ("err", "ref"):
-            a = z[f"{k}.{x}"]
-            if a.ndim != 1 or a.shape[0] != n or a.dtype.kind != "f": raise ValueError(f"rowerr.npz {k}.{x}: shape {a.shape} dtype {a.dtype}, want ({n},) float")
+    n = {f"{k}.{x}.npy": hdr[f"{k}.svh"]["shape"][0] for k in keys for x in ("err", "ref")}
+    try:
+        with zipfile.ZipFile(path) as zf:
+            infos = zf.infolist(); names = {i.filename for i in infos}
+            if len(names) != len(infos) or names != set(n):
+                raise ValueError(f"rowerr.npz: members differ from the plan (missing {sorted(set(n) - names)[:3]}, extra {sorted(names - set(n))[:3]})")
+            for i in infos:
+                m = n[i.filename]
+                if i.compress_type != zipfile.ZIP_STORED: raise ValueError(f"rowerr.npz {i.filename}: compressed, want stored")
+                if i.file_size > 128 + 8 * m + 64: raise ValueError(f"rowerr.npz {i.filename}: {i.file_size} bytes, too large for {m} rows")
+                with zf.open(i) as fh:
+                    head = fh.read(10)
+                    if head[:6] != b"\x93NUMPY" or head[6] not in (1, 2, 3): raise ValueError(f"rowerr.npz {i.filename}: not a .npy")
+                    if head[6] == 1: hl = struct.unpack("<H", head[8:10])[0]
+                    else: hl = struct.unpack("<I", head[8:10] + fh.read(2))[0]
+                    if hl > 4096: raise ValueError(f"rowerr.npz {i.filename}: header too long")
+                    d = ast.literal_eval(fh.read(hl).decode("latin1"))
+                if not isinstance(d, dict) or d.get("descr") not in ("<f8", "<f4") or d.get("fortran_order") is not False or d.get("shape") != (m,):
+                    raise ValueError(f"rowerr.npz {i.filename}: header {d!r:.120}, want shape ({m},) <f8/<f4")
+    except (zipfile.BadZipFile, KeyError, SyntaxError, struct.error, UnicodeDecodeError, IndexError, OSError) as e:
+        raise ValueError(f"rowerr.npz: not a valid npz ({type(e).__name__})")

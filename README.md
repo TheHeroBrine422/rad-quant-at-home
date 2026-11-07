@@ -342,7 +342,8 @@ extension loader takes a lock file), signed images.
 ## Verification, quarantine, points (`server/verify.py`)
 
 - **Every result:** the server's structural check at completion (sha256, sizes, the type's `accept`: exact tensor
-  names / dtypes / shapes for quant shards; the golden's NLL column for eval rows; the row-level consistency of a
+  names / dtypes / shapes for quant shards; in replicate mode `rowerr.npz`, a stored, uncompressed npz with one float
+  `err`/`ref` pair per tensor of the right length; the golden's NLL column for eval rows; the row-level consistency of a
   recorded golden).
 - **Quant results, score mode** (0.3, `"verify": "score"`, docs/VERIFY.md): the scorer (`server.py --score-threads 1`
   or `admin.py score --loop S`) decodes every tensor of the returned codes with the exact integer decode, computes
@@ -764,7 +765,8 @@ exercised yet.
   (`MODE=native`).
 - `tests/quant_e2e.sh`: one real layer vs a direct ourq run (GPU). `tests/checker_tamper.py`, `tests/checker_nan_test.py`
   (the replicate checker on the synthetic layer: NaN scale / NaN claim / 0-0 claim, and a quant_tensor group result
-  through `check_job`, CPU), `tests/dec_rates.sh`.
+  through `check_job`; a `rowerr.npz` that is not a zip, misses a `.ref`, has the wrong length or is compressed, each
+  refused by `accept` and failed on structure, CPU), `tests/dec_rates.sh`.
 - Measurement tools (`tools/`): `hfrange.py` (single tensors of a HF checkpoint by HTTP range), `memwrap.py` (peak VRAM
   / RSS of a quantizer run), `curve_loo.py` and `seed_spread.py` (the data behind the score band).
 

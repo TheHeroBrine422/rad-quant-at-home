@@ -3,7 +3,9 @@
 """checker_nan_test.py -- the replicate-mode checker (checker/check.py) on the synthetic layer of tests/score_test.py,
 no GPU: an honest result passes in full and sampled mode; a shard with a NaN scale, a per-row claim with a NaN, and a
 claim whose rows are all 0/0 must each FAIL (a NaN comparison used to pass, issue #3); an honest quant_tensor group-0
-result passes against its own shard and group weights file (issue #14)."""
+result passes against its own shard and group weights file (issue #14); a rowerr.npz that is not a zip, misses a .ref,
+has a member of the wrong length or is compressed (np.savez_compressed) is refused by accept and fails check_job on
+structure (issue #13)."""
 import json, os, shutil, sys
 import numpy as np
 
@@ -95,6 +97,7 @@ def run():
     def short_err(f):
         z = dict(np.load(f)); z[f"{k0}.err"] = z[f"{k0}.err"][:-1]; np.savez(f, **z)
     bad_rowerr("wrong length", short_err)
+    bad_rowerr("compressed", lambda f: np.savez_compressed(f, **dict(np.load(f))))
 
     n_ok = sum(1 for _, c in RESULTS if c)
     print(f"\n{n_ok}/{len(RESULTS)} checks passed")

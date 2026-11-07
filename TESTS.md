@@ -86,8 +86,8 @@ own logged numbers.
 
 Added after this run (issue #3) and **NOT RUN YET** on the real result: a NaN scale, a NaN per-row claim, a 0/0 per-row
 claim (each must fail; `tests/checker_nan_test.py` covers the same three on the synthetic layer, a quant_tensor
-group result through `check_job`, and a `rowerr.npz` that is not a zip, misses a `.ref` or has the wrong length,
-each refused by `accept` and failed on structure by `check_job` (issue #13), 9/9 on CPU).
+group result through `check_job`, and a `rowerr.npz` that is not a zip, misses a `.ref`, has the wrong length
+or is compressed, each refused by `accept` and failed on structure by `check_job` (issue #13), 10/10 on CPU).
 
 ## 4. One real `quant_layer` on the RTX 4070 (`tests/quant_e2e.sh`)
 
