@@ -4,9 +4,9 @@
 no GPU: an honest result passes in full and sampled mode; a shard with a NaN scale, a per-row claim with a NaN, and a
 claim whose rows are all 0/0 must each FAIL (a NaN comparison used to pass, issue #3); an honest quant_tensor group-0
 result passes against its own shard and group weights file (issue #14); a rowerr.npz that is not a zip, misses a .ref,
-has a member of the wrong length or is compressed (np.savez_compressed) is refused by accept and fails check_job on
-structure (issue #13)."""
-import json, os, shutil, sys
+has a member of the wrong length, is compressed (np.savez_compressed), has a member cut short or a bad CRC is refused
+by accept and fails check_job on structure (issue #13)."""
+import json, os, shutil, sys, zipfile
 import numpy as np
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,6 +98,20 @@ def run():
         z = dict(np.load(f)); z[f"{k0}.err"] = z[f"{k0}.err"][:-1]; np.savez(f, **z)
     bad_rowerr("wrong length", short_err)
     bad_rowerr("compressed", lambda f: np.savez_compressed(f, **dict(np.load(f))))
+    def restore(f, cut=0):   # the same members, STORED, the first .err cut by `cut` bytes; returns its ZipInfo
+        with zipfile.ZipFile(f) as zf: mem = [(i.filename, zf.read(i)) for i in zf.infolist()]
+        name = next(n for n, _ in mem if n.endswith(".err.npy"))
+        with zipfile.ZipFile(f, "w", zipfile.ZIP_STORED) as zf:
+            for n, b in mem: zf.writestr(n, b[:-cut] if cut and n == name else b)
+        with zipfile.ZipFile(f) as zf: return zf.getinfo(name)
+    bad_rowerr("truncated data", lambda f: restore(f, 8))
+    def bad_crc(f):
+        zi = restore(f)
+        with open(f, "r+b") as fh:
+            fh.seek(zi.header_offset + 26); nl, xl = np.frombuffer(fh.read(4), "<u2")
+            fh.seek(zi.header_offset + 30 + int(nl) + int(xl) + 200); b = fh.read(1)
+            fh.seek(-1, 1); fh.write(bytes([b[0] ^ 0xFF]))
+    bad_rowerr("bad CRC", bad_crc)
 
     n_ok = sum(1 for _, c in RESULTS if c)
     print(f"\n{n_ok}/{len(RESULTS)} checks passed")

@@ -266,9 +266,9 @@ def check_log(p, plan, proxy_path, job_path):
 
 def check_claims(plan, hdr, path):
     """the per-row claim (rowerr.npz) is an uncompressed zip (np.savez) of float arrays <key>.err / <key>.ref, one pair
-    per tensor of the plan, each as long as the tensor has output rows. Read from the zip directory and the .npy headers
-    only, with the stdlib: no array is loaded (a member could declare any size) and nothing malformed reaches np.load
-    in admin.py check"""
+    per tensor of the plan, each as long as the tensor has output rows. Checked from the zip directory and the .npy
+    headers with the stdlib before any array is loaded: each member must be stored, exactly its declared size, and
+    pass zipfile's CRC check (read through once), so nothing malformed reaches np.load in admin.py check"""
     keys = qwen.keys(plan)
     n = {f"{k}.{x}.npy": hdr[f"{k}.svh"]["shape"][0] for k in keys for x in ("err", "ref")}
     try:
@@ -287,7 +287,11 @@ def check_claims(plan, hdr, path):
                     else: hl = struct.unpack("<I", head[8:10] + fh.read(2))[0]
                     if hl > 4096: raise ValueError(f"rowerr.npz {i.filename}: header too long")
                     d = ast.literal_eval(fh.read(hl).decode("latin1"))
-                if not isinstance(d, dict) or d.get("descr") not in ("<f8", "<f4") or d.get("fortran_order") is not False or d.get("shape") != (m,):
-                    raise ValueError(f"rowerr.npz {i.filename}: header {d!r:.120}, want shape ({m},) <f8/<f4")
-    except (zipfile.BadZipFile, KeyError, SyntaxError, struct.error, UnicodeDecodeError, IndexError, OSError) as e:
+                    if not isinstance(d, dict) or set(d) != {"descr", "fortran_order", "shape"} or d["descr"] not in ("<f8", "<f4") or d["fortran_order"] is not False or d["shape"] != (m,) or type(d["shape"][0]) is not int:
+                        raise ValueError(f"rowerr.npz {i.filename}: header {d!r:.120}, want shape ({m},) <f8/<f4")
+                    want = (10 if head[6] == 1 else 12) + hl + (8 if d["descr"] == "<f8" else 4) * m
+                    if i.file_size != want or i.compress_size != i.file_size: raise ValueError(f"rowerr.npz {i.filename}: {i.file_size} bytes, want {want} stored")
+                    while fh.read(1 << 20): pass  # to the end, so zipfile checks the CRC
+    except ValueError: raise
+    except Exception as e:
         raise ValueError(f"rowerr.npz: not a valid npz ({type(e).__name__})")

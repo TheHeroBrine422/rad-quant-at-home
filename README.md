@@ -765,8 +765,8 @@ exercised yet.
   (`MODE=native`).
 - `tests/quant_e2e.sh`: one real layer vs a direct ourq run (GPU). `tests/checker_tamper.py`, `tests/checker_nan_test.py`
   (the replicate checker on the synthetic layer: NaN scale / NaN claim / 0-0 claim, and a quant_tensor group result
-  through `check_job`; a `rowerr.npz` that is not a zip, misses a `.ref`, has the wrong length or is compressed, each
-  refused by `accept` and failed on structure, CPU), `tests/dec_rates.sh`.
+  through `check_job`; a `rowerr.npz` that is not a zip, misses a `.ref`, has the wrong length, is
+  compressed, cut short or has a bad CRC, each refused by `accept` and failed on structure, CPU), `tests/dec_rates.sh`.
 - Measurement tools (`tools/`): `hfrange.py` (single tensors of a HF checkpoint by HTTP range), `memwrap.py` (peak VRAM
   / RSS of a quantizer run), `curve_loo.py` and `seed_spread.py` (the data behind the score band).
 
