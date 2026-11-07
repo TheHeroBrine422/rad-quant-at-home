@@ -139,8 +139,9 @@ the server's log of your workers (section "Donor CLI"). Add `--json` to any of t
 
 **Leaderboard.** The public status page lists only donors who opt in, by display name: start the worker with `-e
 RQAH_LEADERBOARD=1` (the name is `RQAH_NAME`), or later `docker exec rad-quant-at-home rqah config set
---leaderboard on --display-name "Your Name"`. Off again with `--leaderboard off`. Several boxes count as one donor
-once linked (`rqah link`, below).
+--leaderboard on --display-name "Your Name"`. Off again with `--leaderboard off`. The board credits by display
+name: **use the same name on every machine** and they share one row (case does not matter). A name is a label, not
+an account: nothing about verification depends on it, and anyone can show any name.
 
 ## Research access (trusted volunteers only)
 
@@ -197,7 +198,7 @@ itself: [research-kit/](research-kit/README.md).
   (`enqueue-level`, `enqueue-golden`, `batch-submit` / `-status` / `-collect`, `list`, `queue`, `reprioritize`, `events`,
   `requeue`, `cancel`),
   verification (`check`, `spot`, `quarantine`, `unquarantine`, `exclude-donor`, `batch-adopt`), workers (`invite`, `add-worker`, `workers`, `trust`,
-  `verifier`, `disable-worker`), donors (`invite --personal`, `donors`, `donor ID --hide`, `link`), `points`,
+  `verifier`, `disable-worker`), donors (`invite --personal`, `donors`, `donor ID --hide`), `points`,
   `status-page`, `export` (the accepted shards of a level in `quantize/ourq.py`'s layout, so knap4 and the search read
   them unchanged). RUNBOOK.md walks through them.
 - **Worker** (`worker/worker.py`): a loop of lease → fetch → run → upload → complete per job, with a heartbeat thread
@@ -355,7 +356,7 @@ truncated back to the acknowledged offset. A result is accepted only if its sha2
 type's structural check passes. Tokens are per worker, stored hashed, and can be disabled
 (`admin.py disable-worker ID`); a quarantined worker can no longer complete anything. With its token a donor reads
 its own donor's workers, jobs, lumens and events (`/api/v0/me...`), never another donor's, and writes only its
-display name, its leaderboard opt-in and links between workers whose tokens it holds.
+display name and its leaderboard opt-in.
 
 **What anyone can read without a token:** `/healthz` and the status page at `/`. The page is a prebuilt file: no
 request reaches the database, and nothing on it can be written. It holds only aggregate counts, level and public
@@ -469,16 +470,16 @@ docker exec rad-quant-at-home rqah points            # lumens per worker / type,
 docker exec rad-quant-at-home rqah logs -f           # the server's events for your workers (--local: this box's job records)
 docker exec rad-quant-at-home rqah config            # server, token fingerprint, caps from the environment, profile
 docker exec rad-quant-at-home rqah config set --leaderboard on --display-name "Ada"
-docker exec rad-quant-at-home rqah link --other-token-file /path/to/other-box-token   # (a file inside the container)
 # outside a container:
 python3 client/rqah.py --server https://<queue-url> --token-file ~/.rqah-token status
 ```
 
 - **Donors and workers.** Every worker belongs to one donor; status, jobs, points and logs cover all workers of the
-  donor of the token used, and nothing else. A donor's boxes are grouped by a personal invite (`admin.py invite
-  --uses 3 --personal`: all registrations with it are one donor), by `rqah link` (holding both tokens proves both
-  workers are yours; whole donors merge; a merged donor stays hidden if either was hidden), or by the operator
-  (`admin.py link WORKER DONOR`).
+  donor of the token used, and nothing else. Workers registered with one personal invite (`admin.py invite --uses 3
+  --personal`) are one donor; every other registration makes a new donor. That grouping is for your own view (and
+  the operator's `exclude-donor`); the **leaderboard credits by display name**, so machines registered separately
+  are credited together by giving them the same name. `rqah link` (and `POST /api/v0/me/link`, `admin.py link`) was
+  removed: the endpoint answers 410 with a pointer to display names.
 - **Verification state per job** (`jobs`): `running`; `verified` (lumens granted); `accepted` (no further check
   due); `awaiting check` (quant results until the checker runs); `spot-check pending` (re-running on our hardware);
   `failed check` / `failed spot check`; `voided` (invalidated after a quarantine); `superseded` (another worker
@@ -494,8 +495,9 @@ python3 client/rqah.py --server https://<queue-url> --token-file ~/.rqah-token s
   token-like strings, long hex and `<>&"'` are refused.
 
 API (any worker token; `server/donor.py`): `GET /api/v0/me`, `/me/jobs?limit=&active=1&worker=`,
-`/me/points?limit=`, `/me/events?after=ID&limit=`; `POST /api/v0/me/profile {display_name, leaderboard}`,
-`/me/link {token}`. Registration takes `"leaderboard": true` (the worker's `--leaderboard` / `RQAH_LEADERBOARD=1`).
+`/me/points?limit=`, `/me/events?after=ID&limit=`; `POST /api/v0/me/profile {display_name, leaderboard}` (a donor
+the operator hid cannot change its name). `/me` reports the donor's `rank`, `board_lumens` (the whole name's total)
+and `name_hidden`. Registration takes `"leaderboard": true` (the worker's `--leaderboard` / `RQAH_LEADERBOARD=1`).
 
 ## Public status page (`server/statuspage.py`)
 
@@ -504,8 +506,9 @@ One static HTML file anyone can read, with no login. It has no JavaScript, no fo
 - **campaign progress:** "ladder 41 / 73 levels (… checked)", the levels in progress with their jobs done, "search 1,240
   evals", golden chunks, and spot checks passed / failed / pending;
 - **jobs:** running, queued, done in the last 24 h and done in total per job type, plus cards busy and donors active;
-- **the leaderboard:** opted-in donors only (display name, lumens, verified jobs, last active), and one line for
-  everyone else ("N donors not listed: X lumens");
+- **the leaderboard:** one row per display name (case-insensitive; the most common spelling is shown) with the
+  lumens and verified jobs of every opted-in donor showing that name, and last active; one line for everyone else
+  ("N donors not listed: X lumens");
 - **recent work:** the last 15 accepted jobs (level and layer, "LM head", "search · mix on <level>", "golden · <corpus>
   <chunk>"), each with who did it (a listed name, "a donor" or "our hardware") and whether it is verified;
 - **the last update time** (UTC).
@@ -523,8 +526,11 @@ One static HTML file anyone can read, with no login. It has no JavaScript, no fo
   every one of its quant jobs is accepted, and as checked when every job also passed the checker.
 - **What it never shows:** worker names, tokens, invites, addresses, hostnames, GPU names, job parameters other than
   level / layer / public corpus names, errors, quarantine reasons, file paths. Names come from the opt-in display name
-  only. A stored name that fails the display-name rules is left off, and so is a donor with a quarantined worker or
-  one the operator hid (`admin.py donor ID --hide`). Every string is HTML-escaped. Identifiers (levels, corpora)
+  only. A stored name that fails the display-name rules is left off. A quarantined worker's lumens count nowhere, but
+  nothing else happens to its name: the row stays with everyone else's lumens (otherwise anyone could take a name
+  off the board by cheating under it). The operator's `admin.py donor ID --hide` on any donor hides that **name**
+  for every donor showing it (the operator's call; `--leaderboard off` drops just one donor, who may opt in again).
+  Every string is HTML-escaped. Identifiers (levels, corpora)
   must also match `[a-z0-9][a-z0-9._-]*` to be shown at all.
 - **Example** (the test fixture, rendered as text):
 
@@ -548,7 +554,7 @@ Jobs
 plus 1 verification re-runs on our own hardware
 Donors
 95.5 lumens of verified work so far. ...
- # | donor        | lumens | verified jobs | last active
+ # | name         | lumens | verified jobs | last active
  1 | Ada Lovelace | 69.0   | 5             | now
  2 | Zoë 🚀 Team  | 20.0   | 1             | now
 3 donors not listed: 6.5 lumens
@@ -790,12 +796,13 @@ exercised yet.
 Every push to main and every pull request runs the no-GPU suites below on GitHub Actions
 (`.github/workflows/tests.yml`, Python 3.12 and the latest 3.x); the GPU tests stay manual.
 
-- `tests/e2e_noop.py`: no GPU, ~5 min, 132 checks (139 with the container). Runs the server as a subprocess, or
+- `tests/e2e_noop.py`: no GPU, ~5 min, 134 checks (141 with the container). Runs the server as a subprocess, or
   `E2E_SERVER=docker` for the container; the workers always run on the host. The GPU side is faked on the CPU (`tests/fakes.py`,
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
   privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record, the eval plausibility band,
   spot checks of a few documents, adoption and `exclude-donor` (#4); w25: the donor CLI (every
-  command, `--json`, exit codes, isolation, link, personal invites) and the served status page.
+  command, `--json`, exit codes, isolation, personal invites, credit by display name, `link` gone) and the served
+  status page.
 - `tests/sched_test.py` (0.4): the scheduling rules in process, a few seconds (docs/SCHED.md): K-granularity
   priorities, `reprioritize`, class order, level-first, cache affinity, the budget filter (incl. a randomized
   check), the cache report protocol, the class-wait drain.

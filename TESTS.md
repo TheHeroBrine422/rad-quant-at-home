@@ -584,3 +584,42 @@ probe with `--network none` and without the env file. Real `--show` on the RTX 4
 display → 11 GB; the Ryzen iGPU listed as not usable; no Docker or toolkit in that sandbox.
 
 Not tested: real AMD sysfs, the smoke step against a real image, `--start`.
+
+## 15. Credit by display name; `rqah link` removed (w74, 2026-11-07)
+
+The leaderboard credits by public display name (docs/VERIFY.md, "Identity"): one row per name, case-insensitive,
+summing the opted-in donors' lumens without quarantined workers; `rqah link`, `POST /api/v0/me/link` (now 410) and
+`admin.py link` are gone. Runs on the VM (Python 3.14, Docker 29.8), CST:
+
+| suite | when | result |
+|---|---|---|
+| `tests/score_test.py`, `sched_test.py`, `checker_nan_test.py` | 4:15 AM | **40/40**, **40/40**, **12/12** |
+| `tests/statuspage_test.py` (7 new checks in `by_name`) | 4:15 AM | **26/26** |
+| `tests/setup_test.py` (1 new: the default-name warning) | 4:15 AM | **126/126** |
+| `tests/bandwidth_e2e.py` | 4:13 AM | **22/22** |
+| `tests/e2e_noop.py`, server as a process | 4:01–4:05 AM | **134/134** |
+| same, server as the container (image built `--worktree` under a private tag) | 4:08–4:12 AM | **141/141** |
+
+New checks (`statuspage_test.py`, fixture `byname.sqlite`):
+
+| check | result |
+|---|---|
+| three opted-in donors "Ada Lovelace" / "ada  LOVELACE" / "Ada Lovelace" → one row, 17.5 lumens, 3 jobs, shown as "Ada Lovelace"; `/me` gives each donor the same rank and `board_lumens` 17.5 | pass |
+| a quarantined worker under "Grace" (50 lumens) → Grace 7 (the other worker's), row shown; its last-seen not used | pass |
+| a donor that did not opt in under a listed name ("ADA lovelace" 100, "Grace" 40) → not in the rows, counted in "not listed"; a name whose only worker is quarantined → no row, its lumens nowhere | pass |
+| the operator's hide on one of two donors named "Hidden Name" → the name is off the board; the other donor's `/me` has `name_hidden` | pass |
+| a hidden donor renaming itself to "Ada Lovelace" → refused; the same name / opt-in still settable; Ada's row unchanged | pass |
+| recent work: "by" a name only for its counted workers (not the quarantined worker's job, not the opted-out donor's) | pass |
+| `donor.link` gone; `LINK_GONE` points to display names | pass |
+
+`e2e_noop.py` (w25 part; replaces the three `link` checks):
+
+| check | result |
+|---|---|
+| `rqah link` → usage error (exit 2); `POST /api/v0/me/link` → 410 with the pointer to display names; e16 and e32 stay separate donors | pass |
+| e16 "Two Boxes" + e32 "two BOXES" → one row on the served page with both workers' lumens; `status` from either: same rank, the name's total, only its own worker | pass |
+| the quarantined `cheatn` takes "honest donor" → the "Honest Donor" row stays with the honest worker's lumens alone | pass |
+| `donor ID --hide` on e32 → the name is off the page for both, e16's `status` has `name_hidden`; e32's rename onto "Honest Donor" → 400, that row stays | pass |
+
+The #4 sibling machine (`fake5b`) now joins fake5's donor by a direct database update, as a personal invite would
+(it used `admin.py link`). Not run here: Python 3.12 (not on the VM; CI runs it).

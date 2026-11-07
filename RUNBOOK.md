@@ -90,9 +90,13 @@ $A manifest --jobs 8                                                            
 - `curl -H "Authorization: Bearer $(cat secrets/admin-token)" http://127.0.0.1:8740/api/v0/admin/summary`: counts per
   level and state, workers, lumens, spot-check counts, gang reservations, spool bytes, the last events.
 - `docker compose logs -f server`.
-- Donors: `$A donors` (display name, opt-in, workers, lumens, rank). A name that should not be on the page:
-  `$A donor ID --hide` (`--unhide`; `--display-name` / `--leaderboard on|off` to correct an entry). Two donors who
-  are one person: `$A link WORKER DONOR`. Donors see their own side with `radquant status | jobs | points | logs`.
+- Donors: `$A donors` (display name, opt-in, workers, lumens, rank of the name's row). The board credits by display
+  name (case-insensitive): every opted-in donor showing a name adds to its row, so one person's machines are
+  credited together by using one name; there is no linking. A name that should not be on the page: `$A donor ID
+  --hide` hides **that name for every donor showing it** (`--unhide`; a hidden donor cannot rename itself). To
+  take one donor off a row without hiding the name: `--leaderboard off` (the donor may opt in again) or
+  `exclude-donor` if it cheated. A quarantined worker's lumens drop out of its name's row by themselves; nothing else
+  happens to the name. Donors see their own side with `radquant status | jobs | points | logs`.
 - A job that keeps failing: `$A events JOB` (worker errors are in the `fail` events), fix, `$A requeue JOB`. A queued
   job no worker takes (every capable worker failed it within the last `--refail-s`, default 1 h): `$A requeue JOB`
   resets its attempts and the exclusions at once. A lease ends at its deadline even while it heartbeats
@@ -135,7 +139,7 @@ $A manifest --jobs 8                                                            
 
 Lumens are granted by the server as results are verified and revoked on quarantine; nothing to do per job.
 `$A points` (table) / `$A points --json` (per worker: id, name, lumens, verified jobs, flags); `$A donors --json`
-per donor (what the leaderboard aggregates). Worker names are what donors registered with and are never published;
+per donor (the leaderboard sums the opted-in donors of one display name, without quarantined workers). Worker names are what donors registered with and are never published;
 the status page shows only opted-in display names. Credits in the model cards: the donors with lumens
 on that release's levels (`$A list --level L` has the `by` worker of each job).
 

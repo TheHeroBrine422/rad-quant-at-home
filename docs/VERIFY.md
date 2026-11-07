@@ -157,8 +157,8 @@ are not re-checked.
 ### Identity: trust is per worker, not per donor (#9, won't fix)
 
 Quarantine, the spot-check draw (a worker's first result of each type, then a random share) and the exclusion of a
-worker from a job it was caught on all key on the worker id. A donor can hold several ids (a personal invite with
-`--uses N`, `rqah link`, more invites), so a caught donor's other machines keep working until the operator acts.
+worker from a job it was caught on all key on the worker id. A person can hold several ids (a personal invite with
+`--uses N`, more invites), so a caught person's other machines keep working until the operator acts.
 Keying these on the donor instead would not stop a cheater: registering again with a fresh invite makes a new donor
 as easily as a new worker, so donor-wide automation would cost complexity and protect nothing. What it would do is
 punish honest donors for one broken machine (a bad card or driver fails a re-run; its siblings are fine). So:
@@ -174,6 +174,33 @@ punish honest donors for one broken machine (a bad card or driver fails a re-run
   others, the search's batches see them as invalidated). `disable-worker` revokes a token.
 - **Later, if re-registration becomes a real problem:** limits on invites (they are the only way in, and the operator
   hands them out), and blocks by IP range at the reverse proxy.
+
+**Credentials are stored hashed.** The database keeps only `workers.token_hash` (sha256 of the worker token, looked
+up on every request) and `invites.code_hash` (sha256 of the invite code); the admin and search tokens live in files
+and the server keeps only their sha256. No token or invite is written to the events, the API answers or the page.
+
+**Donors are a convenience, not a security boundary.** The donors table groups the workers of one personal invite
+(so `rqah status` shows them together), gives the operator `exclude-donor`, and backs #11's rule that a donor is
+leased at most one copy of a best-of-N job. A fresh invite makes a new donor, so none of these stops a determined
+cheater; they keep honest setups tidy (holding two copies of one job takes a second invite). There is no way for a donor to
+merge donors (`rqah link`, `POST /api/v0/me/link` and `admin.py link` were removed; the endpoint answers 410).
+
+**Credit is by public display name.** The leaderboard sums the lumens of every worker whose donor opted in under
+the same display name (compared case-insensitively after `clean_display_name`; the most common spelling is shown),
+so one person's machines share a row by using one name. The name is a label for credit only: **nothing about
+trust, scoring, spot checks, quarantine or invalidation uses it**. Anyone can show any name, which can only add
+verified lumens to that row, never take any away:
+
+- a quarantined worker's lumens drop out of its name's total (and out of the "not listed" total); nothing else
+  happens to the name, so nobody can hide a name by cheating under it;
+- only lumens of opted-in donors count toward a name; a donor that did not opt in counts with "not listed" even if
+  its stored name matches a listed one;
+- the operator's `admin.py donor ID --hide` on any donor hides the *name* for every donor showing it (the operator's
+  call, made with the name in view). A hidden donor cannot change its display name, so it cannot carry the hide onto
+  someone else's name. `--leaderboard off` drops a single donor from a row without hiding the name.
+
+No database migration: the change is in how `board()` reads the existing tables. Donors grouped by the old
+`rqah link` stay grouped; donors keep their stored names and opt-ins, so rows appear by name at the next page build.
 
 ## Cost
 
