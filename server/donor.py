@@ -100,29 +100,51 @@ def net_by_job(S, wids):
             S.q(f"SELECT worker_id, job_id, SUM(lumens) n FROM points WHERE worker_id IN {_in(wids)} GROUP BY worker_id, job_id")}
 
 
+def name_key(name):
+    """the leaderboard's grouping key of a checked display name: case-insensitive"""
+    return unicodedata.normalize("NFC", name.casefold())
+
+
+def hidden_names(S):
+    """keys of the names the operator hid (admin.py donor ID --hide on any donor showing that name)"""
+    return {name_key(n) for n in (public_name(d["display_name"]) for d in S.q("SELECT display_name FROM donors WHERE hidden=1")) if n}
+
+
 def board(S):
-    """the public leaderboard: opted-in, not hidden donors without a quarantined worker; lumens of non-verifier
-    workers, verified jobs = jobs with net lumens > 0. -> (ranked rows, (others' count, others' lumens))"""
+    """the public leaderboard, one row per public display name (case-insensitive): the lumens of every non-verifier,
+    not quarantined worker whose donor opted in under that name; verified jobs = (worker, job) pairs with net lumens
+    > 0. A quarantined worker's lumens count nowhere, and nothing else changes for the name. A name the operator hid
+    on any donor is off the board (its donors count with the others). Rows show the name's most common spelling
+    among their donors. -> (ranked rows, (others' count of donors, others' lumens))"""
     ws = {r["id"]: r for r in S.q("SELECT id, donor_id, verifier, quarantined, last_seen FROM workers")}
     ds = {r["id"]: r for r in S.q("SELECT * FROM donors")}
     per = {}
     for r in S.q("SELECT worker_id, job_id, SUM(lumens) n FROM points GROUP BY worker_id, job_id"):
         w = ws.get(r["worker_id"])
-        if w is None or w["verifier"] or r["n"] <= 1e-9: continue
+        if w is None or w["verifier"] or w["quarantined"] or r["n"] <= 1e-9: continue
         d = per.setdefault(w["donor_id"] if w["donor_id"] is not None else -w["id"], {"lumens": 0.0, "jobs": 0})
         d["lumens"] += r["n"]; d["jobs"] += 1
-    bad = {w["donor_id"] for w in ws.values() if w["quarantined"]}
     last = {}
     for w in ws.values():
-        if w["donor_id"] is not None: last[w["donor_id"]] = max(last.get(w["donor_id"], 0), w["last_seen"] or 0)
-    rows, others = [], [0, 0.0]
+        if w["donor_id"] is not None and not w["quarantined"]: last[w["donor_id"]] = max(last.get(w["donor_id"], 0), w["last_seen"] or 0)
+    hid = hidden_names(S)
+    named, others = {}, [0, 0.0]
     for did, v in per.items():
         d = ds.get(did); name = public_name(d["display_name"]) if d else None
-        if d and d["leaderboard"] and not d["hidden"] and did not in bad and name:
-            rows.append({"donor": did, "name": name, "lumens": round(v["lumens"], 2), "jobs": v["jobs"], "last_seen": last.get(did)})
-        elif did not in bad:
+        key = name_key(name) if name else None
+        if d and d["leaderboard"] and not d["hidden"] and key and key not in hid:
+            g = named.setdefault(key, {"donors": [], "spell": {}, "lumens": 0.0, "jobs": 0, "last_seen": None})
+            g["donors"].append(did); g["spell"][name] = g["spell"].get(name, 0) + 1
+            g["lumens"] += v["lumens"]; g["jobs"] += v["jobs"]
+            g["last_seen"] = max(g["last_seen"] or 0, last.get(did) or 0) or None
+        else:
             others[0] += 1; others[1] += v["lumens"]
-    rows.sort(key=lambda r: (-r["lumens"], -r["jobs"], r["donor"]))
+    rows = []
+    for key, g in named.items():
+        name = min(g["spell"], key=lambda n: (-g["spell"][n], n))       # most donors; ties: the first in code-point order
+        rows.append({"name": name, "key": key, "donors": sorted(g["donors"]), "lumens": round(g["lumens"], 2), "jobs": g["jobs"],
+                     "last_seen": g["last_seen"]})
+    rows.sort(key=lambda r: (-r["lumens"], -r["jobs"], r["key"]))
     for i, r in enumerate(rows): r["rank"] = i + 1
     return rows, (others[0], round(others[1], 2))
 
@@ -199,11 +221,14 @@ def me(S, w):
                         "running": run.get(x["id"], []), "lumens": round(sum(lum), 4), "verified_jobs": len(lum),
                         "could_run": sum(1 for j in queued if f(j) is not None) if f else None})
     rows, _ = board(S)
-    mine = [r for r in rows if d is not None and r["donor"] == d["id"]]
+    mine = [r for r in rows if d is not None and d["id"] in r["donors"]]
+    name = public_name(d["display_name"]) if d else None
     return {"server_time": time.time(), "worker": {"id": w["id"], "name": w["name"]},
             "donor": {"id": d["id"] if d else None, "display_name": d["display_name"] if d else None,
                       "leaderboard": bool(d and d["leaderboard"]), "hidden": bool(d and d["hidden"]),
-                      "rank": mine[0]["rank"] if mine else None, "on_board": len(rows)},
+                      "name_hidden": bool(name and name_key(name) in hidden_names(S)),
+                      "rank": mine[0]["rank"] if mine else None, "on_board": len(rows),
+                      "board_lumens": mine[0]["lumens"] if mine else None},
             "workers": workers, "lumens": round(sum(x["lumens"] for x in workers), 4),
             "verified_jobs": sum(x["verified_jobs"] for x in workers),
             "pending": {"jobs": len(pend), "lumens": round(sum(_expected(j) or 0 for j in pend), 4)},
@@ -279,6 +304,10 @@ def set_profile(S, w, b):
     if not sets: raise ValueError("nothing to set (display_name, leaderboard)")
     with S.tx() as db:
         did = w["donor_id"]
+        d = db.execute("SELECT hidden, display_name FROM donors WHERE id=?", (did,)).fetchone() if did is not None else None
+        if d is not None and d["hidden"] and "display_name" in b and args[0] != d["display_name"]:
+            # hiding a donor hides its name for everyone showing it (board): a hidden donor may not move that to another name
+            raise ValueError("display name: this donor's name was hidden by the operator and cannot be changed (ask the operator)")
         if did is None:
             did = S.new_donor(db, w["name"]); db.execute("UPDATE workers SET donor_id=? WHERE id=?", (did, w["id"]))
         db.execute(f"UPDATE donors SET {', '.join(sets)} WHERE id=?", (*args, did))

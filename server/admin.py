@@ -39,7 +39,9 @@ the 0.2 names $RADQUANT_* are still read in 0.3)
 w25 (donors, status page):
   invite --personal [--uses N]           one person's invite: every worker registered with it is one donor
   donors [--json]                        donors: display name, opt-in, hidden, workers, lumens
-  donor ID [--display-name N] [--leaderboard on|off] [--hide | --unhide]   edit a donor (--hide: off the public page)
+  donor ID [--display-name N] [--leaderboard on|off] [--hide | --unhide]   edit a donor (--hide: its display name
+                                         off the public page for every donor showing it, as the board credits by
+                                         name; --leaderboard off drops just this donor, who may opt in again)
   link WORKER DONOR                      move a worker to a donor (donors may also link their own: `rqah link`)
   status-page OUT [--campaign F]         build the public status page once (server.py rebuilds it by itself)
 0.3 (verify by score, docs/VERIFY.md; small-card jobs):
@@ -546,7 +548,7 @@ def cmd_points(a, S):
 
 def cmd_donors(a, S):
     rows, _ = D.board(S)
-    lum = {r["donor"]: r for r in rows}
+    lum = {did: r for r in rows for did in r["donors"]}
     st = {r["id"]: r for r in V.standings(S)}
     out = []
     for d in S.q("SELECT * FROM donors ORDER BY id"):
@@ -574,6 +576,7 @@ def cmd_donor(a, S):
         if db.execute(f"UPDATE donors SET {', '.join(sets)} WHERE id=?", (*args, a.id)).rowcount != 1: sys.exit(f"no donor {a.id}")
         S.event(db, "donor-edit", detail={"donor": a.id, "set": [x.split("=")[0] for x in sets]})
     print(f"donor {a.id}: " + ", ".join(f"{k.split('=')[0]} = {v}" for k, v in zip(sets, args)))
+    if a.hide: print("(the name is now off the public page for every donor showing it)")
 
 
 def cmd_exclude_donor(a, S):
