@@ -367,9 +367,11 @@ extension loader takes a lock file), signed images.
   the band expected for it at that K (from earlier results of the same tensor: same K, neighbouring K, or the
   rate-distortion slope; one-sided). No re-runs, except one anchor re-run on a verifier for the first result of a
   tensor in a series; other GPUs, vendors, drivers and seeds are all fine; copies of a job (best of N) are all
-  accepted and the export keeps the best. A tensor out of its band fails the job (quarantine); codes equal to a
-  published model's fail (replay); codes equal to another donor's pass but earn nothing. `admin.py scores` lists
-  every scored tensor.
+  accepted and the export keeps the best (0.5: a donor is leased at most one copy of a job). A tensor out of its band
+  fails the job (quarantine); codes equal to a published model's fail (replay); codes equal to another donor's pass
+  but earn nothing. "Equal" includes near-copies (0.5): sharing at least half of 256 trellis tiles sampled with the
+  queue's secret, so the same quant with a few words changed is the same quant. `admin.py scores` lists every scored
+  tensor.
 - **Quant results, replicate mode** (the 0.2 path): the CPU checker (`admin.py check`, below) recomputes every
   tensor's proxy error from the returned codes against our own Hessians and bf16 weights and compares it with the
   worker's log (`|ratio − 1| ≤ 2e-3`). A FAIL quarantines the donor (unless `--no-quarantine`).

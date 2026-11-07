@@ -23,9 +23,11 @@ the all bound is suspect (no points, an anchor re-run at that K decides) or, wit
 (#12: one better-than-honest result must not fail every honest one after it). A tensor with no row at all is
 provisional: the job is re-run once on a verifier (an anchor) and decided against it.
 
-Also per tensor: the codes' sha256 (trellis + suh + svh). Codes identical to a published / imported reference ->
-replay, fail. Identical to an earlier donor's row of the same tensor and K -> duplicate: accepted (it is a valid result)
-but earns nothing (the first submission of given codes earns).
+Also per tensor: the codes' sha256 (trellis + suh + svh), and fingerprints of 256 trellis tiles sampled with the
+queue's secret (#11). Codes identical to a published / imported reference, or sharing at least half of the sampled
+tiles with one -> replay, fail. The same against an earlier donor's row of the same tensor and K -> duplicate:
+accepted (it is a valid result) but earns nothing (the first submission of given codes earns), so one quant
+resubmitted with a few words changed per copy earns once.
 
 Re-checks: every new passed row re-evaluates the passed rows of its tensor that had only a wider basis (extrap or
 provisional); a row now out of its band fails (the donor is quarantined, its unconfirmed results requeued)."""
@@ -47,6 +49,10 @@ FAMILY = {f: {"repeat": 0.02, "interp": 0.08, "extrap": 0.08, "extrap_per_bit": 
 NOISE = {f: 30.0 for f in ("q_proj", "k_proj", "v_proj", "in_proj_qkv", "in_proj_z")}
 NOISE_DEFAULT, Z = 8.0, 4.0
 SLOPE = {"mul1": 1.37, "i8": 1.37, "i8c": 1.37, "i4": 1.37}   # -d log rel / dK; 27B i8 levels: 1.358-1.370 (2 ln 2 = 1.386)
+# near-duplicates (#11): TILES sampled trellis tiles per tensor; sharing NEAR_DUP of them with an earlier result = the
+# same result. Honest copies (another seed_offset: other sign vectors, so other codes everywhere) share none; changing
+# words in more than half the tiles to dodge this costs more error than the band allows (1 % of the words: rel x1.1-4)
+TILES, NEAR_DUP = 256, 0.5
 
 def is_score(p): return isinstance(p, dict) and p.get("verify") == "score"
 
@@ -137,6 +143,35 @@ def decide(db, ser, key, K, codebook, rel, n=None, exclude_job=None):
 
 
 # ------------------------------------------------------------------ the decode
+def tiles_fp(trellis, key, seed):
+    """fingerprints of TILES sampled 16 x 16 tiles of a trellis [in/16, out/16, 16K] (4 bytes each, blake2b of the tile's
+    words): which tiles is drawn from the queue's own secret, so a donor cannot know which ones to change (#11)"""
+    a = np.ascontiguousarray(trellis).reshape(-1, trellis.shape[-1])
+    rng = np.random.default_rng(int.from_bytes(hashlib.sha256(f"{seed}:{key}:{trellis.shape}".encode()).digest()[:8], "little"))
+    idx = np.sort(rng.choice(len(a), TILES, replace=False)) if len(a) > TILES else np.arange(len(a))
+    return b"".join(hashlib.blake2b(a[i].tobytes(), digest_size=4).digest() for i in idx)
+
+
+def tiles_same(x, y):
+    """the fraction of sampled tiles two fingerprints share (0 if not comparable)"""
+    if not x or not y or len(x) != len(y): return 0.0
+    n = len(x) // 4
+    return sum(x[4 * i:4 * i + 4] == y[4 * i:4 * i + 4] for i in range(n)) / n
+
+
+def near_duplicate(db, key, K, fp, job_id):
+    """(the earliest non-void donor / published score row of this tensor and K whose codes share >= NEAR_DUP of the
+    sampled tiles with fp, that fraction) or (None, best fraction): another result with a few words changed is the same
+    result. Our own (trusted) rows are left out, as for identical codes"""
+    best, hit = 0.0, {}
+    for r in db.execute("SELECT * FROM scores WHERE key=? AND K=? AND tiles IS NOT NULL AND state<>'void' AND kind<>'trusted' "
+                        "AND (job_id IS NULL OR job_id<>?) ORDER BY id", (key, K, job_id)).fetchall():
+        f = tiles_same(fp, r["tiles"])
+        if f >= NEAR_DUP: hit.setdefault(r["kind"], (r, f))
+        best = max(best, f)
+    return hit.get("published") or hit.get("donor") or (None, best)       # a replay outranks a duplicate
+
+
 def codes_sha(t):
     h = hashlib.sha256()
     for x in ("trellis", "suh", "svh"): h.update(np.ascontiguousarray(t[x]).tobytes())
@@ -161,6 +196,7 @@ def score_files(S, jtype, p, res_dir, data_path, log=None):
     except Exception as e: return None, f"structure: {e}"
     sh, wts = ST(shard), ST(wf)
     mk = f"{p['model']}@{p['revision']}"
+    seed = S.secret("tiles")
     out = []
     for hname, keys in plan:
         H = None
@@ -178,7 +214,7 @@ def score_files(S, jtype, p, res_dir, data_path, log=None):
             rel = num / den if den > 0 else math.inf
             if not math.isfinite(rel): return None, f"format: {key}: decoded weight not finite"
             out.append({"key": key, "rel": rel, "num": num, "den": den, "sha": codes_sha(t), "n": int(Wt.size),
-                        "s": round(time.time() - t0, 2)})
+                        "tiles": tiles_fp(t["trellis"], key, seed), "s": round(time.time() - t0, 2)})
             if log: log(f"  {key}: rel {rel:.4e} ({time.time() - t0:.1f}s)")
         del H
     return out, None
@@ -212,6 +248,9 @@ def score_job(S, results, data_path, job_id, policy=None, log=None):
                 same = db.execute("SELECT * FROM scores WHERE codes_sha=? AND key=? AND (job_id IS NULL OR job_id<>?) "
                                   "AND state<>'void' ORDER BY id LIMIT 1", (r["sha"], r["key"], job_id)).fetchone()
                 tr = {"key": r["key"], "rel": r["rel"], "s": r["s"]}
+                if same is None:                            # #11: the same codes with a few words changed
+                    same, frac = near_duplicate(db, r["key"], K, r["tiles"], job_id)
+                    if same is not None: tr["near_duplicate"] = round(frac, 4)
                 if same is not None and same["kind"] == "published":
                     s_, basis, bv, d = "fail", "replay", None, {"replay_of": same["note"] or same["id"]}
                 else:
@@ -229,9 +268,9 @@ def score_job(S, results, data_path, job_id, policy=None, log=None):
             for r in rows:
                 rs = r["state"] if st != "fail" else ("fail" if r["state"] == "fail" else "void")
                 db.execute("INSERT INTO scores(job_id, grp, series, key, K, rel, num, den, codes_sha, worker_id, donor_id, kind, "
-                           "state, basis, bound, t, n) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           "state, basis, bound, t, n, tiles) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (job_id, grp, ser, r["key"], K, r["rel"], r["num"], r["den"], r["sha"], w["id"] if w else None,
-                            w["donor_id"] if w else None, kind, rs, r["basis"], r["bound"], time.time(), r["n"]))
+                            w["donor_id"] if w else None, kind, rs, r["basis"], r["bound"], time.time(), r["n"], r["tiles"]))
             det["total_rel"] = sum(r["num"] for r in rows) / sum(r["den"] for r in rows)
         det["seconds"] = round(time.time() - t0, 1)
         db.execute("UPDATE jobs SET check_state=?, check_detail=? WHERE id=?", (st, json.dumps(det, default=str)[:60000], job_id))
@@ -342,10 +381,10 @@ def import_reference(S, data_path, jtype, p, res_dir, kind="trusted", note=None,
     ser, K = series(p), float(p["K"])
     with S.tx() as db:
         for r in rows:
-            db.execute("INSERT INTO scores(job_id, grp, series, key, K, rel, num, den, codes_sha, kind, state, basis, t, note, n) "
-                       "VALUES(NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (group(p, jtype), ser, r["key"], K, r["rel"], r["num"], r["den"],
-                                                                   r["sha"], kind, "pass" if kind == "trusted" else "guard",
-                                                                   "import", time.time(), note, r["n"]))
+            db.execute("INSERT INTO scores(job_id, grp, series, key, K, rel, num, den, codes_sha, kind, state, basis, t, note, n, tiles) "
+                       "VALUES(NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (group(p, jtype), ser, r["key"], K, r["rel"], r["num"], r["den"],
+                                                                     r["sha"], kind, "pass" if kind == "trusted" else "guard",
+                                                                     "import", time.time(), note, r["n"], r["tiles"]))
     return rows
 
 

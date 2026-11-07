@@ -45,9 +45,14 @@ from the codes, and finding codes with low error is exactly the work being donat
 3. **Error**: the exact decode and `rel` per tensor (above). `tr(W H Wᵀ)` is the same for every result of a tensor
    and is computed once (`score_den`).
 4. **Band**: `log rel ≤ log center + tol` for every tensor (next section).
-5. **Replay / duplicates**: the sha256 of each tensor's code material (trellis + suh + svh) is stored. Codes equal to
-   a released model's (imported with `score-import --published`) fail. Codes equal to another donor's earlier result
-   for the same tensor pass (they are a valid result) but earn nothing: the first submission of given codes earns.
+5. **Replay / duplicates**: the sha256 of each tensor's code material (trellis + suh + svh) is stored, and (0.5, #11)
+   fingerprints of 256 of its 16 × 16 trellis tiles (4 bytes each), sampled at positions drawn from a secret of the
+   queue database. Codes equal to a released model's (imported with `score-import --published`), or sharing at least
+   half of the sampled tiles with them, fail. The same against another donor's earlier result for the same tensor
+   and K (or the donor's own other copy): they pass (they are a valid result) but earn nothing: the first submission
+   of given codes earns. Honest copies use another `seed_offset`, so other sign vectors and other codes in every
+   tile; dodging the check means changing words in more than half the tiles, and 1 % of the words already costs
+   ×1.1–4 in rel (out of the band). The scheduler also leases each donor at most one copy of a job (`jobs.grp`).
 
 Verdicts: every tensor in its band → **pass** (points granted, a reference for later jobs). A tensor in the trusted
 band but out of the all-rows band, with no trusted row at its K → **suspect** (next section; an anchor decides). Any
@@ -128,8 +133,8 @@ are not re-checked.
 | lazy, cheaper quant | fewer bits of search (e.g. a lower-K trellis inside the K container, a constrained search), no Hessian / LDLQ | rel above the band: a lower K costs +17 % per 1/8 bit, ignoring the Hessian costs more | real 0.8B: K2 quality re-encoded as K3 codes; K3 with the Hessian damped away |
 | wrong K | codes of a lower K, declared as K | the trellis shape (16K words per tile): structure error; padded to the right shape: garbage decode | K2 shard as K3; K2 codes padded to K3 |
 | wrong format | another codebook (mul1 instead of i8), wrong marker, broken scales | decoded with the declared codebook: rel far out; marker / NaN / zero / huge scales: format error | real mul1 codes declared i8; marker; NaN scale |
-| replay | a published model's codes for the same tensor | sha256 match with a `--published` import | replay test |
-| duplicate | the same codes submitted twice (two copies of a best-of-N job, or colluding donors) | sha256 match with another donor's row: accepted, no points | duplicate test |
+| replay | a published model's codes for the same tensor, as is or with a few words changed | sha256 or near-duplicate (≥ half the sampled tiles) match with a `--published` import | replay tests |
+| duplicate | the same codes submitted twice (two copies of a best-of-N job, or colluding donors), as is or with a few words changed per copy | sha256 or near-duplicate match with another donor's row or the donor's own other copy: accepted, no points; one copy of a job per donor in the scheduler | duplicate and perturbed-copy tests |
 | collusion on quality | several donors return the same slightly-worse quant | the trusted bound (anchors / imports) and re-checks against neighbouring K | 1/8-bit-worse test, re-check test |
 | griefing honest donors | one result a few % better than honest, so that honest repeats fall out of a band centred on it | the all-rows center is the upper median; an all-only fail with the trusted bound passing is suspect, decided by an anchor, never a quarantine (#12) | better-than-honest-then-honest test |
 | wrong data | quantizing another tensor, another layer, other weights | rel against our weights: garbage-level | (follows from the decode) |
@@ -142,8 +147,8 @@ are not re-checked.
   the donor sees a result.
 - Determinism: the quantizer is deterministic on one GPU and software stack (the smoke test's donor and verifier,
   same card, returned bit-identical codes), so two honest donors with identical setups may too; the second earns
-  nothing for that tensor. Codes equal to a *trusted* row (our anchor or import) are not counted as a duplicate.
-  Best-of-N copies avoid it by construction (each copy has its own `seed_offset`).
+  nothing for that tensor. Codes equal (or nearly equal) to a *trusted* row (our anchor or import) are not counted as
+  a duplicate. Best-of-N copies avoid it by construction (each copy has its own `seed_offset`).
 - A cheat that stays inside the tolerance (≤ 3–5 % worse than honest) passes. That is the price of not replicating,
   and it is below the spread between neighbouring ladder steps.
 - Binding codes to the seed (checking that `sign(suh)` / `sign(svh)` follow the job's seed) would stop copying across

@@ -199,7 +199,7 @@ class Queue:
             if not wr["verifier"]:                          # #7: abandon + lease again does not restart the deadline
                 failed = set(failed) | {jid for jid, t0 in self._held(db, w["id"]).items()
                                         if (c := self._cap_of(db, jid)) is not None and t0 + c <= now}
-            eligible = job_filter(wr, caps, failed)
+            eligible = job_filter(wr, caps, failed, SCH.donor_groups(db, wr))
             tr = SCH.Transfers(self.manifest(), self.up_memo)
 
             def fits_now(r): return r["cards"] <= free_cards and r["ram_gb"] <= free_ram

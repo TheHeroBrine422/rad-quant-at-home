@@ -12,7 +12,7 @@ unknown rev after a server restart); the class-wait drain (a busy worker passing
 drained for it, not for a same-class one, not before the window); the expect field of a granted job; /data only
 while a lease is live (#15); a lease's hard deadline (#7: renewals stop at it, the job is reissued, a late result
 still counts, abandon + lease again keeps the clock); a gang drain that timed out is not re-reserved by the same
-worker (#8)."""
+worker (#8); one copy of a best-of-N group per donor (#11)."""
 import argparse, json, os, random, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -51,7 +51,7 @@ def manifest(d, files):
     write_json_atomic(f"{d}/data/manifest.json", {"files": {n: {"sha256": sha(i), "size": s, "mtime": 0} for n, (i, s) in files.items()}})
 
 
-def noop(S, inputs=(), size=1000, prio=0, level=None, ram=0, cards=0, sizes=None):
+def noop(S, inputs=(), size=1000, prio=0, level=None, ram=0, cards=0, sizes=None, grp=None):
     p = {"seconds": 0, "size": size, "seed": 0}
     if inputs: p["inputs"] = list(inputs)
     if ram: p["ram_gb"] = ram
@@ -59,7 +59,7 @@ def noop(S, inputs=(), size=1000, prio=0, level=None, ram=0, cards=0, sizes=None
     m = jobs.get("noop")
     with S.tx() as db:
         return S.enqueue(db, "noop", m.VERSION, p, list(inputs), jobs.requirements(m, p), sum((sizes or {}).get(n, 0) for n in inputs),
-                         level=level, priority=prio)
+                         level=level, priority=prio, grp=grp)
 
 
 def caps(**kw):
@@ -126,6 +126,12 @@ def main():
     ok("admin queue: scheduling order listing", r.returncode == 0 and "by class" in r.stdout, r.stdout.strip().splitlines()[-1:])
     r = adm("reprioritize", "nomatch*", "--by-granularity")
     ok("reprioritize: a pattern that matches nothing is an error", r.returncode != 0)
+    r = adm("enqueue-level", "--model", "m", "--rev", "r", "--K", "3.5", "--codebook", "i8", "--level", "q-k3.5", "--copies", "2", "--head")
+    g = {}
+    for x in S.q("SELECT ukey, grp FROM jobs WHERE level='q-k3.5'"): g.setdefault(x["grp"], []).append(x["ukey"])
+    g0 = {x["grp"] for x in S.q("SELECT grp FROM jobs WHERE level='q-k3'")}
+    ok("enqueue-level --copies 2: the two copies of each unit share a group (q-k3.5:L00, :L01, :head); one copy: none (#11)",
+       sorted(g) == ["q-k3.5:L00", "q-k3.5:L01", "q-k3.5:head"] and all(len(v) == 2 for v in g.values()) and g0 == {None}, g)
 
     # ---------------------------------------------------------------- ordering
     d, a = setup("order")
@@ -369,6 +375,30 @@ def main():
     r4 = Q.lease(wa, cg)
     ok("... while an idle worker with the cards free still takes it at once", r4.get("job") and r4["job"]["id"] == gang,
        r4.get("job", {}).get("id"))
+
+    # ---------------------------------------------------------------- #11: one copy of a best-of-N group per donor
+    d, a = setup("copies")
+    manifest(d, files)
+    Q = Queue(a); S = Q.store
+    c1, c2, c3 = (noop(S, size=10, sizes=sizes, grp="lv:L00") for _ in range(3))
+    other = noop(S, size=10, sizes=sizes, grp="lv:L01")
+    wa = worker(S, "w18")
+    wa2 = S.auth(S.add_worker("w18b", donor_id=wa["donor_id"])[1])          # another token of the same donor
+    wb, wv = worker(S, "w19"), worker(S, "w20")
+    with S.tx() as db: db.execute("UPDATE workers SET verifier=1 WHERE id=?", (wv["id"],))
+    got_a = drain_order(Q, wa, caps(), 5)
+    got_a2 = drain_order(Q, wa2, caps(), 5)
+    got_b = drain_order(Q, wb, caps(), 5)
+    got_v = drain_order(Q, wv, caps(), 5)
+    ok("#11: a donor is leased one copy of a group (not a sibling token either); another donor gets the next copy; our "
+       "verifiers are not limited", got_a == [c1, other] and got_a2 == [] and got_b == [c2] and got_v == [c3], (got_a, got_a2, got_b, got_v))
+    with S.tx() as db:                                      # wa delivers its copy; c2 is handed back
+        db.execute("UPDATE leases SET state='done' WHERE job_id=?", (c1,))
+        db.execute("UPDATE jobs SET state='accepted', accepted_lease=(SELECT id FROM leases WHERE job_id=?) WHERE id=?", (c1, c1))
+    l2 = S.q("SELECT id FROM leases WHERE job_id=? AND state='active'", (c2,))[0][0]
+    Q.fail(wb, {"job_id": c2, "lease_id": l2, "abandon": True, "error": "x"})
+    ok("... and after delivering one, still not another copy of that group", drain_order(Q, wa2, caps(), 3) == [] and
+       drain_order(Q, worker(S, "w21"), caps(), 3) == [c2])
 
     n = sum(1 for _, p in RESULTS if p)
     print(f"\n{n}/{len(RESULTS)} checks passed")

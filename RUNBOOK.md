@@ -62,7 +62,9 @@ $A manifest --jobs 8                                                            
   - Small cards: `--unit group` makes one `quant_tensor` job per Hessian group (4 per layer; needs `datapack --groups`
     once): 6 GB cards take everything but down_proj; 8 GB cards already take whole layers up to K6 (docs/SMALL-CARDS.md).
   - Best of N: `--copies 2` queues each job twice with seed_offset +0 / +1; every copy in its band is accepted (and
-    gives the band a free honest repeat), the export keeps the better one.
+    gives the band a free honest repeat), the export keeps the better one. A donor (all its tokens) is leased at most
+    one copy of a job, and a copy whose codes nearly equal another result's earns nothing (#11). With fewer donors
+    than copies, the spare copies wait for another donor or a verifier.
   - Anchors: the first result for each tensor of a new series waits (provisional) for one re-run on a verifier. To
     skip that, import a level we quantized ourselves with the same settings first: `$A score-import --level k3-i8
     /path/to/ourq/output` (q-LNN.safetensors files). Released models' shards: `$A score-import --level L DIR --published

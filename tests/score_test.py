@@ -13,7 +13,9 @@ published result replayed, a result 1/8 bit worse than the curve); a duplicate o
 earns nothing; a failed score quarantines and invalidates that donor's unconfirmed results but leaves its
 score-verified ones; re-checks fail an earlier extrapolated pass once neighbours arrive; #12: the all band's
 center is the upper median, an honest result after a better-than-honest one is suspect (not failed) and its anchor
-passes it, a trusted-band fail still fails, an outlier-better result logs an event; best of N at export."""
+passes it, a trusted-band fail still fails, an outlier-better result logs an event; best of N at export; #11:
+tile fingerprints, perturbed best-of-N copies and another donor's perturbed copy earn nothing, a perturbed published
+result is a replay."""
 import json, math, os, shutil, struct, sys, tempfile, time
 import numpy as np
 
@@ -138,9 +140,15 @@ def job(jid): return S.q("SELECT * FROM jobs WHERE id=?", (jid,))[0]
 def lumens(worker): return S.q("SELECT COALESCE(SUM(lumens), 0) FROM points WHERE worker_id=?", (WK[worker],))[0][0]
 
 
+def lumens_of(jid): return S.q("SELECT COALESCE(SUM(lumens), 0) FROM points WHERE job_id=?", (jid,))[0][0]
+
+
 def run():
     global S
     SC.NOISE, SC.NOISE_DEFAULT = {}, 0.0        # the logic, without the seed-noise term (calibrated on real runs: score_real.py)
+    # the synthetic "honest repeats" below are C0 with two words changed (the only good codes this fixture has): exactly
+    # what near-duplicate detection (#11) calls a copy, so it is off until its own section
+    near_dup = SC.NEAR_DUP; SC.NEAR_DUP = 1.01
     os.makedirs(RES, exist_ok=True)
     C0 = setup()
     S = Store(f"{W}/q.sqlite")
@@ -349,6 +357,41 @@ def run():
     best = SC.best_of_group(S, [job(j) for j in js])
     ok("best of N: export keeps the passed copy with the lowest total error", best is not None and best["id"] == js[1],
        f"{[(j, job(j)['check_state'], round(json.loads(job(j)['check_detail'] or '{}').get('total_rel', 0), 5)) for j in js]}")
+
+    # #11: near-duplicate codes (on from here; the fingerprints of everything above are forgotten: a fresh campaign)
+    SC.NEAR_DUP = near_dup
+    S.q("UPDATE scores SET tiles=NULL")
+    big = codes(3, 77)["trellis"]; big = np.concatenate([big] * 16, 0).reshape(64, 64, 48)      # 4096 tiles: sampled
+    f0, f1 = SC.tiles_fp(big, "k", "seed-a"), SC.tiles_fp(mutate({"k": {"trellis": big}}, 1, 5)["k"]["trellis"], "k", "seed-a")
+    fr = SC.tiles_fp(codes(3, 78)["trellis"], "k", "seed-a"), SC.tiles_fp(codes(3, 79)["trellis"], "k", "seed-a")
+    ok("#11 fingerprints: 256 sampled tiles; one changed word keeps >= 255 of them, independent codes share none, and "
+       "which tiles are sampled depends on the queue's secret",
+       len(f0) == 4 * SC.TILES and SC.tiles_same(f0, f1) >= 255 / 256 and SC.tiles_same(*fr) == 0 and
+       SC.tiles_fp(big, "k", "seed-b") != f0 and S.secret("tiles") == S.secret("tiles"), f"{SC.tiles_same(f0, f1):.4f}")
+    pn = dict(P, level="k3-nd")
+    def copy(c, who, base):
+        pc = dict(pn, settings=dict(pn["settings"], seed_offset=c)); pc["stamp"] = Q.settings_stamp(pc)
+        j = accept_job(pc, base, who); return j, SC.score_job(S, RES, dp, j)
+    WK["dave"] = S.add_worker("dave")[0]; WK["erin"] = S.add_worker("erin")[0]
+    q0 = mutate(C0, 2, 91)
+    l0 = lumens("dave")
+    got = [copy(c, "dave", mutate(q0, 1, 92 + c) if c else q0) for c in range(3)]
+    l1 = lumens("dave")
+    dups = [json.loads(job(j)["check_detail"]).get("duplicate_of") for j, _ in got]
+    ok("#11: one quant submitted as 3 best-of-N copies with one trellis word changed per tensor: all pass (valid codes), "
+       "only the first earns", [st for _, st in got] == ["pass"] * 3 and dups == [None, got[0][0], got[0][0]] and
+       abs((l1 - l0) - lumens_of(got[0][0])) < 1e-9 and lumens_of(got[1][0]) == lumens_of(got[2][0]) == 0, f"{dups}, +{l1 - l0}")
+    je, st = copy(3, "erin", mutate(q0, 3, 96))
+    nd = [t.get("near_duplicate") for t in json.loads(job(je)["check_detail"])["tensors"]]
+    ok("#11: another donor's copy of those codes with words changed: a duplicate (no points), near_duplicate on every tensor",
+       st == "pass" and lumens("erin") == 0 and json.loads(job(je)["check_detail"]).get("duplicate_of") == got[0][0] and
+       all(x and x > 0.98 for x in nd), str(nd[:3]))
+    pub2 = mutate(C0, 3, 97); make_result(f"{W}/published2", pub2)
+    SC.import_reference(S, dp, "quant_layer", P, f"{W}/published2", kind="published", note="released v3 level")
+    jr_, st = copy(4, "mallory", mutate(pub2, 2, 98))
+    ok("#11: a published result with words changed is a replay (fail), not a duplicate, though it matches donor rows too",
+       st == "fail" and {r[0] for r in S.q("SELECT basis FROM scores WHERE job_id=?", (jr_,))} == {"replay"}, st)
+    S.q("UPDATE workers SET quarantined=0 WHERE id=?", (WK["mallory"],))
 
     # quant_tensor export: a layer's groups merged into one shard = the whole-layer shard, tensor for tensor
     from common.st import merge_shards, subset_shard

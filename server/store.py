@@ -26,7 +26,9 @@ longer exclude it, #5).
 
 0.5: leases.deadline (#7: heartbeats renew a lease only up to it; then it expires like a missed heartbeat);
 reserve_lapsed (#8: a gang / class-wait reservation that timed out without the worker draining; that worker may not
-reserve the job again for one more reserve_max_s)."""
+reserve the job again for one more reserve_max_s); jobs.grp (#11: the copies of one best-of-N job share it; a donor
+holds at most one of them), scores.tiles (#11: fingerprints of sampled trellis tiles, for near-duplicate codes),
+meta (server-local secrets, e.g. which tiles are sampled)."""
 import hashlib, json, os, secrets, sqlite3, threading, time
 
 SCHEMA = """
@@ -64,6 +66,7 @@ CREATE INDEX IF NOT EXISTS scores_tk ON scores(series, key, state);
 CREATE INDEX IF NOT EXISTS scores_sha ON scores(codes_sha);
 CREATE INDEX IF NOT EXISTS scores_job ON scores(job_id);
 CREATE TABLE IF NOT EXISTS score_den(model TEXT NOT NULL, key TEXT NOT NULL, den REAL NOT NULL, PRIMARY KEY(model, key));
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 # columns added after v0: (table, column, declaration); added to an existing database on open
 MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "verifier", "INTEGER NOT NULL DEFAULT 0"),
@@ -71,7 +74,7 @@ MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "ve
            ("jobs", "needs", "TEXT"), ("jobs", "verify_of", "INTEGER"), ("jobs", "verify_state", "TEXT"),
            ("jobs", "verify_detail", "TEXT"), ("jobs", "exclude_worker", "INTEGER"),
            ("workers", "donor_id", "INTEGER"), ("invites", "personal", "INTEGER NOT NULL DEFAULT 0"), ("invites", "donor_id", "INTEGER"),
-           ("jobs", "requeued", "REAL"), ("leases", "deadline", "REAL")]
+           ("jobs", "requeued", "REAL"), ("leases", "deadline", "REAL"), ("jobs", "grp", "TEXT"), ("scores", "tiles", "BLOB")]
 
 
 def h(s): return hashlib.sha256(s.encode()).hexdigest()
@@ -108,6 +111,14 @@ class Store:
                 try: store.db.execute("COMMIT" if et is None else "ROLLBACK")
                 finally: store.lock.release()
         return T()
+
+    def secret(self, name):
+        """a random value made once per queue database (meta table) and never shown to anyone"""
+        with self.tx() as db:
+            r = db.execute("SELECT v FROM meta WHERE k=?", (name,)).fetchone()
+            if r: return r[0]
+            v = secrets.token_hex(32); db.execute("INSERT INTO meta(k, v) VALUES(?,?)", (name, v))
+        return v
 
     def q(self, sql, args=()):
         with self.lock: return self.db.execute(sql, args).fetchall()
@@ -154,15 +165,15 @@ class Store:
 
     # ------------------------------------------------------------ jobs
     def enqueue(self, db, jtype, version, params, inputs, requires, input_bytes, level=None, ukey=None, priority=0,
-                max_attempts=5, needs=None, verify_of=None, exclude_worker=None):
+                max_attempts=5, needs=None, verify_of=None, exclude_worker=None, grp=None):
         if ukey and db.execute("SELECT 1 FROM jobs WHERE ukey=?", (ukey,)).fetchone(): return None
         t = time.time()
         if needs is None and requires.get("trusted"): needs = "trusted"
         cur = db.execute("INSERT INTO jobs(type, version, params, inputs, requires, input_bytes, state, priority, "
-                         "max_attempts, level, ukey, created, updated, needs, verify_of, exclude_worker) "
-                         "VALUES(?,?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?)",
+                         "max_attempts, level, ukey, created, updated, needs, verify_of, exclude_worker, grp) "
+                         "VALUES(?,?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?)",
                          (jtype, version, json.dumps(params, sort_keys=True), json.dumps(inputs), json.dumps(requires),
-                          input_bytes, priority, max_attempts, level, ukey, t, t, needs, verify_of, exclude_worker))
+                          input_bytes, priority, max_attempts, level, ukey, t, t, needs, verify_of, exclude_worker, grp))
         self.event(db, "enqueue", job_id=cur.lastrowid)
         return cur.lastrowid
 

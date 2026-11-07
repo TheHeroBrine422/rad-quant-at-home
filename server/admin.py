@@ -184,7 +184,7 @@ def settings_from(a):
 DATA = None
 
 
-def add_job(S, db, man, jtype, p, level, ukey, priority=0):
+def add_job(S, db, man, jtype, p, level, ukey, priority=0, grp=None):
     m = jobs.check_params(jtype, p)
     req, opt = m.inputs(p)
     import re
@@ -194,7 +194,7 @@ def add_job(S, db, man, jtype, p, level, ukey, priority=0):
     jobs.check_inputs(jtype, p, names)
     info = read_json(os.path.join(DATA, "models", f"{p['model']}@{p['revision']}", "model.json")) if "model" in p else None
     return S.enqueue(db, jtype, m.VERSION, p, names, jobs.requirements(m, p, info), sum(man[n]["size"] for n in names),
-                     level=level, ukey=ukey, priority=priority)
+                     level=level, ukey=ukey, priority=priority, grp=grp)
 
 
 def cmd_enqueue_level(a, S):
@@ -213,18 +213,21 @@ def cmd_enqueue_level(a, S):
             b = dict(base, settings=dict(base["settings"], seed_offset=base["settings"]["seed_offset"] + c))
             b["stamp"] = QC.settings_stamp(b); stamps.add(b["stamp"])
             sfx = f"#c{c}" if a.copies > 1 else ""
+            # the copies of one unit share a group: a donor is leased at most one of them (#11)
+            grp = (lambda u: f"{a.level}:{u}") if a.copies > 1 else (lambda u: None)
             for l in range(lo, hi + 1):
                 if a.unit == "group":
                     for g in range(len(qwen.layer_plan(a.arch, l))):
                         n += add_job(S, db, man, "quant_tensor", {**b, "layer": l, "group": g}, a.level,
                                      f"quant_tensor/v{jobs.get('quant_tensor').VERSION}:{b['stamp']}:L{l:02d}:g{g}{sfx}",
-                                     priority=prio) is not None
+                                     priority=prio, grp=grp(f"L{l:02d}:g{g}")) is not None
                 else:
                     n += add_job(S, db, man, "quant_layer", {**b, "layer": l}, a.level,
-                                 f"quant_layer/v{jobs.get('quant_layer').VERSION}:{b['stamp']}:L{l:02d}{sfx}", priority=prio) is not None
+                                 f"quant_layer/v{jobs.get('quant_layer').VERSION}:{b['stamp']}:L{l:02d}{sfx}", priority=prio,
+                                 grp=grp(f"L{l:02d}")) is not None
             if a.head:                                 # the longest job of a level starts first
                 n += add_job(S, db, man, "quant_head", b, a.level, f"quant_head/v{jobs.get('quant_head').VERSION}:{b['stamp']}:head{sfx}",
-                             priority=prio + 1) is not None
+                             priority=prio + 1, grp=grp("head")) is not None
     print(f"level {a.level} (stamp {', '.join(sorted(stamps))}{', verify by score' if a.verify == 'score' else ''}): {n} new jobs, "
           f"priority {prio}")
 

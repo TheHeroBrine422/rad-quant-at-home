@@ -124,6 +124,11 @@ if a.only_spread:
             for k, r in rels(jid).items():
                 worst = max(worst, abs(r / lg[k] - 1)); by.setdefault((K, k), []).append(r)
     ok("the scorer's error equals ourq's logged proxy_err on every honest tensor (|ratio - 1| <= 2e-3)", worst <= 2e-3, f"worst {worst:.2e}")
+    nd = max([t.get("near_duplicate", 0) for r in S.q("SELECT check_detail FROM jobs") for t in json.loads(r[0] or "{}").get("tensors", [])] + [0])
+    same = max([SC.tiles_same(x["tiles"], y["tiles"]) for x in S.q("SELECT * FROM scores") for y in S.q("SELECT * FROM scores")
+                if x["id"] < y["id"] and x["key"] == y["key"] and x["K"] == y["K"]] + [0])
+    ok("honest seed repeats share (almost) no sampled trellis tiles: never a near-duplicate (#11)", nd == 0 and same < 0.05,
+       f"most tiles shared by two seeds: {same:.3f}")
     for (K, k), v in sorted(by.items()):
         if len(v) > 1: print(f"  spread K{K:g} {k.replace('model.language_model.', ''):45s} max/min {max(v) / min(v) - 1:+.4f}  ({len(v)} seeds)")
     sp = max(max(v) / min(v) - 1 for v in by.values() if len(v) > 1) if any(len(v) > 1 for v in by.values()) else float("nan")
@@ -149,7 +154,9 @@ for L, (j, _, _) in ja.items():
     for k, r in rels(j).items(): worst = max(worst, abs(r / lg[k] - 1))
 # 2. honest repeats by other donors (best-of-N copies): seeds 2-4
 reps = [submit(runs[n], 3, L, f"donor-{n}", seed=int(n[-1])) for n in ("k3-s2", "k3-s3", "k3-s4") if n in runs for L in L0]
-ok("honest repeats (seeds 2-4, other donors): all pass", all(st == "pass" for _, st, _ in reps), str([st for _, st, _ in reps]))
+ok("honest repeats (seeds 2-4, other donors): all pass, none a (near-)duplicate of another seed (#11: they earn)",
+   all(st == "pass" for _, st, _ in reps) and not any(json.loads(job(j)["check_detail"]).get("duplicate_of") for j, _, _ in reps),
+   str([(st, json.loads(job(j)["check_detail"]).get("duplicate_of")) for j, st, _ in reps]))
 spread = {}
 for n in ("k3", "k3-s1", "k3-s2", "k3-s3", "k3-s4"):
     if n in runs:
