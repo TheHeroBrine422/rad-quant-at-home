@@ -2,9 +2,8 @@
 # Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
 """checker_tamper.py RESULTDIR PARAMS.json DATAROOT SCRATCH -- does the checker catch bad results? Copies an accepted
 quant_layer result and tampers with it: codes of one tensor changed (1% of its trellis words), the per-row claim
-shrunk 10%, the logged proxy shrunk 5%, a tensor removed, a wrong settings stamp, a NaN scale, a NaN per-row claim, a
-0/0 per-row claim; each must
-FAIL, the untouched copy must PASS (full and sampled)."""
+shrunk 10%, the logged proxy shrunk 5%, a tensor removed, a wrong settings stamp, a NaN scale, a NaN per-row claim,
+a 0/0 per-row claim; each must FAIL, the untouched copy must PASS (full and sampled)."""
 import json, os, shutil, struct, sys
 import numpy as np
 

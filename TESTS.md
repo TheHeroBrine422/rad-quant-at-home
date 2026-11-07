@@ -84,8 +84,8 @@ own logged numbers.
 | a tensor missing from the shard | fail (structure) |
 | wrong settings stamp in job.json | fail (structure) |
 
-`tests/checker_nan_test.py`: NaN scale / NaN claim / 0-0 claim on the synthetic layer, CPU: **5/5** (the three
-attacks fail; the honest full and sampled results pass).
+Added after this run (issue #3) and **NOT RUN YET** on the real result: a NaN scale, a NaN per-row claim, a 0/0 per-row
+claim (each must fail; `tests/checker_nan_test.py` covers the same three on the synthetic layer, 5/5 on CPU).
 
 ## 4. One real `quant_layer` on the RTX 4070 (`tests/quant_e2e.sh`)
 
