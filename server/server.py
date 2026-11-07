@@ -442,7 +442,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(b)
 
     def _content_length(self, limit):
-        """the request body's declared length; 0 when absent, refused (and the connection closed: the body stays unread) when not an integer, negative or over the cap"""
+        """the request body's declared length; 0 when absent, refused (and the connection closed: the body stays
+        unread) when not an integer, negative or over the cap"""
         try: n = int(self.headers.get("Content-Length") or 0)
         except ValueError: self.close_connection = True; raise HTTPError(400, "bad content-length")
         if n < 0: self.close_connection = True; raise HTTPError(400, "bad content-length")

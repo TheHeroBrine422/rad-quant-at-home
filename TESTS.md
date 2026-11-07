@@ -24,7 +24,7 @@ see section 7.
 | killed worker restarted within its lease | resumes the same lease and completes it (events: `lease, accept`, no expiry) | pass |
 | corrupted upload | bytes with one bit flipped, true sha256 declared → 422 `bad: [out.bin]`, staged file deleted; correct re-upload accepted | pass |
 | chunked / resumable upload | wrong offset → 409 with the resume point; two chunks at offsets 0 / 3000; a short chunk (`Content-Length: 3000`, 1000 bytes sent) → 400 with the old offset, spool truncated back | pass |
-| negative `Content-Length` | `-1` on a JSON endpoint (`register`) and on an upload → 400 `bad content-length`, body not read, connection closed, spool unchanged | pass |
+| negative `Content-Length` | `-1` on a JSON endpoint (`register`) and on an upload → 400 `bad content-length`, body not read (the client keeps its side open and still gets the reply: the server closes), spool unchanged | pass |
 | duplicate completion | a second `complete` (even with a different sha) → 200 `duplicate`, ignored; upload to an accepted job → 409; stored result unchanged, one `accept` event | pass |
 | caps | upload of a name that is not an output → 403; over the per-file cap → 413 | pass |
 | another worker's lease | heartbeat on someone else's lease → 403 | pass |
@@ -36,9 +36,9 @@ see section 7.
 | graceful stop | SIGTERM → finishes the current job, exits 0; `--on-stop abandon` → job handed back within 5 s, attempt not counted | pass |
 | time windows | window arithmetic incl. across midnight; a worker outside its window leases nothing | pass |
 
-2026-11-06: 111/111 (plain process) with the three Content-Length cases (issue #1).
-
 Request overhead: a 1 s noop job takes 1.01 s lease-to-complete on localhost.
+
+Security fix round (issue #1, the three Content-Length cases above): macOS dev box, 2026-11-06, **111/111** (plain process).
 
 ## 2. Server throughput (the queue host, loopback, niced)
 

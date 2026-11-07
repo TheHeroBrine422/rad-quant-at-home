@@ -96,11 +96,12 @@ def req(method, path, body=None, token=None, headers=None):
 
 
 def raw(method, path, headers, body=b"", shutdown=True):
-    """one request on a raw socket (Content-Length is sent verbatim: req() cannot send a bad one) -> (status, json)"""
+    """one request on a raw socket (Content-Length is sent verbatim: req() cannot send a bad one) -> (status, json);
+    no Connection: close, so a reply only arrives once the server closes the connection itself"""
     import socket
     s = socket.create_connection(("127.0.0.1", PORT), timeout=30)
     h = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-    s.sendall(f"{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{h}\r\n".encode() + body)
+    s.sendall(f"{method} {path} HTTP/1.1\r\nHost: x\r\n{h}\r\n".encode() + body)
     if shutdown: s.shutdown(socket.SHUT_WR)
     buf = b""
     while True:
