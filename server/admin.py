@@ -42,7 +42,6 @@ w25 (donors, status page):
   donor ID [--display-name N] [--leaderboard on|off] [--hide | --unhide]   edit a donor (--hide: its display name
                                          off the public page for every donor showing it, as the board credits by
                                          name; --leaderboard off drops just this donor, who may opt in again)
-  link WORKER DONOR                      move a worker to a donor (donors may also link their own: `rqah link`)
   status-page OUT [--campaign F]         build the public status page once (server.py rebuilds it by itself)
 0.3 (verify by score, docs/VERIFY.md; small-card jobs):
   enqueue-level ... --verify score [--unit group] [--copies N]
@@ -592,18 +591,6 @@ def cmd_exclude_donor(a, S):
     print(f"donor {a.donor}: {len(ws)} workers quarantined, {n} results invalidated")
 
 
-def cmd_link(a, S):
-    with S.tx() as db:
-        if not db.execute("SELECT 1 FROM donors WHERE id=?", (a.donor,)).fetchone(): sys.exit(f"no donor {a.donor}")
-        old = db.execute("SELECT donor_id FROM workers WHERE id=?", (a.worker,)).fetchone()
-        if old is None: sys.exit(f"no worker {a.worker}")
-        db.execute("UPDATE workers SET donor_id=? WHERE id=?", (a.donor, a.worker))
-        if old[0] is not None and not db.execute("SELECT 1 FROM workers WHERE donor_id=?", (old[0],)).fetchone():
-            db.execute("DELETE FROM donors WHERE id=?", (old[0],))
-        S.event(db, "link", worker_id=a.worker, detail={"donor": a.donor, "by": "admin"})
-    print(f"worker {a.worker} -> donor {a.donor}")
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=env("DB")); ap.add_argument("--data", default=env("DATA")); ap.add_argument("--results", default=env("RESULTS"))
@@ -613,7 +600,6 @@ def main():
     x = sp.add_parser("donors"); x.add_argument("--json", action="store_true")
     x = sp.add_parser("donor"); x.add_argument("id", type=int); x.add_argument("--display-name")
     x.add_argument("--leaderboard", choices=("on", "off")); x.add_argument("--hide", action="store_true"); x.add_argument("--unhide", action="store_true")
-    x = sp.add_parser("link"); x.add_argument("worker", type=int); x.add_argument("donor", type=int)
     x = sp.add_parser("status-page"); x.add_argument("out"); x.add_argument("--campaign")
     x = sp.add_parser("add-worker"); x.add_argument("name")
     sp.add_parser("workers")
@@ -695,7 +681,6 @@ def main():
     if a.cmd == "invite": print(S.add_invite(a.uses, a.note, a.personal))
     elif a.cmd == "donors": cmd_donors(a, S)
     elif a.cmd == "donor": cmd_donor(a, S)
-    elif a.cmd == "link": cmd_link(a, S)
     elif a.cmd == "status-page":
         page = SP.build(S, SP.load_campaign(a.campaign or os.path.join(os.path.dirname(os.path.abspath(a.db)), "campaign.json")))
         SP.write(a.out, page); print(f"{a.out}: {len(page)} bytes")

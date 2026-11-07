@@ -12,9 +12,9 @@ from the queue server with your worker's own token (server/donor.py). Inside the
                                  finished-job records, STATE/worker.jsonl)
   config [show]                  local settings (server, token fingerprint, caps from the environment) and your
                                  public profile
-  config set [--display-name NAME] [--leaderboard on|off]   the leaderboard entry (opt-in; off by default)
-  link --other-token-file F      join this worker's donor with the donor of another of your workers (both tokens
-                                 prove they are yours): status, jobs and points then cover both
+  config set [--display-name NAME] [--leaderboard on|off]   the leaderboard entry (opt-in; off by default). The
+                                 board credits by name: every opted-in machine with the same display name (case does
+                                 not matter) adds to one row, so use the same name on all of yours
   setup [--check | --yes ...]    on the host, not in the container: detect the GPUs, RAM, disk and Docker, ask what
                                  to donate, write worker.env / compose.yaml / docker-run.sh (client/setup.py,
                                  docs/SETUP.md; its own flags: rqah setup --help)
@@ -68,7 +68,7 @@ def call(a, method, ep, body=None, q=None):
     except urllib.error.HTTPError as x:
         try: msg = json.loads(x.read() or b"{}").get("error", "")
         except ValueError: msg = ""
-        raise Fail(f"server: HTTP {x.code} {msg}".strip(), 3 if x.code in (401, 403) and ep != "me/link" else 1, x.code)
+        raise Fail(f"server: HTTP {x.code} {msg}".strip(), 3 if x.code in (401, 403) else 1, x.code)
     except (urllib.error.URLError, OSError) as x:
         raise Fail(f"server unreachable: {getattr(x, 'reason', x)}", 4)
 
@@ -133,9 +133,10 @@ def cmd_status(a):
     m = call(a, "GET", "me"); m["local"] = local_jobs(a); m["local_budget"] = local_budget(a)
     if a.json: return m
     d = m["donor"]
-    board = (f"on the leaderboard: #{d['rank']} of {d['on_board']}" if d["rank"] else
-             "on the leaderboard once a job is verified" if d["leaderboard"] and not d["hidden"] else
-             "hidden from the leaderboard by the operator" if d["hidden"] else
+    board = (f"on the leaderboard: #{d['rank']} of {d['on_board']}, {d['board_lumens']:.2f} lumens under this name"
+             if d["rank"] else
+             "hidden from the leaderboard by the operator" if d["hidden"] or (d["leaderboard"] and d.get("name_hidden")) else
+             "on the leaderboard once a job is verified" if d["leaderboard"] else
              "not on the leaderboard (rqah config set --leaderboard on)")
     print(f"rad-quant-at-home · donor {d['display_name'] or '-'!r} · {board}")
     print(f"lumens {m['lumens']:.2f} from {m['verified_jobs']} verified jobs · pending verification: {m['pending']['jobs']} jobs "
@@ -276,19 +277,11 @@ def print_config(o):
     if "profile" in o:
         p, w = o["profile"], o["worker"]
         print(f"\ndisplay name {p['display_name']!r}\nleaderboard  {'on' if p['leaderboard'] else 'off'}"
-              + (" (hidden by the operator)" if p["hidden"] else "") + (f", rank #{p['rank']}" if p["rank"] else ""))
+              + (" (hidden by the operator)" if p["hidden"] or p.get("name_hidden") else "") + (f", rank #{p['rank']}" if p["rank"] else ""))
         print(f"this worker  {w['id']} {w['name']!r}: {w['gpu_name'] or 'no GPU'}, cards {w['cards']}, VRAM {w['vram_gb']} GB/card, "
               f"RAM {w['ram_gb']} GB, cache {w['disk_gb']} GB, types {','.join(w['job_types']) or '-'}"
               + "".join(f", {k}" for k in ("trusted", "verifier", "quarantined") if w[k]))
     if "server_error" in o: print(f"\nserver: {o['server_error']}")
-
-
-def cmd_link(a):
-    try: other = open(a.other_token_file).read().strip()
-    except OSError as x: raise Fail(f"{a.other_token_file}: {x.strerror}", 2)
-    r = call(a, "POST", "me/link", {"token": other})
-    if a.json: return r
-    print(f"linked: donor {r['donor']} ({r['moved']} workers moved)"); return None
 
 
 def main(argv=None):
@@ -314,14 +307,12 @@ def main(argv=None):
     x.add_argument("--poll", type=float, default=5)
     x = sp.add_parser("config", parents=[common]); x.add_argument("action", nargs="?", choices=("show", "set"), default="show")
     x.add_argument("--display-name"); x.add_argument("--leaderboard", choices=("on", "off"))
-    x = sp.add_parser("link", parents=[common]); x.add_argument("--other-token-file", required=True)
     a = ap.parse_args(argv)
     for k, d in (("json", False), ("server", e("SERVER")), ("token", None), ("token_file", None), ("state", e("STATE")),
                  ("timeout", 30.0)):
         if not hasattr(a, k): setattr(a, k, d)
     try:
-        out = {"status": cmd_status, "jobs": cmd_jobs, "points": cmd_points, "logs": cmd_logs, "config": cmd_config,
-               "link": cmd_link}[a.cmd](a)
+        out = {"status": cmd_status, "jobs": cmd_jobs, "points": cmd_points, "logs": cmd_logs, "config": cmd_config}[a.cmd](a)
     except Fail as x:
         if a.json: print(json.dumps({"ok": False, "error": str(x), "http": x.http}))
         else: print(f"rqah: {x}", file=sys.stderr)

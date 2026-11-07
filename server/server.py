@@ -30,8 +30,8 @@ passing over drains that worker once it has waited --class-wait-s.
   POST /api/v0/fail       {job_id, lease_id, error, abandon, reject}
   GET  /data/RELPATH      (Range: bytes=a-[b])  only files in the manifest that a job leased by this worker lists
   GET  /api/v0/status
-  GET  /api/v0/me[/jobs|/points|/events]  POST /api/v0/me/profile|link   the donor's own view (server/donor.py;
-                          the donor CLI client/rqah.py)
+  GET  /api/v0/me[/jobs|/points|/events]  POST /api/v0/me/profile   the donor's own view (server/donor.py;
+                          the donor CLI client/rqah.py); /api/v0/me/link was removed: 410
   GET  /  (/index.html)   no auth: the public status page (server/statuspage.py), rebuilt every --status-interval s;
                           with --status-dir also written there for a static host
   GET  /healthz           no auth: 200 if the database answers (container healthcheck)
@@ -642,7 +642,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and ep == ["points"]: return self._send(200, D.my_points(S, w, arg("limit", 50)))
             if method == "GET" and ep == ["events"]: return self._send(200, D.my_events(S, w, arg("after", 0), arg("limit", 100)))
             if method == "POST" and ep == ["profile"]: return self._send(200, D.set_profile(S, w, self._json()))
-            if method == "POST" and ep == ["link"]: return self._send(200, D.link(S, w, self._json().get("token")))
+            if ep == ["link"]: raise HTTPError(410, D.LINK_GONE)
         except PermissionError as e: raise HTTPError(403, str(e))
         except ValueError as e: raise HTTPError(400, str(e)[:300])
         raise HTTPError(404, "no such endpoint")

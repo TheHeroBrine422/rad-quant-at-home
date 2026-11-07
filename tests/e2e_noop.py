@@ -25,8 +25,9 @@ donors, quarantine and requeue, lumens, golden_record (trusted only, TP2 and sta
 draw rate and eval_mix's accept() in process.
 
 w25 (run_w25, TESTS.md section 9): the donor CLI client/rqah.py against the running server (status, jobs, points,
-logs, config, link; --json everywhere; exit codes), donor isolation, personal invites and leaderboard opt-in at
-registration, the display-name rules, and the public status page served at / (headers, read-only, no tokens, worker
+logs, config; --json everywhere; exit codes; `link` and /me/link gone), donor isolation, personal invites and
+leaderboard opt-in at registration, the display-name rules, credit by display name (two machines under one name, a
+quarantined worker under a listed name, the operator's hide), and the public status page served at / (headers, read-only, no tokens, worker
 names, addresses or paths; the opt-in name appears; the --status-dir copy). tests/statuspage_test.py checks the page
 itself against a fixture database."""
 import collections, glob, hashlib, json, os, shutil, signal, sqlite3, subprocess, sys, threading, time
@@ -1008,7 +1009,9 @@ def v05_eval_trust(procs, E):
     out6 = f"{W}/collect6"; admin("batch-collect", str(b6["batch"]), out6)
     had = sorted(os.listdir(out6))
     # the same donor's second machine delivers one more (it would pass its own spot check: its own first job)
-    tok("fake5b"); admin("link", str(wid("fake5b")), str(db().execute("SELECT donor_id FROM workers WHERE name='fake5'").fetchone()[0]))
+    tok("fake5b")                                  # on fake5's donor, as a personal invite would register it
+    with sqlite3.connect(DBP) as c5:
+        c5.execute("UPDATE workers SET donor_id=(SELECT donor_id FROM workers WHERE name='fake5') WHERE name='fake5b'")
     c, b7 = req("POST", S, {"name": "r7", "model": "fm", "revision": "1", "base": "k2", "golden": "xg", "kv": "bf16",
                             "max_model_len": 4096, "candidates": [{"id": "g0", "mix": {LIN[1]: "k4", LIN[9]: "k3"}}]}, token=SEARCH_TOKEN)
     G7 = req("GET", f"{S}/{b7['batch']}", token=SEARCH_TOKEN)[1]["items"][0]["job"]
@@ -1286,28 +1289,43 @@ def run_w25(procs, srv):
     rc_ = admin_rc("status-page", f"{W}/admin-page.html")
     ok("admin.py status-page OUT and donors", rc_[0] == 0 and "Honest Donor" in open(f"{W}/admin-page.html").read() and
        "Honest Donor" in admin("donors"), rc_[1][-200:])
-    # linking two of one donor's workers, personal invites, opt-in at registration
-    rc, lk, _ = cli(t16, "link", "--other-token-file", tokfile(t32), "--json")
-    rc2, s16, _ = cli(t16, "status", "--json"); rc3, s32, _ = cli(t32, "status", "--json")
-    rcb, bl, _ = cli(t16, "link", "--other-token-file", tokfile(t16), "--json")
-    rcj, jl, _ = cli(t16, "link", "--other-token-file", tokfile("rq" + "x" * 43), "--json")
-    ok("cli link: two workers of one donor -> status from either shows both, lumens summed; a token not of this server -> 403",
-       rc == 0 and lk["moved"] == 1 and rc2 == rc3 == 0 and sorted(w["name"] for w in s16["workers"]) == ["e16", "e32"] and
-       s16["donor"]["id"] == s32["donor"]["id"] and abs(s16["lumens"] - pts["e16"]["lumens"] - pts["e32"]["lumens"]) < 1e-6 and
-       rcb == 0 and bl["moved"] == 0 and rcj == 1 and jl["http"] == 403, f"{lk} / {jl}")
-    # a hidden donor cannot un-hide itself by linking into a fresh donor (issue #10)
-    hv = [req("POST", "/api/v0/register", {"invite": admin("invite").strip(), "name": n})[1]["token"] for n in ("hid1", "hid2")]
-    d1 = db().execute("SELECT donor_id FROM workers WHERE name='hid1'").fetchone()[0]
-    admin("donor", str(d1), "--hide")
-    rc, lk2, _ = cli(hv[0], "link", "--other-token-file", tokfile(hv[1]), "--json")
-    d2 = db().execute("SELECT donor_id FROM workers WHERE name='hid2'").fetchone()[0]
-    row = db().execute("SELECT hidden, display_name FROM donors WHERE id=?", (d2,)).fetchone()
-    gone = db().execute("SELECT 1 FROM donors WHERE id=?", (d1,)).fetchone() is None
-    ev = [e for e in events(kind="link") if e["worker_id"] == wid("hid1")]
-    det = json.loads(ev[-1]["detail"]) if ev else {}
-    ok("link: a hidden donor merged into a fresh donor stays hidden, old row gone, event names both donors",
-       rc == 0 and lk2["moved"] == 1 and tuple(row) == (1, "hid2") and gone and det.get("from_donor") == d1 and det.get("donor") == d2,
-       f"{lk2} {tuple(row) if row else row} {det}")
+    # credit by display name: two machines (two donors) under one name, case aside; `link` and /me/link are gone
+    rcl, _, lout = cli(t16, "link", "--other-token-file", tokfile(t32), "--json")
+    cl, bl = req("POST", "/api/v0/me/link", {"token": t32}, token=t16)
+    d16, d32 = (db().execute("SELECT donor_id FROM workers WHERE name=?", (n,)).fetchone()[0] for n in ("e16", "e32"))
+    ok("rqah link is gone (usage error, exit 2); POST /api/v0/me/link -> 410 with a message pointing to display names; "
+       "e16 and e32 stay separate donors",
+       rcl == 2 and "invalid choice" in lout and cl == 410 and "display name" in bl.get("error", "") and d16 != d32, f"{cl} {bl}")
+    r1 = cli(t16, "config", "set", "--display-name", "Two Boxes", "--leaderboard", "on", "--json")[0]
+    r2 = cli(t32, "config", "set", "--display-name", "two BOXES", "--leaderboard", "on", "--json")[0]
+    want = round(pts["e16"]["lumens"] + pts["e32"]["lumens"], 2)
+    shown = wait(lambda: _re.search(r"<td>(?:Two Boxes|two BOXES)</td><td class=\"n\">" + _re.escape(f"{want:,.1f}") + "<", page()[1]), 15)
+    s16, s32 = cli(t16, "status", "--json")[1], cli(t32, "status", "--json")[1]
+    rows = _re.findall(r"<td>((?i:two boxes))</td>", page()[1])
+    ok("credit by name: e16 'Two Boxes' + e32 'two BOXES' (separate donors) -> one row on the page with both workers' lumens; "
+       "status from either shows the same rank and the name's total, and only its own worker",
+       r1 == r2 == 0 and shown and len(rows) == 1 and s16["donor"]["rank"] == s32["donor"]["rank"] and
+       abs(s16["donor"]["board_lumens"] - want) < 0.01 and [w["name"] for w in s16["workers"]] == ["e16"], f"{rows} want {want}")
+    # a quarantined worker under a listed name: its lumens are not counted, the name stays on the page
+    before = [r for r in json.loads(admin("donors", "--json")) if r["display_name"] == "Honest Donor"][0]["rank"]
+    rcq = cli(tcn, "config", "set", "--display-name", "honest donor", "--leaderboard", "on", "--json")[0]
+    time.sleep(2.5)
+    hd = _re.search(r"<td>Honest Donor</td><td class=\"n\">([\d,.]+)<", page()[1])
+    ok("credit by name: a quarantined worker's donor takes the listed name 'honest donor' -> the row stays, its lumens are "
+       "the honest worker's alone",
+       rcq == 0 and before and hd and abs(float(hd.group(1).replace(",", "")) - round(pts["honest"]["lumens"], 1)) < 0.06,
+       hd.group(0) if hd else "row gone")
+    # the operator's hide on one donor hides the name for every donor showing it; a hidden donor cannot rename
+    admin("donor", str(d32), "--hide")
+    gone = wait(lambda: not _re.search(r"(?i)<td>two boxes</td>", page()[1]), 15)
+    s16 = cli(t16, "status", "--json")[1]
+    rcr, rr, _ = cli(t32, "config", "set", "--display-name", "Honest Donor", "--json")
+    still = "Honest Donor" in page()[1]
+    admin("donor", str(d32), "--unhide")
+    ok("hide: one donor of the name hidden -> the name is off the page for both, the other's status says so; the hidden "
+       "donor's rename onto another listed name is refused (400) and that name stays",
+       gone and s16["donor"]["rank"] is None and s16["donor"]["name_hidden"] is True and rcr == 1 and rr["http"] == 400 and still,
+       f"{(rr or {}).get('error')}")
     inv = admin("invite", "--uses", "2", "--personal").strip()
     reg = [req("POST", "/api/v0/register", {"invite": inv, "name": n})[1] for n in ("pa", "pb")]
     rc, pa, _ = cli(reg[0]["token"], "status", "--json")

@@ -12,8 +12,10 @@ donor (store.py: donors).
   GET  /api/v0/me/events?after=ID&limit=N   the server's audit log for the donor's workers (allow-listed fields,
                                    scrubbed of paths / addresses / tokens)
   POST /api/v0/me/profile  {display_name?, leaderboard?}   the public leaderboard entry (opt-in)
-  POST /api/v0/me/link     {token}  put this worker's donor together with the donor of the worker holding `token`
-                                   (holding both tokens proves both are yours)
+
+The leaderboard credits by display name (board()): every opted-in donor showing the same name adds to one row. The
+name is a label for credit only: trust, scoring, spot checks, quarantine and invalidation are per worker (token).
+`POST /api/v0/me/link` was removed with this (410, LINK_GONE).
 
 Nothing here reveals another donor's workers, any token or invite, job inputs or server paths."""
 import json, re, time, unicodedata
@@ -315,25 +317,5 @@ def set_profile(S, w, b):
     return {"ok": True, "donor": did}
 
 
-def link(S, w, other_token):
-    o = S.auth(other_token) if isinstance(other_token, str) else None
-    if o is None: raise PermissionError("that token is not a worker of this server")
-    with S.tx() as db:
-        w = db.execute("SELECT * FROM workers WHERE id=?", (w["id"],)).fetchone()
-        o = db.execute("SELECT * FROM workers WHERE id=?", (o["id"],)).fetchone()
-        if o["donor_id"] is None:
-            db.execute("UPDATE workers SET donor_id=? WHERE id=?", (S.new_donor(db, o["name"]), o["id"]))
-            o = db.execute("SELECT * FROM workers WHERE id=?", (o["id"],)).fetchone()
-        if w["donor_id"] == o["donor_id"]: return {"ok": True, "donor": o["donor_id"], "moved": 0}
-        old = w["donor_id"]
-        if old is None: n = db.execute("UPDATE workers SET donor_id=? WHERE id=?", (o["donor_id"], w["id"])).rowcount
-        else:
-            od = db.execute("SELECT * FROM donors WHERE id=?", (old,)).fetchone()
-            n = db.execute("UPDATE workers SET donor_id=? WHERE donor_id=?", (o["donor_id"], old)).rowcount
-            if od is not None:          # the operator's hide survives the merge; the old name only fills a missing one
-                db.execute("UPDATE donors SET hidden=MAX(hidden, ?), display_name=COALESCE(display_name, ?) WHERE id=?",
-                           (od["hidden"], od["display_name"], o["donor_id"]))
-            db.execute("DELETE FROM donors WHERE id=?", (old,))
-            db.execute("UPDATE invites SET donor_id=? WHERE donor_id=?", (o["donor_id"], old))
-        S.event(db, "link", worker_id=w["id"], detail={"donor": o["donor_id"], "from_donor": old, "with_worker": o["id"], "moved": n})
-    return {"ok": True, "donor": o["donor_id"], "moved": n}
+LINK_GONE = ("rqah link was removed: the leaderboard credits by display name, so use the same name on every machine "
+             "(rqah config set --display-name NAME --leaderboard on)")

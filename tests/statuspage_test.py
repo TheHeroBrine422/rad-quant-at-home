@@ -179,6 +179,8 @@ def by_name(db):
     rec = collections.Counter(r["by"] for r in SP.collect(S, {}, NOW)["recent"])
     ok("by name: recent work credits the name for its counted workers only (Ada x3, Grace x1: not the quarantined worker's "
        "job, not the opted-out donor's)", rec["Ada Lovelace"] == 3 and rec["Grace"] == 1 and rec["a donor"] == 6, str(rec))
+    ok("by name: no link function or link endpoint left in server/donor.py", not hasattr(D, "link") and "410" not in D.LINK_GONE
+       and "display name" in D.LINK_GONE)
     S.db.close()
 
 
