@@ -10,7 +10,8 @@ every job is accepted exactly once with the right bytes.
 
 Scenarios (TESTS.md): tokens / invites, 3 workers with one killed mid-job (lease expires, job reassigned, accepted
 once), a killed worker restarted before / after its lease expired, duplicate completion, corrupted upload, upload
-caps, disk-cap eviction and the disk-based lease filter, Range resume of a partial download, data access rules,
+caps, a negative Content-Length (JSON and upload), a short upload chunk truncated back, disk-cap eviction and the
+disk-based lease filter, Range resume of a partial download, data access rules,
 malformed jobs from the real server (known type, bad params) and from a fake malicious server (unknown type, extra
 keys, path traversal, inputs the type does not allow, a malformed eval_mix, a bad stamp), graceful stop (finish /
 abandon), time windows, env-only configuration (RQAH_*, then the 0.2 RADQUANT_* names).
@@ -92,6 +93,26 @@ def req(method, path, body=None, token=None, headers=None):
         b = e.read(); return e.code, (json.loads(b) if b else {})
     except (urllib.error.URLError, OSError) as e:          # incl. resets while a container's port proxy starts
         return None, {"error": repr(e)}
+
+
+def raw(method, path, headers, body=b"", shutdown=True):
+    """one request on a raw socket (Content-Length is sent verbatim: req() cannot send a bad one) -> (status, json);
+    no Connection: close, so a reply only arrives once the server closes the connection itself"""
+    import socket
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=30)
+    h = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    s.sendall(f"{method} {path} HTTP/1.1\r\nHost: x\r\n{h}\r\n".encode() + body)
+    if shutdown: s.shutdown(socket.SHUT_WR)
+    buf = b""
+    while True:
+        b = s.recv(65536)
+        if not b: break
+        buf += b
+    s.close()
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    code = int(head.split(b" ", 2)[1])
+    try: return code, json.loads(rest)
+    except ValueError: return code, {}
 
 
 def worker(name, token, *extra, log=None):
@@ -325,6 +346,16 @@ def run(procs, srv):
     ok("accepted result unchanged", sha256_file(f"{RES}/{job['id']}/out.bin") == sha and
        [e["kind"] for e in events(job["id"])].count("accept") == 1)
     c, r = req("POST", "/api/v0/lease", caps, token=t_client); job2 = r["job"]
+    u2 = f"/api/v0/upload/{job2['id']}/{job2['lease_id']}/out.bin"
+    auth = {"Authorization": f"Bearer {t_client}"}
+    c, r = raw("POST", "/api/v0/register", {"Content-Length": "-1", "Content-Type": "application/json"}, b"x" * 4096, shutdown=False)
+    ok("negative Content-Length on a JSON endpoint -> 400, body not read", c == 400 and "content-length" in r.get("error", ""), f"{c} {r}")
+    c, r = raw("PUT", f"{u2}?offset=0", {**auth, "Content-Length": "-1"}, b"x" * 4096, shutdown=False)
+    ok("negative Content-Length on an upload -> 400, spool unchanged",
+       c == 400 and req("GET", u2, token=t_client)[1].get("size") == 0, f"{c} {r}")
+    c, r = raw("PUT", f"{u2}?offset=0", {**auth, "Content-Length": "3000"}, body[:1000])
+    ok("short upload body -> 400 with the old offset, spool truncated back",
+       c == 400 and r.get("size") == 0 and req("GET", u2, token=t_client)[1].get("size") == 0, f"{c} {r}")
     ok("another worker's lease -> 403", req("POST", "/api/v0/heartbeat", {"job_id": job2["id"], "lease_id": job2["lease_id"]}, token=toks["wc"])[0] == 403)
     req("POST", "/api/v0/fail", {"job_id": job2["id"], "lease_id": job2["lease_id"], "error": "test", "abandon": True}, token=t_client)
     r2 = db().execute("SELECT state, attempts FROM jobs WHERE id=?", (job2["id"],)).fetchone()
