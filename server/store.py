@@ -18,7 +18,7 @@ leaderboard = opt-in to the public status page, hidden = the operator took the n
 a worker registered with a personal invite (invites.personal) joins the donor of the invite's first registration.
 
 0.3 (server/score.py, docs/VERIFY.md): scores (one row per scored tensor of a score-mode quant result: series, key, K,
-rel, codes sha256, kind donor | trusted | published, state pass | fail | provisional | void), score_den (tr(W H W^T)
+rel, codes sha256, kind donor | trusted | published, state pass | fail | provisional | suspect | void), score_den (tr(W H W^T)
 per tensor, computed once).
 
 0.4: jobs.requeued (the last admin requeue / invalidate: a worker's failed, rejected or expired leases before it no

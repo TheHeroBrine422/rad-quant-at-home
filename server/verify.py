@@ -19,8 +19,8 @@ pass, and a drawn job its spot check's pass; the other types are verified by the
 Verifier workers earn nothing (our machines); timed-out or superseded leases earn nothing.
 
 0.3: quant jobs whose params say "verify": "score" are verified by score instead (server/score.py, docs/VERIFY.md):
-no replication spot checks; the scorer decides check_state (pass / fail / provisional), a provisional one is re-run
-once on a verifier as an anchor (verify_state untouched), a pass settles points (not for a duplicate of another
+no replication spot checks; the scorer decides check_state (pass / fail / provisional / suspect), a provisional or
+suspect one is re-run once on a verifier as an anchor (verify_state untouched), a pass settles points (not for a duplicate of another
 donor's codes), a fail quarantines. A quarantine leaves score-verified results alone: their quality is proven by
 their own codes, whoever made them."""
 import json, os, secrets, shutil, time

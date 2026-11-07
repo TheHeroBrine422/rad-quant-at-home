@@ -49,8 +49,9 @@ from the codes, and finding codes with low error is exactly the work being donat
    a released model's (imported with `score-import --published`) fail. Codes equal to another donor's earlier result
    for the same tensor pass (they are a valid result) but earn nothing: the first submission of given codes earns.
 
-Verdicts: every tensor in its band → **pass** (points granted, a reference for later jobs). Any tensor out of its band
-or a structure / format error → **fail**: the donor is quarantined as before, its accepted results that nothing
+Verdicts: every tensor in its band → **pass** (points granted, a reference for later jobs). A tensor in the trusted
+band but out of the all-rows band, with no trusted row at its K → **suspect** (next section; an anchor decides). Any
+tensor out of its band or a structure / format error → **fail**: the donor is quarantined as before, its accepted results that nothing
 confirmed are requeued, but **its score-verified results stand** (their quality is proven by their own codes). No
 reference yet for some tensor → **provisional** (next sections).
 
@@ -62,7 +63,7 @@ The center comes from earlier **passed** rows of the same tensor in the same ser
 
 | basis | when | center | tol (log), + the noise term |
 |---|---|---|---|
-| repeat | rows at the same K (honest repeats, best-of-N copies, the anchor) | their minimum | 0.02 |
+| repeat | rows at the same K (honest repeats, best-of-N copies, the anchor) | trusted rows: their minimum; all passed rows: their upper median | 0.02 |
 | interp | rows below and above K | linear in log rel between the nearest K on each side | 0.04 (k/v: 0.08) |
 | extrap | rows on one side only | the nearest, moved along the codebook's slope: −d log rel / dK = 1.37 | 0.04 + 0.03 · \|ΔK\| (k/v: 0.08 + 0.12 · \|ΔK\|) |
 
@@ -71,8 +72,17 @@ plus a **noise term** `4 · NOISE / √n` for a tensor of n = in × out weights:
 (q/k/v_proj, in_proj_qkv, in_proj_z: lighter damping, noisier) and 8 for the rest. At the 27B that adds 0.3 % (mlp)
 to 5 % (k_proj, v_proj: 5 M weights);
 on a 0.8B proxy up to 9 %. When trusted rows exist (our verifiers' re-runs, or our own results imported with
-`score-import`), a second bound is computed from them alone and both must hold. That way a chain of donor results,
-each a little worse than the previous, cannot drag the curve.
+`score-import`), a second bound is computed from them alone. That way a chain of donor results, each a little worse
+than the previous, cannot drag the curve.
+
+**The trusted bound is the authority (0.5, #12).** A result that fails it fails. A result that passes it but fails the
+all-rows bound is not failed: with trusted rows at its own K (repeat basis) it passes, otherwise it is **suspect**
+(accepted, no points yet, not a reference) and the job is re-run once on a verifier; that anchor at the same K then
+decides it. Without trusted rows the all-rows bound decides alone. The all-rows bound is centred on the **upper median**
+of the passed rows at a K, not their minimum: one result a few percent better than the honest quantizer (more search
+effort, another quantizer) is allowed, and it must not turn every honest repeat after it into a fail and quarantine
+their donors. A result more than the repeat tolerance below our own trusted center passes and writes a
+`score_outlier` event for the operator (better than our quantizer: worth a look, not a punishment).
 
 **Why these numbers** (`tools/curve_loo.py`, `tools/seed_spread.py`; TESTS.md section 10):
 
@@ -121,6 +131,7 @@ are not re-checked.
 | replay | a published model's codes for the same tensor | sha256 match with a `--published` import | replay test |
 | duplicate | the same codes submitted twice (two copies of a best-of-N job, or colluding donors) | sha256 match with another donor's row: accepted, no points | duplicate test |
 | collusion on quality | several donors return the same slightly-worse quant | the trusted bound (anchors / imports) and re-checks against neighbouring K | 1/8-bit-worse test, re-check test |
+| griefing honest donors | one result a few % better than honest, so that honest repeats fall out of a band centred on it | the all-rows center is the upper median; an all-only fail with the trusted bound passing is suspect, decided by an anchor, never a quarantine (#12) | better-than-honest-then-honest test |
 | wrong data | quantizing another tensor, another layer, other weights | rel against our weights: garbage-level | (follows from the decode) |
 
 **What it does not catch** (and why that is acceptable):

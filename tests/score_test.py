@@ -11,7 +11,9 @@ honest repeat by another donor passes on the repeat basis); attacks that must fa
 lower-K codes padded to the declared K's shape, a lower-K shape, a wrong codebook marker, a non-finite scale, a
 published result replayed, a result 1/8 bit worse than the curve); a duplicate of another donor's codes passes but
 earns nothing; a failed score quarantines and invalidates that donor's unconfirmed results but leaves its
-score-verified ones; re-checks fail an earlier extrapolated pass once neighbours arrive; best of N at export."""
+score-verified ones; re-checks fail an earlier extrapolated pass once neighbours arrive; #12: the all band's
+center is the upper median, an honest result after a better-than-honest one is suspect (not failed) and its anchor
+passes it, a trusted-band fail still fails, an outlier-better result logs an event; best of N at export."""
 import json, math, os, shutil, struct, sys, tempfile, time
 import numpy as np
 
@@ -280,6 +282,60 @@ def run():
            job(jr)["exclude_worker"] == WK["trent"] and S.q("SELECT quarantined FROM workers WHERE id=?", (WK["trent"],))[0][0] == 1
            and lumens("trent") == 0 and all(r["state"] in ("fail", "void") for r in S.q("SELECT state FROM scores WHERE job_id=?", (jr,))),
            str(ev[-4:]))
+    finally:
+        SC.series = series_orig
+
+    # #12: the all band's center is the upper median, and the trusted band is the authority
+    b = SC.bound([(3.0, 0.02), (3.0, 0.019), (3.0, 0.025), (2.0, 0.08)], 3.0, "i8", "x.mlp.up_proj", center="median")
+    b2 = SC.bound([(3.0, 0.02), (3.0, 0.0192)], 3.0, "i8", "x.mlp.up_proj", center="median")
+    ok("band (#12): the all bound's center is the upper median of the rows at K (min stays for trusted rows)",
+       abs(math.exp(b[0]) - 0.02) < 1e-12 and abs(math.exp(b2[0]) - 0.02) < 1e-12)
+    ser4 = "griefing-test"
+    pg = dict(P, level="k3-gr"); pg["stamp"] = Q.settings_stamp(pg)
+    cs_c = mutate(C0, 2, 61)
+    make_result(f"{W}/probe-gr", cs_c, pg)
+    crel = {r["key"]: r["rel"] for r in SC.score_files(S, "quant_layer", pg, f"{W}/probe-gr", dp)[0]}
+    for key in KEYS:                    # honest = carol's quality / 1.01; one passed donor row 4% better than honest at K3;
+        h = crel[key] / 1.01            # our only trusted rows one bit away (extrap)
+        S.q("INSERT INTO scores(series, key, K, rel, kind, state, basis, t) VALUES(?,?,?,?,?,?,?,?)",
+            (ser4, key, 2.0, h * math.exp(1.37), "trusted", "pass", "import", time.time()))
+        S.q("INSERT INTO scores(series, key, K, rel, kind, state, basis, t, worker_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            (ser4, key, 3.0, h * 0.96, "donor", "pass", "repeat", time.time(), WK["mallory"]))
+    SC.series = lambda p: ser4 if p.get("level") == "k3-gr" else series_orig(p)
+    try:
+        jc = accept_job(pg, cs_c, "carol")
+        before = lumens("carol")
+        st = SC.score_job(S, RES, dp, jc)
+        rr = S.q("SELECT * FROM jobs WHERE verify_of=?", (jc,))
+        ok("#12: after one donor row 4% better than honest, an honest +1% repeat (trusted band passes, all band fails) is "
+           "suspect: not quarantined, no points yet, an anchor re-run queued",
+           st == "suspect" and S.q("SELECT quarantined FROM workers WHERE id=?", (WK["carol"],))[0][0] == 0 and lumens("carol") == before
+           and len(rr) == 1 and rr[0]["needs"] == "verifier" and job(jc)["state"] == "accepted", st)
+        S.q("UPDATE jobs SET state='accepted', accepted_by=?, accepted_at=? WHERE id=?", (WK["ver"], time.time(), rr[0]["id"]))
+        make_result(f"{RES}/{rr[0]['id']}", mutate(C0, 2, 62), pg)
+        SC.score_job(S, RES, dp, rr[0]["id"])
+        ok("#12: the anchor at that K (trusted, repeat basis) then decides it: pass, lumens granted",
+           job(jc)["check_state"] == "pass" and lumens("carol") > before, job(jc)["check_state"])
+        S.q("UPDATE scores SET state='void' WHERE series=? AND kind='trusted' AND K=3.0", (ser4,))
+        jm = accept_job(pg, mutate(C0, 123, 63, keys={KEYS[0]}), "mallory")
+        ok("#12: a result that fails the trusted band still fails (and quarantines)", SC.score_job(S, RES, dp, jm) == "fail" and
+           S.q("SELECT quarantined FROM workers WHERE id=?", (WK["mallory"],))[0][0] == 1)
+        S.q("UPDATE workers SET quarantined=0 WHERE id=?", (WK["mallory"],))
+    finally:
+        SC.series = series_orig
+    ser5 = "outlier-test"
+    po = dict(P, level="k3-out"); po["stamp"] = Q.settings_stamp(po)
+    for key in KEYS:                    # our own K3 rows 20% worse than this donor's
+        S.q("INSERT INTO scores(series, key, K, rel, kind, state, basis, t) VALUES(?,?,?,?,?,?,?,?)",
+            (ser5, key, 3.0, crel[key] * 1.2, "trusted", "pass", "import", time.time()))
+    SC.series = lambda p: ser5 if p.get("level") == "k3-out" else series_orig(p)
+    try:
+        jo = accept_job(po, cs_c, "trent")
+        S.q("UPDATE workers SET quarantined=0 WHERE id=?", (WK["trent"],))
+        st = SC.score_job(S, RES, dp, jo)
+        ev = S.q("SELECT detail FROM events WHERE job_id=? AND kind='score_outlier'", (jo,))
+        ok("#12: a result more than the repeat tolerance below our trusted center passes and logs a score_outlier event",
+           st == "pass" and ev and len(json.loads(ev[0][0])["tensors"]) == len(KEYS), st)
     finally:
         SC.series = series_orig
 

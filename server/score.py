@@ -12,13 +12,16 @@ The band is one-sided (a lower error is never a cheat: the server computes it, a
 with center / tol from earlier scored rows of the same tensor in the same SERIES (model, revision, arch, codebook,
 settings without seed_offset: the ladder's levels differ only in K), best basis first:
   repeat   rows at the same K (honest repeats, best-of-N copies, the anchor re-run): center = their minimum
+           (trusted rows) / their upper median (every passed row, #12)
   interp   rows on both sides: linear in log(rel) between the nearest lower and upper K
   extrap   rows on one side: the nearest, moved along the codebook's rate-distortion slope (-d log rel / dK = SLOPE)
 with tol = TOL[basis] (extrap: + TOL["extrap_per_bit"] x |dK|; FAMILY: k_proj / v_proj's own table) + Z x NOISE /
 sqrt(n), the honest seed noise of a tensor of n = in x out weights. Two bounds when trusted rows
-exist (our verifiers / imported references): one from every passed row, one from trusted rows only; both must hold
-(so a chain of slightly-worse donor results cannot drift the curve). A tensor with no row at all is provisional: the
-job is re-run once on a verifier (an anchor) and decided against it.
+exist (our verifiers / imported references): one from every passed row, one from trusted rows only (so a chain of
+slightly-worse donor results cannot drift the curve). The trusted one is the authority: failing it fails; failing only
+the all bound is suspect (no points, an anchor re-run at that K decides) or, with trusted rows at that very K, a pass
+(#12: one better-than-honest result must not fail every honest one after it). A tensor with no row at all is
+provisional: the job is re-run once on a verifier (an anchor) and decided against it.
 
 Also per tensor: the codes' sha256 (trellis + suh + svh). Codes identical to a published / imported reference ->
 replay, fail. Identical to an earlier donor's row of the same tensor and K -> duplicate: accepted (it is a valid result)
@@ -70,14 +73,17 @@ def tol(key, basis, n=None):
 
 
 # ------------------------------------------------------------------ the band
-def bound(rows, K, codebook, key, n=None):
-    """(log center, tol, basis, refs) from scored rows [(K, rel)] of one tensor of n weights, or None"""
+def bound(rows, K, codebook, key, n=None, center="min"):
+    """(log center, tol, basis, refs) from scored rows [(K, rel)] of one tensor of n weights, or None. center: how the
+    rows at one K are summarised, "min" (trusted rows: our own runs) or "median" (every passed row: the upper median,
+    so one result better than the honest quantizer does not move the band for everyone else, #12)"""
     if not rows: return None
     s = SLOPE.get(codebook, 1.37)
-    best = {}
+    at = {}
     for k, r in rows:
-        if r and r > 0: best[k] = min(best.get(k, math.inf), r)
-    if not best: return None
+        if r and r > 0: at.setdefault(k, []).append(r)
+    if not at: return None
+    best = {k: min(v) if center == "min" else sorted(v)[len(v) // 2] for k, v in at.items()}
     if K in best: return math.log(best[K]), tol(key, "repeat", n), "repeat", len(best)
     lo = [k for k in best if k < K]; hi = [k for k in best if k > K]
     if lo and hi:
@@ -104,18 +110,30 @@ def ref_rows(db, ser, key, exclude_job=None, trusted_only=False):
 
 
 def decide(db, ser, key, K, codebook, rel, n=None, exclude_job=None):
-    """the verdict of one tensor's rel: (state pass|fail|provisional, basis, bound value, detail)"""
-    ba = bound(ref_rows(db, ser, key, exclude_job), K, codebook, key, n)
+    """the verdict of one tensor's rel: (state pass|fail|provisional|suspect, basis, bound value, detail).
+    Two bounds: "all" (every passed row, upper median per K) and "trusted" (our rows only, minimum per K). Without a
+    trusted bound the all bound decides. With one, the trusted bound is the authority (#12): failing it fails; passing
+    it while failing the all bound is no fail: a pass when the trusted rows are at this very K (repeat basis), else
+    "suspect" (no points; an anchor re-run at this K decides). A rel more than the repeat tolerance below the trusted
+    center is marked outlier_better (an event for the operator: better than our own quantizer)."""
+    ba = bound(ref_rows(db, ser, key, exclude_job), K, codebook, key, n, center="median")
     bt = bound(ref_rows(db, ser, key, exclude_job, trusted_only=True), K, codebook, key, n)
     if ba is None and bt is None: return "provisional", None, None, {}
-    det, ok = {}, True
+    det, ok = {}, {}
     for name, b in (("all", ba), ("trusted", bt)):
         if b is None: continue
         o, mg = judge(rel, b)
         det[name] = {"basis": b[2], "center": math.exp(b[0]), "tol": round(b[1], 4), "margin": round(mg, 4) if math.isfinite(mg) else "inf", "refs": b[3]}
-        ok = ok and o
+        ok[name] = o
+    if bt is None: st = "pass" if ok["all"] else "fail"
+    elif not ok["trusted"]: st = "fail"
+    elif ok.get("all", True): st = "pass"
+    else:
+        det["all_only_fail"] = True
+        st = "pass" if bt[2] == "repeat" else "suspect"
+    if bt is not None and rel and rel > 0 and math.log(rel) < bt[0] - tol(key, "repeat", n): det["outlier_better"] = True
     b = ba or bt
-    return ("pass" if ok else "fail"), b[2], math.exp(b[0] + b[1]), det
+    return st, b[2], math.exp(b[0] + b[1]), det
 
 
 # ------------------------------------------------------------------ the decode
@@ -206,7 +224,7 @@ def score_job(S, results, data_path, job_id, policy=None, log=None):
                 tr.update({"state": s_, "basis": basis, "bound": bv, **d})
                 det["tensors"].append(tr); states.append(s_)
                 r.update(state=s_, basis=basis, bound=bv)
-            st = "fail" if "fail" in states else "provisional" if "provisional" in states else "pass"
+            st = agg(states)
             if dup is not None and st == "pass": det["duplicate_of"] = dup
             for r in rows:
                 rs = r["state"] if st != "fail" else ("fail" if r["state"] == "fail" else "void")
@@ -218,17 +236,28 @@ def score_job(S, results, data_path, job_id, policy=None, log=None):
         det["seconds"] = round(time.time() - t0, 1)
         db.execute("UPDATE jobs SET check_state=?, check_detail=? WHERE id=?", (st, json.dumps(det, default=str)[:60000], job_id))
         S.event(db, f"score_{st}", job_id, j["accepted_by"], detail={k: det.get(k) for k in ("K", "kind", "total_rel", "error", "duplicate_of")})
+        out = [{"key": t["key"], "rel": t["rel"], "trusted_center": t["trusted"]["center"]} for t in det["tensors"]
+               if t.get("outlier_better")]
+        if out and kind == "donor":                         # better than our own quantizer by more than the noise: look
+            S.event(db, "score_outlier", job_id, j["accepted_by"], detail={"tensors": out[:8]})
         orig = db.execute("SELECT * FROM jobs WHERE id=?", (j["verify_of"],)).fetchone() if j["verify_of"] else None
         if st == "pass" and orig is None: V.settle(S, db, job_id)
         elif st == "fail" and kind == "donor" and orig is None:
             V.quarantine(S, db, results, j["accepted_by"], f"score check of job {job_id} failed: " + (err or _worst(det)))
         elif st == "fail":
             S.event(db, "score_trusted_fail", job_id, j["accepted_by"], detail={"error": err})     # look: our own hardware
-        elif st == "provisional":
+        elif st in ("provisional", "suspect"):              # no reference yet / out of the all band only: an anchor decides
             if not db.execute("SELECT 1 FROM jobs WHERE verify_of=? AND state IN ('queued','leased','accepted')", (job_id,)).fetchone():
-                V.enqueue_rerun(S, db, j, why="anchor", mark=False)
+                V.enqueue_rerun(S, db, j, why="anchor" if st == "provisional" else "suspect", mark=False)
     if st == "pass": reevaluate(S, results, ser, [r["key"] for r in rows or []])
     return st
+
+
+def agg(states):
+    """a job's state from its tensors': any fail fails, then provisional, then suspect"""
+    for st in ("fail", "provisional", "suspect"):
+        if st in states: return st
+    return "pass"
 
 
 def _worst(det):
@@ -247,26 +276,28 @@ def reevaluate(S, results, ser, keys):
         jids = set()
         for key in keys:
             for r in db.execute("SELECT * FROM scores WHERE series=? AND key=? AND kind='donor' AND "
-                                "(state='provisional' OR (state='pass' AND basis IN ('extrap','interp')))", (ser, key)).fetchall():
+                                "(state IN ('provisional','suspect') OR (state='pass' AND basis IN ('extrap','interp')))", (ser, key)).fetchall():
                 jids.add(r["job_id"])
         for jid in sorted(x for x in jids if x is not None):
             j = db.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
-            if j is None or j["state"] != "accepted" or j["check_state"] not in ("provisional", "pass"): continue
+            if j is None or j["state"] != "accepted" or j["check_state"] not in ("provisional", "suspect", "pass"): continue
             p = json.loads(j["params"]); det = json.loads(j["check_detail"] or "{}")
             rows = db.execute("SELECT * FROM scores WHERE job_id=?", (jid,)).fetchall()
             states, changed = [], False
             for r in rows:
-                if r["state"] not in ("provisional", "pass"): states.append(r["state"]); continue
+                if r["state"] not in ("provisional", "suspect", "pass"): states.append(r["state"]); continue
                 if r["state"] == "pass" and r["basis"] == "repeat": states.append("pass"); continue
                 s_, basis, bv, d = decide(db, ser, r["key"], float(r["K"]), p["codebook"], r["rel"], r["n"], exclude_job=jid)
-                if s_ == "provisional": states.append(r["state"]); continue
+                # still no reference, or out of the all band only while the trusted band holds and no anchor at this K
+                # has come back: unchanged (a passed row is never downgraded to suspect)
+                if s_ in ("provisional", "suspect"): states.append(r["state"]); continue
                 if (s_, basis) != (r["state"], r["basis"]):
                     db.execute("UPDATE scores SET state=?, basis=?, bound=? WHERE id=?", (s_, basis, bv, r["id"])); changed = True
                     for t in det.get("tensors", []):
                         if t["key"] == r["key"]: t.update({"state": s_, "basis": basis, "bound": bv, **d, "rechecked": time.time()})
                 states.append(s_)
             if not changed: continue
-            st = "fail" if "fail" in states else "provisional" if "provisional" in states else "pass"
+            st = agg(states)
             if st == j["check_state"]:
                 db.execute("UPDATE jobs SET check_detail=? WHERE id=?", (json.dumps(det, default=str)[:60000], jid)); continue
             db.execute("UPDATE jobs SET check_state=?, check_detail=? WHERE id=?", (st, json.dumps(det, default=str)[:60000], jid))
