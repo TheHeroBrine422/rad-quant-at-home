@@ -426,6 +426,12 @@ class Worker:
         jid, lid = job.get("id"), job.get("lease_id")
         return isinstance(jid, int) and not isinstance(jid, bool) and jid >= 0 and isinstance(lid, str) and bool(re.fullmatch(r"[0-9a-f]{32}", lid))
 
+    @classmethod
+    def shown_id(cls, job):
+        """a job id for the log: plain when it passed ids_ok, else escaped and cut (a hostile server's id must not
+        forge log lines or drive the terminal)"""
+        return job.get("id") if cls.ids_ok(job) else ascii(str(job.get("id"))[:80])
+
     def validate(self, job):
         """is this a job we run, with parameters and inputs it allows? (no code from the server, ever) -> (module,
         its requirements); raises jobs.Rejected"""
@@ -446,7 +452,7 @@ class Worker:
         """check a leased (or resumed) job, give it its cards and RAM and a thread; refuse what does not fit"""
         try: m, own = self.validate(job)
         except jobs.Rejected as e:
-            log(f"job {str(job.get('id'))[:80]}: REJECTED: {e}")
+            log(f"job {self.shown_id(job)}: REJECTED: {e}")
             self.fail(job, f"rejected by worker: {e}", reject=True)
             if cur: self.cleanup(cur)
             return
@@ -472,7 +478,7 @@ class Worker:
     def resume(self, cur):
         j = cur["job"]
         if not self.ids_ok(j):
-            log(f"state file for job {str(j.get('id'))[:80]!r}: bad id or lease id; ignoring it"); return
+            log(f"state file for job {self.shown_id(j)}: bad id or lease id; ignoring it"); return
         try: hb = self.c.api("POST", "heartbeat", {"job_id": j["id"], "lease_id": j["lease_id"]}, tries=5)
         except Exception as e: hb = {"ok": False, "cancel": True, "error": repr(e)}
         if hb.get("cancel"):

@@ -37,7 +37,7 @@ see section 7.
 
 Request overhead: a 1 s noop job takes 1.01 s lease-to-complete on localhost.
 
-2026-11-06: 109/109 (plain process) with the two lease-id cases (issue #2).
+Security fix round (issue #2, the two lease-id cases above): macOS dev box, 2026-11-06, **109/109** (plain process).
 
 ## 2. Server throughput (the queue host, loopback, niced)
 
