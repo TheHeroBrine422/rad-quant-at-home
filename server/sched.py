@@ -11,6 +11,39 @@ the worker already caches; a worker with a download budget instead takes the job
 import fnmatch, json
 import jobs
 
+QUANT = ("quant_layer", "quant_tensor", "quant_head")
+# probation (workers registered without an invite, docs/VERIFY.md "Identity"): the defaults of server.py's
+# --probation-pass / --eval-unlock
+PROBATION_PASS, EVAL_UNLOCK = 3, 5
+
+
+def passed_quant(q, wid):
+    """a worker's quant results the scorer or checker passed and that earned lumens (a duplicate earns none);
+    q(sql, args) -> rows"""
+    return q("SELECT COUNT(*) FROM jobs j WHERE j.accepted_by=? AND j.verify_of IS NULL AND j.state='accepted' AND "
+             "j.check_state='pass' AND j.type IN ('quant_layer','quant_tensor','quant_head') AND "
+             "(SELECT COALESCE(SUM(lumens), 0) FROM points p WHERE p.job_id=j.id AND p.worker_id=j.accepted_by) > 1e-9",
+             (wid,))[0][0]
+
+
+def tier(wr, passed, probation_pass=PROBATION_PASS, eval_unlock=EVAL_UNLOCK):
+    """what a worker may lease: "full" (registered with an invite or by the operator, or unlocked), "quant" (on
+    probation with probation_pass passed results: score-mode quant jobs only, any number at once) or "probation"
+    (score-mode quant jobs only, one at a time). eval_mix and every type whose check takes our hardware (replicate
+    quant, golden_record) unlock at eval_unlock passed results. A quarantined probation worker never unlocks."""
+    p = wr["probation"] if "probation" in wr.keys() else 0
+    if not p or wr["verifier"]: return "full"
+    if p >= 2 or wr["quarantined"] or passed < probation_pass: return "probation"
+    return "quant" if passed < eval_unlock else "full"
+
+
+def score_quant(j):
+    """a quant job verified by the server's own scorer (no card time of ours)"""
+    if j["type"] not in QUANT: return False
+    try: return json.loads(j["params"]).get("verify") == "score"
+    except (ValueError, AttributeError): return False
+
+
 # enqueue-level's default priority by the granularity of K (user 2026-11-06): coarse ladder steps first
 GRANULARITY_PRIORITY = ((1, 40), (2, 30), (4, 20), (8, 10), (16, 5))
 
@@ -29,11 +62,12 @@ def norm_req(r):
     return r
 
 
-def job_filter(wr, caps, failed=frozenset(), groups=frozenset()):
+def job_filter(wr, caps, failed=frozenset(), groups=frozenset(), tier_="full"):
     """f(job row) -> its normalised requirements if worker row wr with declared caps may ever run it, else None (the
     free-cards / free-RAM part is the caller's). failed: ids of queued jobs this worker already failed, rejected or let
     expire since their last requeue (one attempt per worker per job). groups: best-of-N groups (jobs.grp) of which the
-    worker's donor already holds or delivered a copy (#11: one copy of a group per donor)"""
+    worker's donor already holds or delivered a copy (#11: one copy of a group per donor). tier_: tier() of the
+    worker; below "full" only score-mode quant jobs"""
     types = set(caps.get("job_types") or ()) & {n for n, m in jobs.REGISTRY.items() if m.IMPLEMENTED}
     vers = caps.get("versions", {})
     disk = caps.get("disk_gb", 0) * 1e9
@@ -43,6 +77,7 @@ def job_filter(wr, caps, failed=frozenset(), groups=frozenset()):
         if j["type"] not in types or vers.get(j["type"], j["version"]) != j["version"]: return None
         if j["exclude_worker"] == wr["id"]: return None
         if j["id"] in failed: return None
+        if tier_ != "full" and not score_quant(j): return None
         if groups and j["grp"] in groups: return None
         if j["needs"] == "verifier" and not wr["verifier"]: return None
         if j["needs"] == "trusted" and not (wr["trusted"] or wr["verifier"]): return None

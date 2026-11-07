@@ -3,8 +3,8 @@
 CLI client/rqah.py). Authenticated with any one worker token; the answer covers every worker of that worker's
 donor (store.py: donors).
 
-  GET  /api/v0/me                  profile, workers (caps as declared, flags, running jobs, lumens), totals, queue depth
-                                   (and how many queued jobs each worker could run)
+  GET  /api/v0/me                  profile, workers (caps as declared, flags, tier, running jobs, lumens), totals, queue
+                                   depth (and how many queued jobs each worker could run)
   GET  /api/v0/me/jobs?limit=N&worker=ID&active=1     leases of the donor's workers, newest first, each with its
                                    verification state (VERIFICATION below) and lumens
   GET  /api/v0/me/points?limit=N   lumens per worker and type, the ledger (grants / revokes), what is still pending,
@@ -12,8 +12,10 @@ donor (store.py: donors).
   GET  /api/v0/me/events?after=ID&limit=N   the server's audit log for the donor's workers (allow-listed fields,
                                    scrubbed of paths / addresses / tokens)
   POST /api/v0/me/profile  {display_name?, leaderboard?}   the public leaderboard entry (opt-in)
-  POST /api/v0/me/link     {token}  put this worker's donor together with the donor of the worker holding `token`
-                                   (holding both tokens proves both are yours)
+
+The leaderboard credits by display name (board()): every opted-in donor showing the same name adds to one row. The
+name is a label for credit only: trust, scoring, spot checks, quarantine and invalidation are per worker (token).
+`POST /api/v0/me/link` was removed with this (410, LINK_GONE).
 
 Nothing here reveals another donor's workers, any token or invite, job inputs or server paths."""
 import json, re, time, unicodedata
@@ -100,29 +102,51 @@ def net_by_job(S, wids):
             S.q(f"SELECT worker_id, job_id, SUM(lumens) n FROM points WHERE worker_id IN {_in(wids)} GROUP BY worker_id, job_id")}
 
 
+def name_key(name):
+    """the leaderboard's grouping key of a checked display name: case-insensitive"""
+    return unicodedata.normalize("NFC", name.casefold())
+
+
+def hidden_names(S):
+    """keys of the names the operator hid (admin.py donor ID --hide on any donor showing that name)"""
+    return {name_key(n) for n in (public_name(d["display_name"]) for d in S.q("SELECT display_name FROM donors WHERE hidden=1")) if n}
+
+
 def board(S):
-    """the public leaderboard: opted-in, not hidden donors without a quarantined worker; lumens of non-verifier
-    workers, verified jobs = jobs with net lumens > 0. -> (ranked rows, (others' count, others' lumens))"""
+    """the public leaderboard, one row per public display name (case-insensitive): the lumens of every non-verifier,
+    not quarantined worker whose donor opted in under that name; verified jobs = (worker, job) pairs with net lumens
+    > 0. A quarantined worker's lumens count nowhere, and nothing else changes for the name. A name the operator hid
+    on any donor is off the board (its donors count with the others). Rows show the name's most common spelling
+    among their donors. -> (ranked rows, (others' count of donors, others' lumens))"""
     ws = {r["id"]: r for r in S.q("SELECT id, donor_id, verifier, quarantined, last_seen FROM workers")}
     ds = {r["id"]: r for r in S.q("SELECT * FROM donors")}
     per = {}
     for r in S.q("SELECT worker_id, job_id, SUM(lumens) n FROM points GROUP BY worker_id, job_id"):
         w = ws.get(r["worker_id"])
-        if w is None or w["verifier"] or r["n"] <= 1e-9: continue
+        if w is None or w["verifier"] or w["quarantined"] or r["n"] <= 1e-9: continue
         d = per.setdefault(w["donor_id"] if w["donor_id"] is not None else -w["id"], {"lumens": 0.0, "jobs": 0})
         d["lumens"] += r["n"]; d["jobs"] += 1
-    bad = {w["donor_id"] for w in ws.values() if w["quarantined"]}
     last = {}
     for w in ws.values():
-        if w["donor_id"] is not None: last[w["donor_id"]] = max(last.get(w["donor_id"], 0), w["last_seen"] or 0)
-    rows, others = [], [0, 0.0]
+        if w["donor_id"] is not None and not w["quarantined"]: last[w["donor_id"]] = max(last.get(w["donor_id"], 0), w["last_seen"] or 0)
+    hid = hidden_names(S)
+    named, others = {}, [0, 0.0]
     for did, v in per.items():
         d = ds.get(did); name = public_name(d["display_name"]) if d else None
-        if d and d["leaderboard"] and not d["hidden"] and did not in bad and name:
-            rows.append({"donor": did, "name": name, "lumens": round(v["lumens"], 2), "jobs": v["jobs"], "last_seen": last.get(did)})
-        elif did not in bad:
+        key = name_key(name) if name else None
+        if d and d["leaderboard"] and not d["hidden"] and key and key not in hid:
+            g = named.setdefault(key, {"donors": [], "spell": {}, "lumens": 0.0, "jobs": 0, "last_seen": None})
+            g["donors"].append(did); g["spell"][name] = g["spell"].get(name, 0) + 1
+            g["lumens"] += v["lumens"]; g["jobs"] += v["jobs"]
+            g["last_seen"] = max(g["last_seen"] or 0, last.get(did) or 0) or None
+        else:
             others[0] += 1; others[1] += v["lumens"]
-    rows.sort(key=lambda r: (-r["lumens"], -r["jobs"], r["donor"]))
+    rows = []
+    for key, g in named.items():
+        name = min(g["spell"], key=lambda n: (-g["spell"][n], n))       # most donors; ties: the first in code-point order
+        rows.append({"name": name, "key": key, "donors": sorted(g["donors"]), "lumens": round(g["lumens"], 2), "jobs": g["jobs"],
+                     "last_seen": g["last_seen"]})
+    rows.sort(key=lambda r: (-r["lumens"], -r["jobs"], r["key"]))
     for i, r in enumerate(rows): r["rank"] = i + 1
     return rows, (others[0], round(others[1], 2))
 
@@ -172,8 +196,18 @@ def _expected(j):
     except Exception: return None
 
 
+def tier_of(S, x):
+    """(sched.tier of worker row x, its passed quant results or None when it was never on probation)"""
+    if not x["probation"] or x["verifier"]: return "full", None
+    n = sched.passed_quant(S.q, x["id"])
+    return sched.tier(x, n, *_thresholds(S)), n
+
+
+def _thresholds(S): return getattr(S, "probation", (sched.PROBATION_PASS, sched.EVAL_UNLOCK))
+
+
 def me(S, w):
-    ws = donor_workers(S, w); wids = [x["id"] for x in ws]; d = _donor(S, w)
+    ws = donor_workers(S, w); wids = [x["id"] for x in ws]; d = _donor(S, w); pp, eu = _thresholds(S)
     net = net_by_job(S, wids)
     run = {}
     for r in S.q(f"SELECT l.worker_id, j.id, j.type FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.state='active' "
@@ -187,7 +221,8 @@ def me(S, w):
     for x in ws:
         caps = json.loads(x["caps"] or "{}")
         lum = [v for (wi, _), v in net.items() if wi == x["id"] and v > 1e-9]
-        f = sched.job_filter(x, caps) if caps.get("job_types") else None
+        tr, passed = tier_of(S, x)
+        f = sched.job_filter(x, caps, tier_=tr) if caps.get("job_types") else None
         workers.append({"id": x["id"], "name": x["name"], "registered": x["created"], "last_seen": x["last_seen"],
                         "gpu_name": scrub(caps.get("gpu_name", ""), 64), "cards": caps.get("cards"), "vram_gb": caps.get("vram_gb"),
                         "ram_gb": caps.get("ram_gb"), "disk_gb": caps.get("disk_gb"), "job_types": caps.get("job_types", []),
@@ -195,15 +230,19 @@ def me(S, w):
                         "cached_inputs": (caps.get("cache") or {}).get("n") if isinstance(caps.get("cache"), dict) else None,
                         "trusted": bool(x["trusted"]), "verifier": bool(x["verifier"]), "quarantined": bool(x["quarantined"]),
                         "disabled": bool(x["disabled"]),
+                        "tier": {"tier": tr, "passed": passed, "probation_pass": pp, "eval_unlock": eu} if x["probation"] else {"tier": tr},
                         "quarantine_reason": scrub(x["quarantine_reason"]) if x["quarantined"] else None,
                         "running": run.get(x["id"], []), "lumens": round(sum(lum), 4), "verified_jobs": len(lum),
                         "could_run": sum(1 for j in queued if f(j) is not None) if f else None})
     rows, _ = board(S)
-    mine = [r for r in rows if d is not None and r["donor"] == d["id"]]
+    mine = [r for r in rows if d is not None and d["id"] in r["donors"]]
+    name = public_name(d["display_name"]) if d else None
     return {"server_time": time.time(), "worker": {"id": w["id"], "name": w["name"]},
             "donor": {"id": d["id"] if d else None, "display_name": d["display_name"] if d else None,
                       "leaderboard": bool(d and d["leaderboard"]), "hidden": bool(d and d["hidden"]),
-                      "rank": mine[0]["rank"] if mine else None, "on_board": len(rows)},
+                      "name_hidden": bool(name and name_key(name) in hidden_names(S)),
+                      "rank": mine[0]["rank"] if mine else None, "on_board": len(rows),
+                      "board_lumens": mine[0]["lumens"] if mine else None},
             "workers": workers, "lumens": round(sum(x["lumens"] for x in workers), 4),
             "verified_jobs": sum(x["verified_jobs"] for x in workers),
             "pending": {"jobs": len(pend), "lumens": round(sum(_expected(j) or 0 for j in pend), 4)},
@@ -279,6 +318,10 @@ def set_profile(S, w, b):
     if not sets: raise ValueError("nothing to set (display_name, leaderboard)")
     with S.tx() as db:
         did = w["donor_id"]
+        d = db.execute("SELECT hidden, display_name FROM donors WHERE id=?", (did,)).fetchone() if did is not None else None
+        if d is not None and d["hidden"] and "display_name" in b and args[0] != d["display_name"]:
+            # hiding a donor hides its name for everyone showing it (board): a hidden donor may not move that to another name
+            raise ValueError("display name: this donor's name was hidden by the operator and cannot be changed (ask the operator)")
         if did is None:
             did = S.new_donor(db, w["name"]); db.execute("UPDATE workers SET donor_id=? WHERE id=?", (did, w["id"]))
         db.execute(f"UPDATE donors SET {', '.join(sets)} WHERE id=?", (*args, did))
@@ -286,25 +329,5 @@ def set_profile(S, w, b):
     return {"ok": True, "donor": did}
 
 
-def link(S, w, other_token):
-    o = S.auth(other_token) if isinstance(other_token, str) else None
-    if o is None: raise PermissionError("that token is not a worker of this server")
-    with S.tx() as db:
-        w = db.execute("SELECT * FROM workers WHERE id=?", (w["id"],)).fetchone()
-        o = db.execute("SELECT * FROM workers WHERE id=?", (o["id"],)).fetchone()
-        if o["donor_id"] is None:
-            db.execute("UPDATE workers SET donor_id=? WHERE id=?", (S.new_donor(db, o["name"]), o["id"]))
-            o = db.execute("SELECT * FROM workers WHERE id=?", (o["id"],)).fetchone()
-        if w["donor_id"] == o["donor_id"]: return {"ok": True, "donor": o["donor_id"], "moved": 0}
-        old = w["donor_id"]
-        if old is None: n = db.execute("UPDATE workers SET donor_id=? WHERE id=?", (o["donor_id"], w["id"])).rowcount
-        else:
-            od = db.execute("SELECT * FROM donors WHERE id=?", (old,)).fetchone()
-            n = db.execute("UPDATE workers SET donor_id=? WHERE donor_id=?", (o["donor_id"], old)).rowcount
-            if od is not None:          # the operator's hide survives the merge; the old name only fills a missing one
-                db.execute("UPDATE donors SET hidden=MAX(hidden, ?), display_name=COALESCE(display_name, ?) WHERE id=?",
-                           (od["hidden"], od["display_name"], o["donor_id"]))
-            db.execute("DELETE FROM donors WHERE id=?", (old,))
-            db.execute("UPDATE invites SET donor_id=? WHERE donor_id=?", (o["donor_id"], old))
-        S.event(db, "link", worker_id=w["id"], detail={"donor": o["donor_id"], "from_donor": old, "with_worker": o["id"], "moved": n})
-    return {"ok": True, "donor": o["donor_id"], "moved": n}
+LINK_GONE = ("rqah link was removed: the leaderboard credits by display name, so use the same name on every machine "
+             "(rqah config set --display-name NAME --leaderboard on)")

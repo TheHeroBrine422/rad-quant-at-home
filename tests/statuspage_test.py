@@ -10,8 +10,9 @@ script on a read-only connection); it is well-formed XHTML (xml.etree) with only
 script / form / input / external resource / event-handler attribute (html.parser; xmllint --html too if present);
 no token, IP, e-mail, path or hostname pattern and none of the fixture's secrets; everything donor- or
 operator-supplied escaped; the numbers right (ladder, search, goldens, jobs by type, leaderboard order and opt-in,
-recent work); and the donor display-name rules (server/donor.py)."""
-import html.parser, json, os, re, shutil, sqlite3, subprocess, sys, time
+recent work); the donor display-name rules (server/donor.py); and credit by display name (by_name: one row per
+name, case-insensitive; quarantined workers' lumens out, the row stays; opt-in per donor; the operator's hide)."""
+import collections, html.parser, json, os, re, shutil, sqlite3, subprocess, sys, time
 import xml.etree.ElementTree as ET
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -129,6 +130,60 @@ def fixture(db):
     return S, ids, toks
 
 
+def by_name(db):
+    """7. credit by display name: one row per name (case-insensitive), lumens of opted-in donors' unquarantined workers"""
+    S = Store(db)
+    ids = {n: S.add_worker(n)[0] for n in ("a1", "a2", "a3", "a4", "q1", "q2", "o1", "h1", "h2", "solo")}
+    with S.tx() as d:
+        don = lambda n: d.execute("SELECT donor_id FROM workers WHERE id=?", (ids[n],)).fetchone()[0]
+        for n, name, lb in (("a1", "Ada Lovelace", 1), ("a2", "ada  LOVELACE", 1), ("a3", "Ada Lovelace", 1), ("a4", "ADA lovelace", 0),
+                            ("q1", "Grace", 1), ("q2", "grace", 1), ("o1", "Grace", 0), ("h1", "Hidden Name", 1), ("h2", "hidden name", 1),
+                            ("solo", "Solo Cheat", 1)):
+            d.execute("UPDATE donors SET display_name=?, leaderboard=? WHERE id=?", (name, lb, don(n)))
+        d.execute("UPDATE workers SET quarantined=1, quarantine_reason='x' WHERE id IN (?,?)", (ids["q2"], ids["solo"]))
+        d.execute("UPDATE donors SET hidden=1 WHERE id=?", (don("h2"),))
+        for n in ids: d.execute("UPDATE workers SET last_seen=? WHERE id=?", (NOW - 60 if n == "q2" else NOW - 7200, ids[n]))
+        lum = {"a1": 10.0, "a2": 5.0, "a3": 2.5, "a4": 100.0, "q1": 7.0, "q2": 50.0, "o1": 40.0, "h1": 3.0, "h2": 4.0, "solo": 9.0}
+        for j, (n, l) in enumerate(lum.items(), 1):
+            d.execute("INSERT INTO jobs(id, type, version, params, inputs, requires, input_bytes, state, accepted_by, accepted_at, "
+                      "created, updated) VALUES(?, 'noop', 1, '{}', '[]', '{}', 0, 'accepted', ?, ?, ?, ?)", (j, ids[n], NOW - j, NOW, NOW))
+            d.execute("INSERT INTO points(t, worker_id, job_id, lumens, kind) VALUES(?,?,?,?, 'grant')", (NOW, ids[n], j, l))
+        dids = {n: don(n) for n in ids}
+    rows, others = D.board(S)
+    by = {r["key"]: r for r in rows}
+    ada, grace = by.get("ada lovelace"), by.get("grace")
+    ok("by name: three opted-in donors named Ada Lovelace / ada LOVELACE (different case, extra space) -> one row, lumens summed, "
+       "the most common spelling shown, every donor's rank the same",
+       ada is not None and ada["name"] == "Ada Lovelace" and ada["lumens"] == 17.5 and ada["jobs"] == 3 and
+       ada["donors"] == sorted(dids[n] for n in ("a1", "a2", "a3")) and
+       all(D.me(S, S.q("SELECT * FROM workers WHERE id=?", (ids[n],))[0])["donor"]["rank"] == ada["rank"] for n in ("a1", "a2", "a3")) and
+       D.me(S, S.q("SELECT * FROM workers WHERE id=?", (ids["a2"],))[0])["donor"]["board_lumens"] == 17.5, str(rows))
+    ok("by name: a quarantined worker under a name -> its lumens drop out (Grace 7, not 57; nor in 'others'), the row is still "
+       "shown; its last-seen does not count either",
+       grace is not None and grace["lumens"] == 7.0 and grace["donors"] == [dids["q1"]] and grace["last_seen"] == NOW - 7200, str(grace))
+    ok("by name: a donor that did not opt in, under a listed name (ADA lovelace 100, Grace 40) -> not counted in the row, "
+       "counted with the others (with the two donors of the hidden name: 4 donors, 147 lumens); a name whose only worker "
+       "is quarantined -> no row, its lumens nowhere",
+       others == (4, 147.0) and "solo cheat" not in by, f"others {others}")
+    ok("by name: the operator's hide on one donor (hidden name) hides the name for every donor showing it; the other donor's "
+       "status says so",
+       "hidden name" not in by and D.me(S, S.q("SELECT * FROM workers WHERE id=?", (ids["h1"],))[0])["donor"]["name_hidden"] is True
+       and D.me(S, S.q("SELECT * FROM workers WHERE id=?", (ids["a1"],))[0])["donor"]["name_hidden"] is False, str(list(by)))
+    h2 = S.q("SELECT * FROM workers WHERE id=?", (ids["h2"],))[0]
+    try: D.set_profile(S, h2, {"display_name": "Ada Lovelace"}); moved = True
+    except ValueError: moved = False
+    keep = D.set_profile(S, h2, {"display_name": "hidden name", "leaderboard": False})["ok"]
+    ok("by name: a hidden donor cannot move its hide onto another name (rename refused; setting the same name or the "
+       "opt-in still works); Ada's row unchanged",
+       not moved and keep and D.board(S)[0][0]["key"] == "ada lovelace" and D.board(S)[0][0]["lumens"] == 17.5)
+    rec = collections.Counter(r["by"] for r in SP.collect(S, {}, NOW)["recent"])
+    ok("by name: recent work credits the name for its counted workers only (Ada x3, Grace x1: not the quarantined worker's "
+       "job, not the opted-out donor's)", rec["Ada Lovelace"] == 3 and rec["Grace"] == 1 and rec["a donor"] == 6, str(rec))
+    ok("by name: no link function or link endpoint left in server/donor.py", not hasattr(D, "link") and "410" not in D.LINK_GONE
+       and "display name" in D.LINK_GONE)
+    S.db.close()
+
+
 def main():
     if os.path.exists(W): shutil.rmtree(W)
     os.makedirs(W)
@@ -225,6 +280,7 @@ def main():
     ok("scrub(): paths, IPs, tokens, e-mails out of donor-facing text",
        D.scrub("fail at /root/x/y.py from 10.1.2.3:8740 tok rq" + "Z" * 30 + " a@b.cd https://h/x") ==
        "fail at <path> from <ip> tok <token> <email> <url>", D.scrub("fail at /root/x/y.py from 10.1.2.3:8740 tok rq" + "Z" * 30 + " a@b.cd https://h/x"))
+    by_name(f"{W}/byname.sqlite")
     n_ok = sum(r[1] for r in RESULTS)
     print(f"\n{n_ok}/{len(RESULTS)} checks passed")
     sys.exit(0 if n_ok == len(RESULTS) else 1)

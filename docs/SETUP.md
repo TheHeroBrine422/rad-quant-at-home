@@ -52,8 +52,8 @@ AMD gets `/dev/kfd`, `/dev/dri`, the host's numeric video / render gids and `sec
 | setting | default | notes |
 |---|---|---|
 | queue URL | (required) | `https://`; plain `http://` only for localhost |
-| invite | (none) | read without echo (curses: not drawn; plain: getpass), or `--invite-file F` / `-` / `$RQAH_INVITE`. Never a flag value, never printed, stored only in `worker.env`. Enter keeps the stored one, `-` removes it (after registration the token is in the state volume and the invite is unused) |
-| display name, leaderboard | `donor`, off | the server's display-name rules (kept in sync by the test) plus no `#` / `$` |
+| invite | (none) | optional: without one the worker registers on probation (server-scored quantization jobs only, one at a time until a few results pass; evaluations later); an invite skips that. Read without echo (curses: not drawn; plain: getpass), or `--invite-file F` / `-` / `$RQAH_INVITE`. Never a flag value, never printed, stored only in `worker.env`. Enter keeps the stored one, `-` removes it (after registration the token is in the state volume and the invite is unused) |
+| display name, leaderboard | `donor`, off | the server's display-name rules (kept in sync by the test) plus no `#` / `$`. The board credits by name (case-insensitive): use the same name on every machine to be credited together. A warning if you opt in with the default `donor` (you would share its row with everyone who kept it) |
 | vendor | the one with the most usable VRAM | asked only when both have usable cards |
 | cards | every usable card of that vendor | iGPUs, other gfx targets, cc < 8.0 and drivers < 570 are refused |
 | VRAM per card | the card's size in GB, 1 less if it drives a display | the smallest of the selected cards; a warning for mixed models |
@@ -139,7 +139,7 @@ The form (2 × R9700, 128 GB):
  Schedule
    Run only during                  always
 
- the https:// URL you got with your invite
+ the https:// URL of the queue (from us)
  ↑↓ move  Enter edit  Space toggle  [a] show advanced  [s] summary & save  [q] quit
 ```
 
@@ -160,7 +160,7 @@ What the worker may use:
   disk            input cache ≤ 50 GB in the Docker volume rqah-state
   network         down unlimited, up unlimited; budget down no cap, up no cap
   when            22:00-08:00 (America/Chicago); on stop: finish the running jobs
-  leaderboard     listed as 'Grace'
+  leaderboard     listed as 'Grace' (with every opted-in machine of that name)
 
 Jobs it will get (small-card mode, docs/SMALL-CARDS.md):
   + 27B layers up to K6 (quant_layer), and every Hessian group but down_proj above K6 (quant_tensor)

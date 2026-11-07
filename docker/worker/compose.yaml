@@ -3,8 +3,9 @@
 # `docker run` line in README.md ("For donors"); this file holds the same settings. Every RQAH_* setting
 # also takes its 0.2 name RADQUANT_* (read in 0.3 only).
 #
-#   cp .env.example .env     then set RQAH_SERVER, RQAH_INVITE (first start only), RENDER_GID, VIDEO_GID, caps
-#   docker compose up -d     registers with the invite on the first start; the token is kept in the state volume
+#   cp .env.example .env     then set RQAH_SERVER, RQAH_INVITE (first start only; optional), RENDER_GID, VIDEO_GID, caps
+#   docker compose up -d     registers on the first start (without an invite: on probation); the token is kept in the
+#                            state volume
 #   docker compose logs -f   docker compose stop   (stop = finish the current jobs, up to stop_grace_period)
 #   docker compose exec worker rqah status      your workers, jobs, lumens (rqah jobs | points | logs | config)
 #
@@ -26,7 +27,8 @@ services:
     cap_drop: [ALL]
     environment:
       RQAH_SERVER: ${RQAH_SERVER:-${RADQUANT_SERVER:?set RQAH_SERVER to the queue URL you were given}}
-      RQAH_INVITE: ${RQAH_INVITE:-${RADQUANT_INVITE:-}}     # one-time invite; ignored once the token file exists
+      RQAH_INVITE: ${RQAH_INVITE:-${RADQUANT_INVITE:-}}     # one-time invite (optional: without one the worker starts on
+                                                        # probation); ignored once the token file exists
       RQAH_NAME: ${RQAH_NAME:-${RADQUANT_NAME:-donor}}      # your display name on the leaderboard, if you opt in:
       RQAH_LEADERBOARD: ${RQAH_LEADERBOARD:-0}          # 1 = listed on the public status page (first start;
                                                                 # later: docker compose exec worker rqah config set ...)

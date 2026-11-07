@@ -138,6 +138,7 @@ are not re-checked.
 | collusion on quality | several donors return the same slightly-worse quant | the trusted bound (anchors / imports) and re-checks against neighbouring K | 1/8-bit-worse test, re-check test |
 | griefing honest donors | one result a few % better than honest, so that honest repeats fall out of a band centred on it | the all-rows center is the upper median; an all-only fail with the trusted bound passing is suspect, decided by an anchor, never a quarantine (#12) | better-than-honest-then-honest test |
 | wrong data | quantizing another tensor, another layer, other weights | rel against our weights: garbage-level | (follows from the decode) |
+| throwaway identities | registering many workers without an invite, to grab leases, eat bandwidth or verifier time, or start over after a quarantine | probation: score-mode quant only (no verifier time), one lease at a time, eval_mix and replicate quant after 5 passed results; a quarantined probation worker never unlocks; registrations limited per address (IPv6 /64) and per hour ("Identity" below) | `tests/probation_test.py` |
 
 **What it does not catch** (and why that is acceptable):
 
@@ -157,10 +158,10 @@ are not re-checked.
 ### Identity: trust is per worker, not per donor (#9, won't fix)
 
 Quarantine, the spot-check draw (a worker's first result of each type, then a random share) and the exclusion of a
-worker from a job it was caught on all key on the worker id. A donor can hold several ids (a personal invite with
-`--uses N`, `rqah link`, more invites), so a caught donor's other machines keep working until the operator acts.
-Keying these on the donor instead would not stop a cheater: registering again with a fresh invite makes a new donor
-as easily as a new worker, so donor-wide automation would cost complexity and protect nothing. What it would do is
+worker from a job it was caught on all key on the worker id. A person can hold several ids (a personal invite with
+`--uses N`, more invites, or simply registering again: open registration needs no invite), so a caught person's
+other machines keep working until the operator acts. Keying these on the donor instead would not stop a cheater:
+registering again makes a new donor as easily as a new worker, so donor-wide automation would cost complexity and protect nothing. What it would do is
 punish honest donors for one broken machine (a bad card or driver fails a re-run; its siblings are fine). So:
 
 - **Every worker is checked on its own.** A new token's first result of each type is always re-run (or scored), so a
@@ -172,8 +173,66 @@ punish honest donors for one broken machine (a bad card or driver fails a re-run
 - **Donor-wide action is the operator's call:** `admin.py exclude-donor DONOR --reason ...` quarantines every worker
   of the donor and invalidates every result of theirs that nothing confirmed (lumens revoked, jobs requeued for
   others, the search's batches see them as invalidated). `disable-worker` revokes a token.
-- **Later, if re-registration becomes a real problem:** limits on invites (they are the only way in, and the operator
-  hands them out), and blocks by IP range at the reverse proxy.
+- **Throwaway identities are cheap to make and cheap to carry: probation and rate limits** (below), not invites,
+  bound what one costs us. Beyond that: closing open registration (`--no-open-registration`: invites only again) and
+  blocks by IP range at the reverse proxy.
+
+**Open registration and probation.** `POST /register` without an invite makes a worker on probation (`workers.probation`
+1). Its tier (server/sched.py `tier()`), from its quant results that passed and earned lumens:
+
+| passed results | it may lease | at once |
+|---|---|---|
+| < `--probation-pass` (3) | quant jobs verified by score (`"verify": "score"`) | 1 |
+| < `--eval-unlock` (5) | the same | its slots |
+| ≥ `--eval-unlock` | everything a worker with an invite gets (eval_mix, replicate-mode quant, noop; trusted-only types still need `trust`) | its slots |
+
+A quarantined probation worker is locked at the first row for good (`probation` 2), even if the operator lifts the
+quarantine (`admin.py probation ID --off` is the explicit override). An invite skips probation. What a throwaway
+worker can cost us, and what bounds it:
+
+- **Our hardware's time:** none while on probation. Score-mode quant results are checked by the server's scorer on
+  CPU (~20–30 s per 27B layer); there are no replication re-runs, eval spot checks or full trusted re-runs, which are
+  what take a verifier card, until a worker has 5 passed results, i.e. ~5 honest layer jobs of real GPU work. A
+  provisional or suspect score can still be anchored once on a verifier (once per tensor, not per worker).
+- **Scorer CPU and bandwidth:** one lease at a time, so one job's inputs (~1.5 GB for a 27B layer) and one result in
+  flight per throwaway; leases have deadlines (#7) and one attempt per worker per job (#5). Making many throwaways is
+  limited per client address (`--reg-per-ip-day` 5, IPv6 per /64) and in total (`--reg-global-hour` 60). One lease
+  at a time bounds concurrency, not total volume: a worker that keeps leasing and abandoning pulls one job's inputs
+  after another; that is visible in the events (`abandon`), and `disable-worker` / the proxy's IP blocks stop it.
+- **Held leases:** one per probation worker, with the lease deadline; an expired or abandoned lease returns the job.
+- **Points:** nothing changes: lumens come only from results that passed the scorer, and a duplicate of another
+  donor's codes earns none (it does not count towards unlocking either).
+
+The rate limits read the TCP peer's address, or `X-Forwarded-For` only when the peer is one of `--trusted-proxy`
+(the rightmost entry that is not a trusted proxy: entries further left are whatever the client sent). The database
+keeps an HMAC of the address (key: a server-local secret in `meta`) for one day, never the address itself.
+
+**Credentials are stored hashed.** The database keeps only `workers.token_hash` (sha256 of the worker token, looked
+up on every request) and `invites.code_hash` (sha256 of the invite code); the admin and search tokens live in files
+and the server keeps only their sha256. No token or invite is written to the events, the API answers or the page.
+
+**Donors are a convenience, not a security boundary.** The donors table groups the workers of one personal invite
+(so `rqah status` shows them together), gives the operator `exclude-donor`, and backs #11's rule that a donor is
+leased at most one copy of a best-of-N job. A fresh invite makes a new donor, so none of these stops a determined
+cheater; they keep honest setups tidy (holding two copies of one job takes a second invite). There is no way for a donor to
+merge donors (`rqah link`, `POST /api/v0/me/link` and `admin.py link` were removed; the endpoint answers 410).
+
+**Credit is by public display name.** The leaderboard sums the lumens of every worker whose donor opted in under
+the same display name (compared case-insensitively after `clean_display_name`; the most common spelling is shown),
+so one person's machines share a row by using one name. The name is a label for credit only: **nothing about
+trust, scoring, spot checks, quarantine or invalidation uses it**. Anyone can show any name, which can only add
+verified lumens to that row, never take any away:
+
+- a quarantined worker's lumens drop out of its name's total (and out of the "not listed" total); nothing else
+  happens to the name, so nobody can hide a name by cheating under it;
+- only lumens of opted-in donors count toward a name; a donor that did not opt in counts with "not listed" even if
+  its stored name matches a listed one;
+- the operator's `admin.py donor ID --hide` on any donor hides the *name* for every donor showing it (the operator's
+  call, made with the name in view). A hidden donor cannot change its display name, so it cannot carry the hide onto
+  someone else's name. `--leaderboard off` drops a single donor from a row without hiding the name.
+
+No database migration: the change is in how `board()` reads the existing tables. Donors grouped by the old
+`rqah link` stay grouped; donors keep their stored names and opt-ins, so rows appear by name at the next page build.
 
 ## Cost
 

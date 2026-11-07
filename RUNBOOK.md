@@ -23,13 +23,23 @@ endpoint (its own token, eval_mix on public goldens only). Commands use `A` for 
    `python3 -c "import secrets; print(secrets.token_urlsafe(32))" > secrets/admin-token`.
 4. `docker compose up -d && docker compose ps` (healthy within seconds).
 5. TLS: a terminator in front (Caddy: `queue.<domain> { reverse_proxy 127.0.0.1:8740 }`) or a tunnel. Nothing is
-   public until this step; it needs the user's go-ahead (outward-facing).
+   public until this step; it needs the user's go-ahead (outward-facing). Open registration (default on) limits
+   registrations without an invite per client address: set `RQAH_TRUSTED_PROXY` to the address the proxy reaches
+   the server from (for the container: the source address the server sees, e.g. the bridge gateway; check with a
+   test registration and `$A events`) so it reads `X-Forwarded-For` from the proxy only. Without it every client
+   counts as the proxy's one address (the per-address limit then acts as a global one). `RQAH_OPEN_REGISTRATION=0`:
+   invites only.
 6. Our own workers: a verifier for spot checks on one of our cards (`run-local.sh` on the GPU box under its card lock,
    `--gpu-lock '/var/lock/gpu-card{card}.lock'`), registered with `$A add-worker verifier-1` and flagged
    `$A verifier ID`. Without a verifier running, drawn results wait (their points stay pending).
-7. Donors: `$A invite --uses 1 --note "<who>"` per donor; send the code and the queue URL privately. One person with
-   several boxes: `$A invite --uses 3 --personal --note "<who>"` (every registration with it is one donor). Big-box
-   donors we know personally: `$A trust ID` after they registered.
+7. Donors: anyone with the queue URL can register without an invite and starts on probation (score-mode quant only,
+   one lease at a time until `RQAH_PROBATION_PASS` 3 passed results, eval_mix after `RQAH_EVAL_UNLOCK` 5). Invites
+   skip probation: `$A invite --uses 1 --note "<who>"` for donors we know; send the code and the queue URL privately.
+   One person with several boxes: `$A invite --uses 3 --personal --note "<who>"` (every registration with it is one
+   donor). Big-box donors we know personally: `$A trust ID` after they registered. `$A workers` flags `probation` /
+   `probation-locked` (quarantined while on probation: it never unlocks); `$A probation ID --off` lifts it, `$A
+   probation ID` puts a worker on it. Note that probation only works when the ladder is enqueued `--verify score`:
+   with replicate-mode levels only, a probation worker gets nothing.
 8. Status page (public, read-only; on by default every 60 s at `/`): write `campaign.json` into the DB directory
    (`{"title": ..., "ladder": {"levels": 73}, "search": {"evals": N}}`; README "Public status page"). For a static
    host as well: `RQAH_STATUS_DIR=/srv/rqah/out/status` and publish that directory (e.g. `rsync` from cron).
@@ -90,9 +100,13 @@ $A manifest --jobs 8                                                            
 - `curl -H "Authorization: Bearer $(cat secrets/admin-token)" http://127.0.0.1:8740/api/v0/admin/summary`: counts per
   level and state, workers, lumens, spot-check counts, gang reservations, spool bytes, the last events.
 - `docker compose logs -f server`.
-- Donors: `$A donors` (display name, opt-in, workers, lumens, rank). A name that should not be on the page:
-  `$A donor ID --hide` (`--unhide`; `--display-name` / `--leaderboard on|off` to correct an entry). Two donors who
-  are one person: `$A link WORKER DONOR`. Donors see their own side with `radquant status | jobs | points | logs`.
+- Donors: `$A donors` (display name, opt-in, workers, lumens, rank of the name's row). The board credits by display
+  name (case-insensitive): every opted-in donor showing a name adds to its row, so one person's machines are
+  credited together by using one name; there is no linking. A name that should not be on the page: `$A donor ID
+  --hide` hides **that name for every donor showing it** (`--unhide`; a hidden donor cannot rename itself). To
+  take one donor off a row without hiding the name: `--leaderboard off` (the donor may opt in again) or
+  `exclude-donor` if it cheated. A quarantined worker's lumens drop out of its name's row by themselves; nothing else
+  happens to the name. Donors see their own side with `radquant status | jobs | points | logs`.
 - A job that keeps failing: `$A events JOB` (worker errors are in the `fail` events), fix, `$A requeue JOB`. A queued
   job no worker takes (every capable worker failed it within the last `--refail-s`, default 1 h): `$A requeue JOB`
   resets its attempts and the exclusions at once. A lease ends at its deadline even while it heartbeats
@@ -135,7 +149,7 @@ $A manifest --jobs 8                                                            
 
 Lumens are granted by the server as results are verified and revoked on quarantine; nothing to do per job.
 `$A points` (table) / `$A points --json` (per worker: id, name, lumens, verified jobs, flags); `$A donors --json`
-per donor (what the leaderboard aggregates). Worker names are what donors registered with and are never published;
+per donor (the leaderboard sums the opted-in donors of one display name, without quarantined workers). Worker names are what donors registered with and are never published;
 the status page shows only opted-in display names. Credits in the model cards: the donors with lumens
 on that release's levels (`$A list --level L` has the `by` worker of each job).
 

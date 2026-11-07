@@ -24,6 +24,12 @@ steps were built and run on the 4070 without Docker, `tests/cuda_rootfs.sh`, but
 ≥ 8 GB of free RAM per compile job; ROCm: with radiance inside), `docker run --gpus` on an NVIDIA host, and one real
 R9700 job of each type.
 
+What is new on this branch (after 0.4.0):
+- **Credit by display name:** the leaderboard has one row per public display name (case-insensitive); use the same
+  name on every machine. `rqah link` is gone.
+- **Open registration:** an invite is optional. Without one a worker starts on probation (server-scored quantization
+  jobs only, one at a time until a few pass; evaluations later), rate-limited per address.
+
 What is new in 0.4:
 - **Bandwidth limits for donors** on data caps or slow links: rate caps (`--max-down-mbps`, `--max-up-mbps`) and day /
   month data budgets (`--max-down-gb-day` ...). The server offers a worker only jobs whose downloads and uploads fit
@@ -66,7 +72,10 @@ will be allowed to do, and writes `worker.env` (mode 0600), `compose.yaml` and `
 `--answers FILE` runs it without questions. It needs no sudo, and it uses the network only if you ask it to pull the
 image or start the worker. Details: [docs/SETUP.md](docs/SETUP.md). Or write the line yourself:
 
-**Run it** (one line; the invite code and the queue URL come from us). AMD:
+**Run it** (one line; the queue URL comes from us, and so does an invite code if you have one). **The invite is
+optional:** without `RQAH_INVITE` the worker registers on its own and starts **on probation**: quantization jobs only
+(checked by the server itself), one at a time until 3 of its results pass, evaluations after 5 (`rqah status` shows
+how far). An invite skips that. AMD:
 
 ```bash
 docker run -d --name rad-quant-at-home --restart unless-stopped --device /dev/kfd --device /dev/dri \
@@ -139,8 +148,9 @@ the server's log of your workers (section "Donor CLI"). Add `--json` to any of t
 
 **Leaderboard.** The public status page lists only donors who opt in, by display name: start the worker with `-e
 RQAH_LEADERBOARD=1` (the name is `RQAH_NAME`), or later `docker exec rad-quant-at-home rqah config set
---leaderboard on --display-name "Your Name"`. Off again with `--leaderboard off`. Several boxes count as one donor
-once linked (`rqah link`, below).
+--leaderboard on --display-name "Your Name"`. Off again with `--leaderboard off`. The board credits by display
+name: **use the same name on every machine** and they share one row (case does not matter). A name is a label, not
+an account: nothing about verification depends on it, and anyone can show any name.
 
 ## Research access (trusted volunteers only)
 
@@ -167,8 +177,8 @@ itself: [research-kit/](research-kit/README.md).
             worker.py  (donor: lease -> fetch into a capped cache -> run built-in job on its cards -> upload -> complete)
 ```
 
-- **Server** (`server/server.py`, Python stdlib only): workers register with an invite code and get a token (only
-  its sha256 is stored). The job table holds type, params, inputs, requirements, state, lease owner / expiry,
+- **Server** (`server/server.py`, Python stdlib only): workers register, with an invite code or without one (open
+  registration: on probation, rate-limited; "Open registration" below), and get a token (only its sha256 is stored). The job table holds type, params, inputs, requirements, state, lease owner / expiry,
   attempts, result, spot-check state. A reaper thread puts jobs whose leases missed their heartbeat back in the queue
   (0.5: also leases past their deadline, `--lease-cap-x` 3 × the job type's reference runtime and at least
   `--lease-cap-min-s` 2 h after the lease was issued, however often they heartbeat; abandoning and leasing the job again
@@ -197,7 +207,7 @@ itself: [research-kit/](research-kit/README.md).
   (`enqueue-level`, `enqueue-golden`, `batch-submit` / `-status` / `-collect`, `list`, `queue`, `reprioritize`, `events`,
   `requeue`, `cancel`),
   verification (`check`, `spot`, `quarantine`, `unquarantine`, `exclude-donor`, `batch-adopt`), workers (`invite`, `add-worker`, `workers`, `trust`,
-  `verifier`, `disable-worker`), donors (`invite --personal`, `donors`, `donor ID --hide`, `link`), `points`,
+  `verifier`, `disable-worker`), donors (`invite --personal`, `donors`, `donor ID --hide`), `points`,
   `status-page`, `export` (the accepted shards of a level in `quantize/ourq.py`'s layout, so knap4 and the search read
   them unchanged). RUNBOOK.md walks through them.
 - **Worker** (`worker/worker.py`): a loop of lease → fetch → run → upload → complete per job, with a heartbeat thread
@@ -348,14 +358,26 @@ nll by ~1e-2: `eval/gold27/README.md`).
 Tested against a fake malicious server (TESTS.md): unknown types, extra parameters, path traversal, inputs the
 type doesn't allow, a malformed eval_mix, a bad settings stamp, a job id that is a path, an empty lease id, a job id carrying a newline and a terminal escape. All were refused, with no download attempted.
 
+**Open registration** (`POST /api/v0/register` without an invite; `--open-registration`, default on,
+`--no-open-registration` = invites only): the new worker is on **probation**: it is offered only quant jobs verified
+by the server's own scorer (`"verify": "score"`: no card time of ours), one lease at a time until `--probation-pass`
+(3) of its results passed and earned lumens, and eval_mix and every other type whose check takes our hardware
+(replicate-mode quant, golden_record) only after `--eval-unlock` (5). A quarantined probation worker never unlocks
+(`admin.py probation ID --off` is the operator's override; `probation ID` puts any worker on it). Registrations without
+an invite are limited per client address (`--reg-per-ip-day` 5; IPv6 per /64) and in total (`--reg-global-hour` 60):
+429 with `retry_s`. The address is the TCP peer's, or, only when the peer is one of `--trusted-proxy`, the rightmost
+`X-Forwarded-For` entry that is not a trusted proxy; the database keeps a keyed hash of it for a day, never the
+address. An invite (operator-issued) skips probation. The tier is shown to the donor (`rqah status`, `/me`), never on
+the public page. docs/VERIFY.md ("Identity") has the reasoning.
+
 **What a worker can do to the server:** lease and finish jobs (as many at once as its slots, at most
-`--max-leases`), read only the files its own active leases list, upload only the declared outputs of its own leases
+`--max-leases`; on probation one), read only the files its own active leases list, upload only the declared outputs of its own leases
 within the caps (chunks ≤ 64 MB, JSON bodies ≤ 1 MB), declared by a non-negative `Content-Length`; a short body is
 truncated back to the acknowledged offset. A result is accepted only if its sha256 and size match and the
 type's structural check passes. Tokens are per worker, stored hashed, and can be disabled
 (`admin.py disable-worker ID`); a quarantined worker can no longer complete anything. With its token a donor reads
 its own donor's workers, jobs, lumens and events (`/api/v0/me...`), never another donor's, and writes only its
-display name, its leaderboard opt-in and links between workers whose tokens it holds.
+display name and its leaderboard opt-in.
 
 **What anyone can read without a token:** `/healthz` and the status page at `/`. The page is a prebuilt file: no
 request reaches the database, and nothing on it can be written. It holds only aggregate counts, level and public
@@ -469,16 +491,16 @@ docker exec rad-quant-at-home rqah points            # lumens per worker / type,
 docker exec rad-quant-at-home rqah logs -f           # the server's events for your workers (--local: this box's job records)
 docker exec rad-quant-at-home rqah config            # server, token fingerprint, caps from the environment, profile
 docker exec rad-quant-at-home rqah config set --leaderboard on --display-name "Ada"
-docker exec rad-quant-at-home rqah link --other-token-file /path/to/other-box-token   # (a file inside the container)
 # outside a container:
 python3 client/rqah.py --server https://<queue-url> --token-file ~/.rqah-token status
 ```
 
 - **Donors and workers.** Every worker belongs to one donor; status, jobs, points and logs cover all workers of the
-  donor of the token used, and nothing else. A donor's boxes are grouped by a personal invite (`admin.py invite
-  --uses 3 --personal`: all registrations with it are one donor), by `rqah link` (holding both tokens proves both
-  workers are yours; whole donors merge; a merged donor stays hidden if either was hidden), or by the operator
-  (`admin.py link WORKER DONOR`).
+  donor of the token used, and nothing else. Workers registered with one personal invite (`admin.py invite --uses 3
+  --personal`) are one donor; every other registration makes a new donor. That grouping is for your own view (and
+  the operator's `exclude-donor`); the **leaderboard credits by display name**, so machines registered separately
+  are credited together by giving them the same name. `rqah link` (and `POST /api/v0/me/link`, `admin.py link`) was
+  removed: the endpoint answers 410 with a pointer to display names.
 - **Verification state per job** (`jobs`): `running`; `verified` (lumens granted); `accepted` (no further check
   due); `awaiting check` (quant results until the checker runs); `spot-check pending` (re-running on our hardware);
   `failed check` / `failed spot check`; `voided` (invalidated after a quarantine); `superseded` (another worker
@@ -494,8 +516,9 @@ python3 client/rqah.py --server https://<queue-url> --token-file ~/.rqah-token s
   token-like strings, long hex and `<>&"'` are refused.
 
 API (any worker token; `server/donor.py`): `GET /api/v0/me`, `/me/jobs?limit=&active=1&worker=`,
-`/me/points?limit=`, `/me/events?after=ID&limit=`; `POST /api/v0/me/profile {display_name, leaderboard}`,
-`/me/link {token}`. Registration takes `"leaderboard": true` (the worker's `--leaderboard` / `RQAH_LEADERBOARD=1`).
+`/me/points?limit=`, `/me/events?after=ID&limit=`; `POST /api/v0/me/profile {display_name, leaderboard}` (a donor
+the operator hid cannot change its name). `/me` reports the donor's `rank`, `board_lumens` (the whole name's total)
+and `name_hidden`. Registration takes `"leaderboard": true` (the worker's `--leaderboard` / `RQAH_LEADERBOARD=1`).
 
 ## Public status page (`server/statuspage.py`)
 
@@ -504,8 +527,9 @@ One static HTML file anyone can read, with no login. It has no JavaScript, no fo
 - **campaign progress:** "ladder 41 / 73 levels (… checked)", the levels in progress with their jobs done, "search 1,240
   evals", golden chunks, and spot checks passed / failed / pending;
 - **jobs:** running, queued, done in the last 24 h and done in total per job type, plus cards busy and donors active;
-- **the leaderboard:** opted-in donors only (display name, lumens, verified jobs, last active), and one line for
-  everyone else ("N donors not listed: X lumens");
+- **the leaderboard:** one row per display name (case-insensitive; the most common spelling is shown) with the
+  lumens and verified jobs of every opted-in donor showing that name, and last active; one line for everyone else
+  ("N donors not listed: X lumens");
 - **recent work:** the last 15 accepted jobs (level and layer, "LM head", "search · mix on <level>", "golden · <corpus>
   <chunk>"), each with who did it (a listed name, "a donor" or "our hardware") and whether it is verified;
 - **the last update time** (UTC).
@@ -523,8 +547,11 @@ One static HTML file anyone can read, with no login. It has no JavaScript, no fo
   every one of its quant jobs is accepted, and as checked when every job also passed the checker.
 - **What it never shows:** worker names, tokens, invites, addresses, hostnames, GPU names, job parameters other than
   level / layer / public corpus names, errors, quarantine reasons, file paths. Names come from the opt-in display name
-  only. A stored name that fails the display-name rules is left off, and so is a donor with a quarantined worker or
-  one the operator hid (`admin.py donor ID --hide`). Every string is HTML-escaped. Identifiers (levels, corpora)
+  only. A stored name that fails the display-name rules is left off. A quarantined worker's lumens count nowhere, but
+  nothing else happens to its name: the row stays with everyone else's lumens (otherwise anyone could take a name
+  off the board by cheating under it). The operator's `admin.py donor ID --hide` on any donor hides that **name**
+  for every donor showing it (the operator's call; `--leaderboard off` drops just one donor, who may opt in again).
+  Every string is HTML-escaped. Identifiers (levels, corpora)
   must also match `[a-z0-9][a-z0-9._-]*` to be shown at all.
 - **Example** (the test fixture, rendered as text):
 
@@ -548,7 +575,7 @@ Jobs
 plus 1 verification re-runs on our own hardware
 Donors
 95.5 lumens of verified work so far. ...
- # | donor        | lumens | verified jobs | last active
+ # | name         | lumens | verified jobs | last active
  1 | Ada Lovelace | 69.0   | 5             | now
  2 | Zoë 🚀 Team  | 20.0   | 1             | now
 3 donors not listed: 6.5 lumens
@@ -598,8 +625,9 @@ $A manifest --jobs 8
 $A enqueue-level --model qwen38-27b --rev <rev> --K 3 --codebook i8 --level k3-i8 \
    --sigma-reg 0.025 --sigma-reg-in 0.005 --scaled-hessian --qtf2 --verify score --head [--copies 2] [--unit group]
 python3 -I server/server.py --db Q.sqlite --data DATA --spool SPOOL --results RESULTS --bind 127.0.0.1 --port 8740 \
-   --score-threads 1 [--search-token-file F] [--admin-token-file F]   # expose only through a TLS terminator / tunnel
-$A invite --uses 1                       # one per donor
+   --score-threads 1 [--search-token-file F] [--admin-token-file F] \
+   [--trusted-proxy ADDR] [--no-open-registration]    # expose only through a TLS terminator / tunnel
+$A invite --uses 1                       # optional per donor: skips probation (open registration needs none)
 $A list --level k3-i8; $A scores --level k3-i8; $A export --level k3-i8 OUT --checked; $A points
 # replicate mode (0.2) instead: no --verify score, then $A check --level k3-i8 --rows-frac 0.25
 ```
@@ -680,6 +708,9 @@ Toolkit on the host; the worker's own `--gpus` then picks among the cards the co
 - `RQAH_INVITE`: a one-time invite. The worker registers on its first start and keeps the token in the state
   volume (`/var/lib/rqah/token`, mode 0600). The invite stays visible in `docker inspect`, which is harmless
   because it is used up.
+- nothing: the worker registers without an invite on its first start (open registration; probation) and keeps the
+  token the same way. A server with open registration off refuses (the worker exits with the reason); a rate limit
+  (429) is waited out.
 - `RQAH_TOKEN_FILE`: a file mounted read-only.
 - `RQAH_TOKEN`: the token in an env variable. This shows in `docker inspect`, so prefer the other two.
 
@@ -687,7 +718,7 @@ Worker options (each flag also `RQAH_<FLAG>`, e.g. `--max-up-gb-month` = `RQAH_M
 
 | option [default] | meaning |
 |---|---|
-| `--server`, `--token-file` / `--invite` + `--name` | the queue and how to authenticate (see above) |
+| `--server`, `--token-file` / `--invite` (optional) + `--name` | the queue and how to authenticate (see above) |
 | `--state` [`/var/lib/rqah` in the image] | token, running jobs, input cache, `worker.jsonl`, `bandwidth.json` |
 | `--gpus 0,1,...` / `--cards N`, `--gpu-name`, `--vram-gb` (per card) | the cards jobs may use |
 | `--slots` [one per card] | jobs at once |
@@ -790,12 +821,17 @@ exercised yet.
 Every push to main and every pull request runs the no-GPU suites below on GitHub Actions
 (`.github/workflows/tests.yml`, Python 3.12 and the latest 3.x); the GPU tests stay manual.
 
-- `tests/e2e_noop.py`: no GPU, ~5 min, 132 checks (139 with the container). Runs the server as a subprocess, or
+- `tests/e2e_noop.py`: no GPU, ~5 min, 134 checks (141 with the container). Runs the server as a subprocess, or
   `E2E_SERVER=docker` for the container; the workers always run on the host. The GPU side is faked on the CPU (`tests/fakes.py`,
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
   privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record, the eval plausibility band,
   spot checks of a few documents, adoption and `exclude-donor` (#4); w25: the donor CLI (every
-  command, `--json`, exit codes, isolation, link, personal invites) and the served status page.
+  command, `--json`, exit codes, isolation, personal invites, credit by display name, `link` gone) and the served
+  status page.
+- `tests/probation_test.py`: open registration and probation in process, a few seconds: registration without an
+  invite, the per-address (IPv6 /64) and global limits, `X-Forwarded-For` only behind `--trusted-proxy`, no address
+  stored, closed registration, the probation tiers (score-mode quant only, one lease, eval_mix after 5), invites skip
+  it, a quarantined probation worker stays locked.
 - `tests/sched_test.py` (0.4): the scheduling rules in process, a few seconds (docs/SCHED.md): K-granularity
   priorities, `reprioritize`, class order, level-first, cache affinity, the budget filter (incl. a randomized
   check), the cache report protocol, the class-wait drain.

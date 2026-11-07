@@ -26,6 +26,9 @@ the 0.2 names $RADQUANT_* are still read in 0.3)
   model-info MODEL REV [--n-params N]    (re)write models/MODEL@REV/model.json (n_params: sets requirements / bpw)
   trust ID [--off] | verifier ID [--off] the per-worker flags: trusted (big-box job types), verifier (spot-check re-runs)
   quarantine ID --reason R | unquarantine ID
+  probation ID [--off]                   a worker registered without an invite starts on probation (score-mode quant
+                                         only until it has passed results; docs/VERIFY.md): --off lifts it, also
+                                         the lock a quarantine puts on it; without --off puts a worker on it
   spot JOB                               re-run an accepted job on a verifier now (a manual spot check)
   ladder-add MODEL REV LEVEL FILE.rad    cut a ladder level's container into models/MODEL@REV/rad/LEVEL/ (skeleton +
                                          one piece per weight) for eval_mix; then `manifest`
@@ -39,8 +42,9 @@ the 0.2 names $RADQUANT_* are still read in 0.3)
 w25 (donors, status page):
   invite --personal [--uses N]           one person's invite: every worker registered with it is one donor
   donors [--json]                        donors: display name, opt-in, hidden, workers, lumens
-  donor ID [--display-name N] [--leaderboard on|off] [--hide | --unhide]   edit a donor (--hide: off the public page)
-  link WORKER DONOR                      move a worker to a donor (donors may also link their own: `rqah link`)
+  donor ID [--display-name N] [--leaderboard on|off] [--hide | --unhide]   edit a donor (--hide: its display name
+                                         off the public page for every donor showing it, as the board credits by
+                                         name; --leaderboard off drops just this donor, who may opt in again)
   status-page OUT [--campaign F]         build the public status page once (server.py rebuilds it by itself)
 0.3 (verify by score, docs/VERIFY.md; small-card jobs):
   enqueue-level ... --verify score [--unit group] [--copies N]
@@ -546,7 +550,7 @@ def cmd_points(a, S):
 
 def cmd_donors(a, S):
     rows, _ = D.board(S)
-    lum = {r["donor"]: r for r in rows}
+    lum = {did: r for r in rows for did in r["donors"]}
     st = {r["id"]: r for r in V.standings(S)}
     out = []
     for d in S.q("SELECT * FROM donors ORDER BY id"):
@@ -574,6 +578,7 @@ def cmd_donor(a, S):
         if db.execute(f"UPDATE donors SET {', '.join(sets)} WHERE id=?", (*args, a.id)).rowcount != 1: sys.exit(f"no donor {a.id}")
         S.event(db, "donor-edit", detail={"donor": a.id, "set": [x.split("=")[0] for x in sets]})
     print(f"donor {a.id}: " + ", ".join(f"{k.split('=')[0]} = {v}" for k, v in zip(sets, args)))
+    if a.hide: print("(the name is now off the public page for every donor showing it)")
 
 
 def cmd_exclude_donor(a, S):
@@ -589,18 +594,6 @@ def cmd_exclude_donor(a, S):
     print(f"donor {a.donor}: {len(ws)} workers quarantined, {n} results invalidated")
 
 
-def cmd_link(a, S):
-    with S.tx() as db:
-        if not db.execute("SELECT 1 FROM donors WHERE id=?", (a.donor,)).fetchone(): sys.exit(f"no donor {a.donor}")
-        old = db.execute("SELECT donor_id FROM workers WHERE id=?", (a.worker,)).fetchone()
-        if old is None: sys.exit(f"no worker {a.worker}")
-        db.execute("UPDATE workers SET donor_id=? WHERE id=?", (a.donor, a.worker))
-        if old[0] is not None and not db.execute("SELECT 1 FROM workers WHERE donor_id=?", (old[0],)).fetchone():
-            db.execute("DELETE FROM donors WHERE id=?", (old[0],))
-        S.event(db, "link", worker_id=a.worker, detail={"donor": a.donor, "by": "admin"})
-    print(f"worker {a.worker} -> donor {a.donor}")
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=env("DB")); ap.add_argument("--data", default=env("DATA")); ap.add_argument("--results", default=env("RESULTS"))
@@ -610,7 +603,6 @@ def main():
     x = sp.add_parser("donors"); x.add_argument("--json", action="store_true")
     x = sp.add_parser("donor"); x.add_argument("id", type=int); x.add_argument("--display-name")
     x.add_argument("--leaderboard", choices=("on", "off")); x.add_argument("--hide", action="store_true"); x.add_argument("--unhide", action="store_true")
-    x = sp.add_parser("link"); x.add_argument("worker", type=int); x.add_argument("donor", type=int)
     x = sp.add_parser("status-page"); x.add_argument("out"); x.add_argument("--campaign")
     x = sp.add_parser("add-worker"); x.add_argument("name")
     sp.add_parser("workers")
@@ -627,6 +619,7 @@ def main():
     for c in ("trust", "verifier"): x = sp.add_parser(c); x.add_argument("id", type=int); x.add_argument("--off", action="store_true")
     x = sp.add_parser("quarantine"); x.add_argument("id", type=int); x.add_argument("--reason", required=True)
     x = sp.add_parser("unquarantine"); x.add_argument("id", type=int)
+    x = sp.add_parser("probation"); x.add_argument("id", type=int); x.add_argument("--off", action="store_true")
     x = sp.add_parser("spot"); x.add_argument("ids", nargs="+")
     x = sp.add_parser("ladder-add"); x.add_argument("model"); x.add_argument("rev"); x.add_argument("level"); x.add_argument("rad")
     x = sp.add_parser("golden-add"); x.add_argument("name"); x.add_argument("dir"); x.add_argument("--public", action="store_true")
@@ -692,14 +685,14 @@ def main():
     if a.cmd == "invite": print(S.add_invite(a.uses, a.note, a.personal))
     elif a.cmd == "donors": cmd_donors(a, S)
     elif a.cmd == "donor": cmd_donor(a, S)
-    elif a.cmd == "link": cmd_link(a, S)
     elif a.cmd == "status-page":
         page = SP.build(S, SP.load_campaign(a.campaign or os.path.join(os.path.dirname(os.path.abspath(a.db)), "campaign.json")))
         SP.write(a.out, page); print(f"{a.out}: {len(page)} bytes")
     elif a.cmd == "add-worker": wid, tok = S.add_worker(a.name); print(f"worker {wid} token {tok}")
     elif a.cmd == "workers":
         for r in S.q("SELECT * FROM workers ORDER BY id"):
-            fl = ",".join(k for k in ("disabled", "trusted", "verifier", "quarantined") if r[k])
+            fl = ",".join(k for k in ("disabled", "trusted", "verifier", "quarantined") if r[k]) + \
+                 {0: "", 1: ",probation", 2: ",probation-locked"}.get(r["probation"], "")
             print(r["id"], r["name"], f"donor {r['donor_id']}", fl, time.strftime("%Y-%m-%d %H:%M", time.gmtime(r["last_seen"] or 0)), r["caps"],
                   r["quarantine_reason"] or "")
     elif a.cmd == "disable-worker":
@@ -735,6 +728,12 @@ def main():
         with S.tx() as db:
             db.execute("UPDATE workers SET quarantined=0, quarantine_reason=NULL WHERE id=?", (a.id,)); S.event(db, "unquarantine", worker_id=a.id)
         print(f"worker {a.id}: quarantine lifted (its invalidated results stay requeued)")
+    elif a.cmd == "probation":
+        with S.tx() as db:
+            if db.execute("UPDATE workers SET probation=? WHERE id=?", (0 if a.off else 1, a.id)).rowcount != 1:
+                sys.exit(f"no worker {a.id}")
+            S.event(db, f"probation{'-off' if a.off else ''}", worker_id=a.id)
+        print(f"worker {a.id}: probation {'off' if a.off else 'on'}")
     elif a.cmd == "spot": cmd_spot(a, S)
     elif a.cmd == "ladder-add": cmd_ladder_add(a, S)
     elif a.cmd == "golden-add": cmd_golden_add(a, S)

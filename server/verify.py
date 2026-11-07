@@ -201,7 +201,9 @@ def quarantine(S, db, results, wid, reason):
     """no more leases for this worker; its active leases cancelled; its unconfirmed accepted results invalidated"""
     w = worker(db, wid)
     if w is None: return 0
-    db.execute("UPDATE workers SET quarantined=1, quarantine_reason=? WHERE id=?", (reason[:500], wid))
+    # a probation worker (registered without an invite) that is quarantined never unlocks (probation 2)
+    db.execute("UPDATE workers SET quarantined=1, quarantine_reason=?, probation=CASE WHEN probation>0 THEN 2 ELSE 0 END "
+               "WHERE id=?", (reason[:500], wid))
     now = time.time()
     # its spool dirs: Queue.sweep_spool (the reaper)
     for l in db.execute("SELECT * FROM leases WHERE worker_id=? AND state='active'", (wid,)).fetchall():

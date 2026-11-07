@@ -3,7 +3,7 @@
 """statuspage.py --db QUEUE.sqlite --out index.html [--campaign campaign.json] -- the public status page (stdlib only).
 
 ONE static HTML file built from the queue database: campaign progress, jobs running / queued by type, the donor
-leaderboard (opt-in display names only), recent finished work, the update time. No JavaScript, no forms, no external
+leaderboard (opt-in display names only, one row per name), recent finished work, the update time. No JavaScript, no forms, no external
 resources; a <meta refresh> reloads it every minute. server.py rebuilds it every --status-interval seconds (default
 60), serves it at / and, with --status-dir, also writes DIR/index.html for any static host; this script builds it once
 (cron, tests). It is polyglot XHTML: an XML parser must accept it (tests/statuspage_test.py).
@@ -97,13 +97,14 @@ def collect(S, campaign=None, now=None):
     donors_day = count("SELECT COUNT(DISTINCT w.donor_id) FROM workers w WHERE w.verifier=0 AND w.last_seen>=?", (now - 86400,))
     lumens_all = round(sum(r["lumens"] for r in rows) + others[1], 2)
     # recent finished work
-    named = {r["donor"]: r["name"] for r in rows}
+    named = {did: r["name"] for r in rows for did in r["donors"]}
     wk = {r["id"]: r for r in S.q("SELECT id, donor_id, verifier, quarantined FROM workers")}
     net = {(r["worker_id"], r["job_id"]): r["n"] for r in S.q("SELECT worker_id, job_id, SUM(lumens) n FROM points GROUP BY worker_id, job_id")}
     recent = []
     for j in S.q("SELECT * FROM jobs WHERE state='accepted' AND verify_of IS NULL ORDER BY accepted_at DESC, id DESC LIMIT 15"):
         w = wk.get(j["accepted_by"])
-        by = "our hardware" if w is not None and w["verifier"] else named.get(w["donor_id"]) if w is not None else None
+        by = ("our hardware" if w is not None and w["verifier"] else
+              named.get(w["donor_id"]) if w is not None and not w["quarantined"] else None)
         if by is None: by = "a donor"
         if net.get((j["accepted_by"], j["id"]), 0) > 1e-9 or (w is not None and w["verifier"] and
                                                               (j["type"] not in QUANT or j["check_state"] == "pass")):
@@ -200,8 +201,10 @@ def render(d):
     if rr: o.append(f'<p class="mut">plus {_n(rr)} verification re-runs on our own hardware</p>')
     o += ['</section>', '<section id="donors">', '<h2>Donors</h2>',
           f'<p>{_n(d["lumens_all"])} lumens of verified work so far. A lumen is one R9700 card-minute of work that passed '
-          'verification. Donors appear here only if they opt in (<code>rqah config set --leaderboard on</code>).</p>',
-          '<table>', '<thead><tr><th class="n">#</th><th>donor</th><th class="n">lumens</th><th class="n">verified jobs</th>'
+          'verification. Donors appear here only if they opt in (<code>rqah config set --leaderboard on</code>), one row per '
+          'display name: every machine under the same name (case does not matter) adds to it. A name is a label, not an '
+          'account: anyone can use it.</p>',
+          '<table>', '<thead><tr><th class="n">#</th><th>name</th><th class="n">lumens</th><th class="n">verified jobs</th>'
           '<th>last active</th></tr></thead>', '<tbody>']
     for r in d["board"]:
         o.append(f'<tr><td class="n">{r["rank"]}</td><td>{_e(r["name"])}</td><td class="n">{_n(float(r["lumens"]))}</td>'
@@ -209,7 +212,7 @@ def render(d):
     if not d["board"]: o.append('<tr><td colspan="5" class="mut">nobody listed yet</td></tr>')
     o += ['</tbody>', '</table>']
     if d["board_more"] or d["others"][0]:
-        o.append(f'<p class="mut">' + (f'{_n(d["board_more"])} more listed donors; ' if d["board_more"] else "") +
+        o.append(f'<p class="mut">' + (f'{_n(d["board_more"])} more listed names; ' if d["board_more"] else "") +
                  f'{_n(d["others"][0])} donors not listed: {_n(float(d["others"][1]))} lumens</p>')
     o += ['</section>', '<section id="recent">', '<h2>Recent work</h2>', '<table>',
           '<thead><tr><th>finished</th><th>job</th><th>by</th><th>state</th></tr></thead>', '<tbody>']
