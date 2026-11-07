@@ -358,6 +358,9 @@ def run(procs, srv):
     ok("short upload body -> 400 with the old offset, spool truncated back",
        c == 400 and r.get("size") == 0 and req("GET", u2, token=t_client)[1].get("size") == 0, f"{c} {r}")
     ok("another worker's lease -> 403", req("POST", "/api/v0/heartbeat", {"job_id": job2["id"], "lease_id": job2["lease_id"]}, token=toks["wc"])[0] == 403)
+    c1, r1 = req("POST", "/api/v0/heartbeat", {"job_id": 2 ** 70, "lease_id": "0" * 32}, token=t_client)
+    c2, r2 = req("GET", f"/api/v0/me/events?after={10 ** 30}", token=t_client)
+    ok("ids / limits beyond 64 bits -> 400, not a 500 with a traceback (#15)", c1 == 400 and c2 == 400, f"{c1} {r1} | {c2} {r2}")
     req("POST", "/api/v0/fail", {"job_id": job2["id"], "lease_id": job2["lease_id"], "error": "test", "abandon": True}, token=t_client)
     r2 = db().execute("SELECT state, attempts FROM jobs WHERE id=?", (job2["id"],)).fetchone()
     ok("abandon returns the job without counting an attempt", tuple(r2) == ("queued", 0), str(tuple(r2)))

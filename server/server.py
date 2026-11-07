@@ -429,8 +429,9 @@ class Queue:
         return {"ok": True, "duplicate": False}
 
     def may_read(self, w, rel):
-        for r in self.store.q("SELECT j.inputs FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND l.state='active'",
-                              (w["id"],)):
+        """a lease that is active and not past its expiry (the reaper marks it expired up to a tick later)"""
+        for r in self.store.q("SELECT j.inputs FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND l.state='active' "
+                              "AND l.expires>?", (w["id"], time.time())):
             if rel in json.loads(r["inputs"]): return True
         return False
 
@@ -551,7 +552,7 @@ class Handler(BaseHTTPRequestHandler):
         except HTTPError as e:
             if method == "PUT" and e.code != 200: self.close_connection = True    # unread body
             self._send(e.code, {"error": e.msg, **e.extra})
-        except (KeyError, ValueError, TypeError) as e:
+        except (KeyError, ValueError, TypeError, OverflowError) as e:     # OverflowError: an id beyond SQLite's 64 bits
             self.close_connection = True
             self._send(400, {"error": f"bad request: {e!r}"[:300]})
         except Exception as e:

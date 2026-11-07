@@ -279,6 +279,17 @@ def main():
     r = Q.lease(w, dict(c, budget={"down": 100, "up": None}))
     ok("a job over the worker's budget never drains it (it could not run it anyway)", r.get("job") and r["job"]["id"] == lo)
 
+    # ---------------------------------------------------------------- #15: /data only while the lease is live
+    d, a = setup("mayread")
+    manifest(d, files)
+    Q = Queue(a); S = Q.store
+    j = noop(S, ["test/f1"], sizes=sizes); w = worker(S, "w10")
+    r = Q.lease(w, caps())
+    before = Q.may_read(w, "test/f1")
+    with S.tx() as db: db.execute("UPDATE leases SET expires=? WHERE job_id=?", (time.time() - 1, j))     # the reaper has not run yet
+    ok("may_read: an active lease past its expiry no longer opens its inputs (before the reaper marks it) (#15)",
+       r.get("job") and before and not Q.may_read(w, "test/f1") and not Q.may_read(w, "test/f2"))
+
     n = sum(1 for _, p in RESULTS if p)
     print(f"\n{n}/{len(RESULTS)} checks passed")
     return 0 if n == len(RESULTS) else 1
