@@ -312,7 +312,7 @@ Runs (2026-11-05, CST):
 | personal invite (`--uses 2 --personal`): both registrations are one donor; registering with `"leaderboard": true` opts in under the worker name | pass |
 | exit codes: bad token 3, unreachable server 4, no token 2 (JSON error objects); `/api/v0/me` without a token → 401 | pass |
 
-Security fix round (issue #10, link keeps the hidden flag): macOS dev box, 2026-11-06, **109/109** (plain process).
+Security fix round (issue #10, link keeps the hidden flag): macOS dev box, 2026-11-06, **109/109** (plain process). The new case: a hidden donor that links into a fresh donor stays hidden, the old row is gone, and the `link` event names both donors.
 
 Refactor checked by the 90 earlier checks: the lease filter moved to `server/sched.py` (shared with the donor API's
 "could run" count), and workers from before donors are each given a donor on database open.
