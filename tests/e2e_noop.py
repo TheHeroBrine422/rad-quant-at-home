@@ -568,7 +568,7 @@ def run(procs, srv):
     ok("crash mid-upload: partial upload kept, resumed, accepted once, byte-exact",
        hit and s1 >= s0 - (1 << 20) and s1 > 0 and exact and up is not None and up <= (41 << 20) and
        [e["kind"] for e in events(j)].count("accept") + [e["kind"] for e in events(j)].count("accept_late") == 1,
-       f"{how_s}; spool {s0 / 2**20:.1f} MiB before the kill, {s1 / 2**20:.1f} MiB just after; worker sent {None if up is None else up / 2**20:.1f} MiB of 40")
+       f"{how_s}; spool {s0 / 2**20:.1f} MiB before the kill, {s1 / 2**20:.1f} MiB just after; worker sent {'-' if up is None else f'{up / 2**20:.1f}'} MiB of 40")
     run_v02(procs, srv)
     run_w25(procs, srv)
     if MODE == "docker":

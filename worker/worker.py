@@ -626,18 +626,31 @@ class Worker:
             raise
         if off > size: off = None                                              # server holds junk: it drops it at complete
         if off is None or off == size: return 0
-        sent, chunk = 0, self.a.chunk_mb << 20
+        sent, chunk, errs = 0, self.a.chunk_mb << 20, 0
         with open(path, "rb") as f:
             f.seek(off)
             while off < size:
                 b = f.read(min(chunk, size - off))
-                try: r = self.c.api("PUT", f"{ep}?offset={off}", MeteredBody(b, self.meter, job["id"]), tries=5)
+                try: r = self.c.api("PUT", f"{ep}?offset={off}", MeteredBody(b, self.meter, job["id"]), tries=1)
                 except APIError as e:
                     if e.code == 409 and "size" in e.body: off = e.body["size"]; f.seek(off); continue
                     if e.code == 409 and e.body.get("accepted"): return sent
-                    raise
-                off = r["size"]; sent += len(b)
-                if cancel.is_set() and self.abandon.is_set(): raise InterruptedError("cancelled")
+                    if e.code < 500: raise
+                    err = e
+                except OSError as e: err = e                                # URLError, reset, timeout
+                else:
+                    off = r["size"]; sent += len(b); errs = 0
+                    if cancel.is_set() and self.abandon.is_set(): raise InterruptedError("cancelled")
+                    continue
+                # the server may have stored this chunk and gone away before answering, or answered 409 and closed
+                # while we were still sending: never resend at our offset, ask for the server's
+                errs += 1
+                if errs >= 5: raise err
+                log(f"upload {name} at {off}: {err!r}; resuming from the server's offset in {2 ** errs}s")
+                time.sleep(2 ** errs)
+                off = self.c.api("GET", ep, tries=5)["size"]
+                if off > size: return sent                                 # junk on the server: dropped at complete
+                f.seek(off)
         self.meter.budget.flush()
         return sent
 
