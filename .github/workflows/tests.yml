@@ -1,0 +1,45 @@
+# The no-GPU test suites on every push to main and every pull request (fork PRs included).
+# `pull_request` (not `pull_request_target`): fork PRs run with a read-only token and no secrets.
+# GPU jobs (real quantization, tests/quant_e2e.sh, checker_tamper.py on a real result) stay manual.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.x"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: dependencies
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends libxml2-utils
+          python -m pip install --quiet numpy
+      - name: unit suites
+        run: |
+          set -e
+          for t in tests/score_test.py tests/sched_test.py tests/checker_nan_test.py tests/statuspage_test.py; do
+            echo "::group::$t"; python -I "$t"; echo "::endgroup::"
+          done
+      - name: bandwidth e2e
+        run: python -I tests/bandwidth_e2e.py
+      - name: e2e (server as a process)
+        run: python -I tests/e2e_noop.py

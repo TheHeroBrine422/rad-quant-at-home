@@ -749,6 +749,9 @@ exercised yet.
 
 ### Tests
 
+Every push to main and every pull request runs the no-GPU suites below on GitHub Actions
+(`.github/workflows/tests.yml`, Python 3.12 and the latest 3.x); the GPU tests stay manual.
+
 - `tests/e2e_noop.py`: no GPU, ~5 min, 119 checks (126 with the container). Runs the server as a subprocess, or
   `E2E_SERVER=docker` for the container; the workers always run on the host. The GPU side is faked on the CPU (`tests/fakes.py`,
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
