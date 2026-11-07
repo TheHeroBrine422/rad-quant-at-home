@@ -154,6 +154,27 @@ are not re-checked.
 - Binding codes to the seed (checking that `sign(suh)` / `sign(svh)` follow the job's seed) would stop copying across
   best-of-N copies. It needs the quantizer's device RNG on the server, so it is left out.
 
+### Identity: trust is per worker, not per donor (#9, won't fix)
+
+Quarantine, the spot-check draw (a worker's first result of each type, then a random share) and the exclusion of a
+worker from a job it was caught on all key on the worker id. A donor can hold several ids (a personal invite with
+`--uses N`, `rqah link`, more invites), so a caught donor's other machines keep working until the operator acts.
+Keying these on the donor instead would not stop a cheater: registering again with a fresh invite makes a new donor
+as easily as a new worker, so donor-wide automation would cost complexity and protect nothing. What it would do is
+punish honest donors for one broken machine (a bad card or driver fails a re-run; its siblings are fine). So:
+
+- **Every worker is checked on its own.** A new token's first result of each type is always re-run (or scored), so a
+  new identity buys no unchecked work; counting the first N per donor would be weaker, not stronger.
+- **Nothing a worker delivers counts without a check that does not trust it.** Quant codes are scored by the server
+  itself; for evaluations (#4) a result far off the knapsack's prediction is refused or re-run in full, a share is
+  spot-checked on random documents, and anything the search adopts is re-run in full on our hardware. A cheat that
+  re-registers starts from zero unchecked work.
+- **Donor-wide action is the operator's call:** `admin.py exclude-donor DONOR --reason ...` quarantines every worker
+  of the donor and invalidates every result of theirs that nothing confirmed (lumens revoked, jobs requeued for
+  others, the search's batches see them as invalidated). `disable-worker` revokes a token.
+- **Later, if re-registration becomes a real problem:** limits on invites (they are the only way in, and the operator
+  hands them out), and blocks by IP range at the reverse proxy.
+
 ## Cost
 
 Decoding is cheap. The cost is one GEMM `H·ΔW` per tensor (`tr(W H Wᵀ)` is the same for every result of a tensor
