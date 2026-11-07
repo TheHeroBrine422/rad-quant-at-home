@@ -58,6 +58,14 @@ Host RAM: 16 GB or more (a 27B layer job peaks at ~10 GB on an 8 GB card, less o
 for quantization, 200 GB recommended for evaluation jobs, where XFS or btrfs lets mixes be assembled with reflinks)
 plus ~20 GB.
 
+**Set it up with the wizard** (optional): `python3 client/setup.py` (alias `rqah setup`; one file, Python 3.10+, no
+dependencies) looks at your GPUs, RAM, disk and Docker, asks what to donate (cards, VRAM / RAM / cache caps,
+bandwidth limits and data budgets, time windows, leaderboard, the invite without echoing it), shows what the worker
+will be allowed to do, and writes `worker.env` (mode 0600), `compose.yaml` and `docker-run.sh` for the right image into
+`~/.config/rad-quant-at-home`. Re-running it edits that config, `--check` validates it, and `--yes` with flags or
+`--answers FILE` runs it without questions. It needs no sudo, and it uses the network only if you ask it to pull the
+image or start the worker. Details: [docs/SETUP.md](docs/SETUP.md). Or write the line yourself:
+
 **Run it** (one line; the invite code and the queue URL come from us). AMD:
 
 ```bash
@@ -763,6 +771,9 @@ Every push to main and every pull request runs the no-GPU suites below on GitHub
 - `tests/bandwidth_e2e.py` (0.4): the bandwidth limits end to end with noop jobs, ~3 min: the budget counters (day,
   month, reset day, year wrap), rate caps on a 30 s fetch / upload / resumed fetch (±10%), budgets across a SIGKILL
   and a restart, `rqah status`, the status page.
+- `tests/setup_test.py`: the setup wizard (docs/SETUP.md) on fake machines (fake sysfs and command output), ~20 s, no
+  GPU, no network: a 4 / 8 / 12 / 16 / 32 GB card matrix, multi-card with an iGPU, unsupported cards, no Docker,
+  the files and their modes, re-runs, `--check`, the plain prompts and the curses form on a pseudo-terminal.
 - `tests/statuspage_test.py`: the status page from a fixture database, a few seconds: well-formed XHTML, element
   allow-list, no active content, no token / IP / path / hostname patterns, escaping, the numbers, the display-name
   rules.
