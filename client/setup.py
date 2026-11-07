@@ -667,7 +667,7 @@ def summary_lines(cfg, hw, secret_state, cfgdir, E=(), W=()):
         x = [s for s in (bud(cfg[f'max_{d}_gb_day'], 'day'), bud(cfg[f'max_{d}_gb_month'], 'month')) if s]
         return ", ".join(x) or "no cap"
     L = ["What will be written (in " + cfgdir + "):",
-         "  worker.env      the settings below + " + {"new": "your invite", "kept": "your invite (kept)", "none": "no invite"}[secret_state]
+         "  worker.env      the settings below + " + {"new": "your invite", "kept": "your invite (kept)", "none": "no invite (a first registration starts on probation)"}[secret_state]
          + "  (mode 0600)",
          f"  compose.yaml    image {image_for(cfg)}",
          "  docker-run.sh   the same as one docker run line",
@@ -816,7 +816,8 @@ def check_dir(cfgdir, hw):
             E.append(f"worker.env: a line docker and compose would read differently: {l.split('=', 1)[0]}=...")
     e2, w2 = validate(cfg, hw, secret)
     E += e2; W += w2
-    if not secret: I.append("no invite stored: fine once the worker has registered (its token is in the state volume)")
+    if not secret: I.append("no invite stored: fine once the worker has registered (its token is in the state volume); "
+                            "before that it registers without one, on probation")
     want = render_all(cfg, hw, secret, cfgdir, "-")
     for n in ("worker.env", "compose.yaml", "docker-run.sh"):
         try: have = open(os.path.join(cfgdir, n)).read()
@@ -892,8 +893,9 @@ class Q:
 
 
 QUESTIONS = [
-    Q("server", "Queue URL", "text", "the https:// URL you got with your invite", "Account"),
-    Q("invite", "Invite code", "secret", "the one-time code from us; hidden while you type, stored only in worker.env (0600); "
+    Q("server", "Queue URL", "text", "the https:// URL of the queue (from us)", "Account"),
+    Q("invite", "Invite code", "secret", "optional: the one-time code from us skips probation; leave empty to start on probation "
+      "(quantization jobs only until a few results pass). Hidden while you type, stored only in worker.env (0600); "
       "Enter keeps the stored one, '-' removes it", "Account"),
     Q("name", "Display name", "text", "worker name; also your public name if you opt in below: 1-32 characters, no e-mail or URL. "
       "Use the same name on every machine to be credited together", "Account"),
@@ -1334,7 +1336,8 @@ def main(argv=None):
         print(f"not written: {len(E)} error(s) (--force writes anyway)", file=sys.stderr); return 1
     files = write_all(cfgdir, cfg, hw, secret)
     print("written: " + ", ".join(os.path.basename(f) for f in files) + f" in {cfgdir}")
-    if not secret: print("note: no invite stored: the worker needs a token in its state volume (registered before), or an invite")
+    if not secret: print("note: no invite stored: the worker registers without one and starts on probation (quantization jobs "
+                         "only until a few results pass), unless its state volume has a token already")
     interactive = not a.yes
     do_smoke = a.smoke or (interactive and ask_yes(input, "Run the local checks now (no network: compose file, image, GPU access in the image)?", True))
     do_pull = a.pull or (interactive and hw["docker"]["access"] and ask_yes(input, f"Pull the image now ({image_for(cfg)}, several GB download)?", False))

@@ -8,8 +8,8 @@ out/ and secrets/ bind-mounted, while the workers, admin.py and the test itself 
 Both modes also restart the server mid-run three ways (graceful restart, SIGKILL, remove + recreate) and check that
 every job is accepted exactly once with the right bytes.
 
-Scenarios (TESTS.md): tokens / invites, 3 workers with one killed mid-job (lease expires, job reassigned, accepted
-once), a killed worker restarted before / after its lease expired, duplicate completion, corrupted upload, upload
+Scenarios (TESTS.md): tokens / invites (and a worker registering without one: probation), 3 workers with one
+killed mid-job (lease expires, job reassigned, accepted once), a killed worker restarted before / after its lease expired, duplicate completion, corrupted upload, upload
 caps, a negative Content-Length (JSON and upload), a short upload chunk truncated back, disk-cap eviction and the
 disk-based lease filter, Range resume of a partial download, data access rules,
 malformed jobs from the real server (known type, bad params) and from a fake malicious server (unknown type, extra
@@ -547,6 +547,19 @@ def run(procs, srv):
        all(states()[i] == "accepted" for i in jobs_of("envw")) and "RADQUANT_SERVER is deprecated" in r2.stdout + r2.stderr,
        f"rc {r1.returncode}/{r2.returncode}, workers {len(wrow)}, "
        f"mode {oct(os.stat(tf).st_mode & 0o777) if os.path.exists(tf) else None}")
+
+    # ---- no invite and no token: the worker registers without one (open registration) and starts on probation, which
+    # leases score-mode quant jobs only: a queued noop stays queued
+    admin("enqueue-noop", "1", "--seconds", "0", "--size", "100", "--seed", "560", "--tag", "probw")
+    tfp = f"{W}/probw/token"
+    e3 = dict(env, RQAH_SERVER=URL, RQAH_STATE=f"{W}/probw", RQAH_TOKEN_FILE=tfp, RQAH_NAME="probw", RQAH_IMAGE_ID="e2e-env")
+    r3 = subprocess.run(a, env=e3, capture_output=True, text=True, timeout=60)
+    prow = db().execute("SELECT probation FROM workers WHERE name='probw'").fetchall()
+    ok("worker with neither token nor invite: registers without an invite on probation (token file 0600), the queued "
+       "noop job is not leased to it", r3.returncode == 0 and [tuple(x) for x in prow] == [(1,)] and os.path.exists(tfp) and
+       os.stat(tfp).st_mode & 0o777 == 0o600 and "on probation" in r3.stdout + r3.stderr and
+       all(states()[i] == "queued" for i in jobs_of("probw")), f"rc {r3.returncode} {[tuple(x) for x in prow]} {(r3.stdout + r3.stderr)[-200:]}")
+    for i in jobs_of("probw"): admin("cancel", str(i))
 
     # ---- the server goes away mid-run: graceful restart, crash (SIGKILL), remove + recreate
     for k, how in enumerate(("restart", "crash", "recreate")):

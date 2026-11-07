@@ -286,13 +286,13 @@ class Worker:
         tok = a.token or (open(a.token_file).read().strip() if a.token_file and os.path.exists(a.token_file) else None)
         self.c = Client(a.server, tok)
         if not tok:
-            if not a.invite: sys.exit("no token: give --token / --token-file, or --invite CODE --name NAME to register")
-            r = self.c.api("POST", "register", {"invite": a.invite, "name": a.name, "leaderboard": bool(a.leaderboard)})
+            r = self.register(a)
             tok = r["token"]; self.c.token = tok
             if a.token_file:
                 fd = os.open(a.token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 with os.fdopen(fd, "w") as f: f.write(tok + "\n")
-            log(f"registered as worker {r['worker_id']}")
+            log(f"registered as worker {r['worker_id']}" + (" on probation (no invite): quantization jobs only, one at a time, "
+                "until a few results pass; then more (rqah status shows how far)" if r.get("probation") else ""))
         self.cache = Cache(a.cache or os.path.join(a.state, "cache"), int(a.cache_gb * 1e9))
         lim = {f"{d}_{p}": int(getattr(a, f"max_{d}_gb_{p}") * GB) if getattr(a, f"max_{d}_gb_{p}") else None
                for d in ("down", "up") for p in ("day", "month")}
@@ -501,6 +501,24 @@ class Worker:
             except Exception as e:
                 log(f"heartbeat failed: {e!r}")
 
+    def register(self, a):
+        """POST /register: with the invite if there is one, else without (a server with open registration puts the
+        worker on probation); a rate limit (429) is waited out, a refusal (403) ends the worker"""
+        body = {"name": a.name, "leaderboard": bool(a.leaderboard)}
+        if a.invite: body["invite"] = a.invite
+        else: log("no token and no invite: registering without an invite (open registration, probation)")
+        while True:
+            try: return self.c.api("POST", "register", body)
+            except APIError as x:
+                msg = (x.body or {}).get("error", "") if isinstance(x.body, dict) else ""
+                if x.code == 429:
+                    wait = min(max(int((x.body or {}).get("retry_s") or 600), 60), 6 * 3600)
+                    log(f"registration: {msg or 'rate limited'}; retrying in {wait // 60} min"); time.sleep(wait); continue
+                if x.code == 403:
+                    sys.exit(f"registration refused: {msg or 'bad invite'}" + ("" if a.invite else
+                             " (this server needs an invite: --invite / $RQAH_INVITE)"))
+                raise
+
     def cur_path(self, job): return os.path.join(self.a.state, "current", f"{job['id']}-{job['lease_id'][:8]}.json")
     def save(self, cur): write_json_atomic(self.cur_path(cur["job"]), cur)
 
@@ -661,7 +679,8 @@ def main():
     ap.add_argument("--server", default=e("SERVER"), help="queue URL ($RQAH_SERVER)")
     ap.add_argument("--token", default=e("TOKEN"), help="worker token ($RQAH_TOKEN; prefer --token-file)")
     ap.add_argument("--token-file", default=e("TOKEN_FILE"), help="token file ($RQAH_TOKEN_FILE); written at registration")
-    ap.add_argument("--invite", default=e("INVITE"), help="one-time invite code to register ($RQAH_INVITE)")
+    ap.add_argument("--invite", default=e("INVITE"), help="one-time invite code to register ($RQAH_INVITE); optional on a "
+                    "server with open registration: without one the worker starts on probation")
     ap.add_argument("--name", default=e("NAME", "worker"), help="worker name at registration ($RQAH_NAME)")
     ap.add_argument("--leaderboard", action="store_true", default=e("LEADERBOARD", "0").lower() in ("1", "true", "yes", "on"),
                     help="at registration: list the name on the public status page ($RQAH_LEADERBOARD=1; later: "
