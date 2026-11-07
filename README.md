@@ -165,10 +165,9 @@ itself: [research-kit/](research-kit/README.md).
   job is still open: the late-result rule); a job fails for good after `max_attempts` (default 5). Completion is
   idempotent: once a job is accepted, any later completion or upload for it is acknowledged and ignored. A late
   result from an expired lease is still accepted if nobody has finished the job yet, and the newer lease is then
-  told to stop. Files are served with HTTP Range support,
-  only to a worker holding an active lease on a job that lists the file, and goldens / corpora only while their
-  privacy marker says public. No HTTP endpoint changes anything as admin; the search's batch endpoint (its own token)
-  can only enqueue eval_mix jobs on public goldens.
+  told to stop. Files are served with HTTP Range support, only to a worker holding an active lease on a job that
+  lists the file, and goldens / corpora only while their privacy marker says public. No HTTP endpoint changes
+  anything as admin; the search's batch endpoint (its own token) can only enqueue eval_mix jobs on public goldens.
 - **Scheduler** (0.2, 0.4: docs/SCHED.md): every job type declares what one job needs (`requires`: GPU, cards, VRAM per card, host RAM;
   by model size or bpw), every worker what it has (`--gpus` / `--cards`, `--vram-gb`, `--ram-gb`, `--cache-gb`). A job
   is leased only to a worker whose declaration covers it and whose cards and RAM are free now (the server counts its
@@ -740,7 +739,7 @@ exercised yet.
 
 ### Tests
 
-- `tests/e2e_noop.py`: no GPU, ~5 min, 108 checks (115 with the container). Runs the server as a subprocess, or
+- `tests/e2e_noop.py`: no GPU, ~5 min, 110 checks (117 with the container). Runs the server as a subprocess, or
   `E2E_SERVER=docker` for the container; the workers always run on the host. The GPU side is faked on the CPU (`tests/fakes.py`,
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
   privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record; w25: the donor CLI (every
