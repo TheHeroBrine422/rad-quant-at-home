@@ -95,7 +95,8 @@ $A manifest --jobs 8                                                            
   "past its deadline"): the job is reissued, and the old holder's result still counts if it comes first.
   A level to redo: `$A requeue --level L --force` (accepted results are moved aside). Stop work: `$A cancel --level L`.
 - A gang job waits for a multi-card worker to drain (`reserve` events); a drain that has not finished after
-  `RQAH_RESERVE_MAX_S` is given up and may be retried by another worker.
+  `RQAH_RESERVE_MAX_S` is given up and may be retried by another worker (not by the same one for another
+  `RQAH_RESERVE_MAX_S`).
 
 ## 5. Verify
 

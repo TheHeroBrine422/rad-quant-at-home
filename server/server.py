@@ -226,6 +226,7 @@ class Queue:
                               "why": f"draining for job {j['id']} ({r['cards']} cards)"}
             over, starving = 0, None
             reserved = {r[0] for r in db.execute("SELECT job_id FROM reservations")}
+            reserved |= {r[0] for r in db.execute("SELECT job_id FROM reserve_lapsed WHERE worker_id=?", (w["id"],))}   # #8
             for (prio,) in db.execute("SELECT DISTINCT priority FROM jobs WHERE state='queued' ORDER BY priority DESC").fetchall():
                 cands = []
                 for j in db.execute("SELECT * FROM jobs WHERE state='queued' AND priority=? ORDER BY id LIMIT ?",
@@ -698,7 +699,8 @@ def main():
     ap.add_argument("--class-scan", type=int, default=env("CLASS_SCAN", 5000, int),
                     help="queued jobs of one priority class looked at per lease request")
     ap.add_argument("--reserve-max-s", type=float, default=env("RESERVE_MAX_S", 6 * 3600, float),
-                    help="a drain that has not freed the cards by then is given up (the job may be reserved again)")
+                    help="a drain that has not freed the cards by then is given up; that worker may not reserve the same "
+                         "job again for as long (#8), another worker may")
     ap.add_argument("--spot-rate", type=float, default=env("SPOT_RATE", 0.04, float),
                     help="fraction of each donor's accepted jobs re-run on a verifier (spot checks)")
     ap.add_argument("--spot-first", type=int, default=env("SPOT_FIRST", 1, int),

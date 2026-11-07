@@ -11,7 +11,8 @@ granted job exceeds the declared budget; the over-budget answer; the cache repor
 unknown rev after a server restart); the class-wait drain (a busy worker passing over an aged higher-class job is
 drained for it, not for a same-class one, not before the window); the expect field of a granted job; /data only
 while a lease is live (#15); a lease's hard deadline (#7: renewals stop at it, the job is reissued, a late result
-still counts, abandon + lease again keeps the clock)."""
+still counts, abandon + lease again keeps the clock); a gang drain that timed out is not re-reserved by the same
+worker (#8)."""
 import argparse, json, os, random, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +55,7 @@ def noop(S, inputs=(), size=1000, prio=0, level=None, ram=0, cards=0, sizes=None
     p = {"seconds": 0, "size": size, "seed": 0}
     if inputs: p["inputs"] = list(inputs)
     if ram: p["ram_gb"] = ram
+    if cards: p["cards"] = cards
     m = jobs.get("noop")
     with S.tx() as db:
         return S.enqueue(db, "noop", m.VERSION, p, list(inputs), jobs.requirements(m, p), sum((sizes or {}).get(n, 0) for n in inputs),
@@ -344,6 +346,29 @@ def main():
     ev = S.q("SELECT detail FROM events WHERE kind='expire' AND lease_id=?", (r5["job"]["lease_id"],))
     ok("the reaper expires a lease at its deadline (event: past its deadline)", ev and "deadline" in (ev[0][0] or "") and
        S.q("SELECT state FROM jobs WHERE id=?", (j3,))[0][0] == "queued")
+
+    # ---------------------------------------------------------------- #8: a drain that never drains
+    d, a = setup("gang")
+    manifest(d, files)
+    Q = Queue(a); S = Q.store
+    g1, g2 = noop(S, cards=1, prio=50, sizes=sizes), noop(S, cards=1, prio=50, sizes=sizes)
+    wa, wb = worker(S, "w16"), worker(S, "w17")
+    cg = caps(gpu=True, cards=2, vram_gb=32, slots=2)
+    Q.lease(wa, cg); Q.lease(wb, cg)                        # each holds one of its two cards
+    gang = noop(S, cards=2, prio=40, sizes=sizes)
+    r1 = Q.lease(wa, cg)
+    with S.tx() as db: db.execute("UPDATE reservations SET t=t-?", (a.reserve_max_s + 1,))
+    r2 = Q.lease(wa, cg)                                     # expire() drops the stale drain first
+    r3 = Q.lease(wb, cg)
+    res = S.q("SELECT job_id, worker_id FROM reservations")
+    ok("a worker whose gang drain timed out without draining cannot reserve the job again; another busy multi-card worker "
+       "can (#8)", r1.get("draining") == gang and not r2.get("draining") and r2.get("job") is None and r3.get("draining") == gang
+       and [tuple(x) for x in res] == [(gang, wb["id"])], (r1.get("draining"), r2, r3.get("draining")))
+    with S.tx() as db:                                      # wa's own job ends: it is idle with two free cards
+        db.execute("UPDATE leases SET state='done' WHERE job_id=?", (g1,)); db.execute("UPDATE jobs SET state='accepted' WHERE id=?", (g1,))
+    r4 = Q.lease(wa, cg)
+    ok("... while an idle worker with the cards free still takes it at once", r4.get("job") and r4["job"]["id"] == gang,
+       r4.get("job", {}).get("id"))
 
     n = sum(1 for _, p in RESULTS if p)
     print(f"\n{n}/{len(RESULTS)} checks passed")

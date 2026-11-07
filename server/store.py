@@ -24,7 +24,9 @@ per tensor, computed once).
 0.4: jobs.requeued (the last admin requeue / invalidate: a worker's failed, rejected or expired leases before it no
 longer exclude it, #5).
 
-0.5: leases.deadline (#7: heartbeats renew a lease only up to it; then it expires like a missed heartbeat)."""
+0.5: leases.deadline (#7: heartbeats renew a lease only up to it; then it expires like a missed heartbeat);
+reserve_lapsed (#8: a gang / class-wait reservation that timed out without the worker draining; that worker may not
+reserve the job again for one more reserve_max_s)."""
 import hashlib, json, os, secrets, sqlite3, threading, time
 
 SCHEMA = """
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS points(id INTEGER PRIMARY KEY, t REAL, worker_id INTE
   lumens REAL NOT NULL, kind TEXT NOT NULL, note TEXT);
 CREATE INDEX IF NOT EXISTS points_worker ON points(worker_id);
 CREATE TABLE IF NOT EXISTS reservations(job_id INTEGER PRIMARY KEY, worker_id INTEGER NOT NULL, t REAL);
+CREATE TABLE IF NOT EXISTS reserve_lapsed(job_id INTEGER NOT NULL, worker_id INTEGER NOT NULL, t REAL, PRIMARY KEY(job_id, worker_id));
 CREATE TABLE IF NOT EXISTS batches(id INTEGER PRIMARY KEY, t REAL, name TEXT, spec TEXT, n INTEGER);
 CREATE TABLE IF NOT EXISTS batch_items(batch_id INTEGER NOT NULL, cand TEXT NOT NULL, job_id INTEGER NOT NULL,
   PRIMARY KEY(batch_id, cand));
@@ -172,7 +175,13 @@ class Store:
                        "worker_id IN (SELECT id FROM workers WHERE last_seen < ? OR quarantined=1 OR disabled=1)",
                        (now - getattr(self, "reserve_idle_s", 300),))
             if getattr(self, "reserve_max_s", None):
+                # a drain that never freed the cards: that worker may not reserve the job again for another
+                # reserve_max_s, so another busy multi-card worker gets its turn (#8)
+                db.execute("INSERT OR REPLACE INTO reserve_lapsed SELECT job_id, worker_id, ? FROM reservations WHERE t < ?",
+                           (now, now - self.reserve_max_s))
                 db.execute("DELETE FROM reservations WHERE t < ?", (now - self.reserve_max_s,))
+                db.execute("DELETE FROM reserve_lapsed WHERE t < ? OR job_id NOT IN (SELECT id FROM jobs WHERE state='queued')",
+                           (now - self.reserve_max_s,))
             for l in db.execute("SELECT * FROM leases WHERE state='active' AND expires<?", (now,)).fetchall():
                 past = l["deadline"] is not None and l["expires"] >= l["deadline"]
                 self.expire_lease(db, l, now, why="past its deadline" if past else "expired"); n += 1

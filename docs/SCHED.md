@@ -82,8 +82,9 @@ small job, of a lower class. Two drains prevent this:
   for a job over the worker's budget (the worker could not run it anyway).
 
 In both cases another worker that can run the job at once still takes it, and the reservation goes away. A drain
-that has not freed the room within `--reserve-max-s` (default 6 h) is given up, after which the job may reserve
-again. A worker's soft preferences (level order, cache affinity, budget order) thus delay a higher class by at most
+that has not freed the room within `--reserve-max-s` (default 6 h) is given up. That worker may not reserve the same
+job again for another `--reserve-max-s` (0.5, #8), so a worker that never drains cannot keep a job reserved: the next
+busy worker that could run it reserves it instead, and an idle one takes it at once. A worker's soft preferences (level order, cache affinity, budget order) thus delay a higher class by at most
 one lease cycle. Hard constraints delay it by at most `--class-wait-s` plus the time the running jobs need to end.
 
 Cost: a lease request now looks at every candidate of the highest class that has one, instead of stopping at the
