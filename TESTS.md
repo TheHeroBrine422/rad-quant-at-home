@@ -3,7 +3,8 @@
 Times are US Central (CST). Sections 1-7: v0 (w13 / w13b, 2026-11-04; they use the v0 names `rxm-queue`, `RXMQ_*`,
 `RXMW_*`, `rxmq`). Section 8: v0.2 (w24, 2026-11-05). Section 9: the donor CLI and the public status page (w25,
 2026-11-05). Sections 10-12: 0.3 (w47, 2026-11-06): verification by score, small cards, the CUDA image, the rename.
-Section 13: 0.4 (w57, 2026-11-06): bandwidth limits and the scheduling rules.
+Section 13: 0.4 (w57, 2026-11-06): bandwidth limits and the scheduling rules. Section 14: the setup wizard (w69,
+2026-11-07).
 Older sections describe the code and names of their time (the project lived in rad-exl3-mix's `volunteer/` and was
 called `radquant` until 0.3; the environment names in them were updated to `RQAH_*`). Machines: the VM (noop
 end-to-end, the server container, image builds), an RTX 4070 test box (the real quantizer runs, CPU checks), the
@@ -45,6 +46,12 @@ Request overhead: a 1 s noop job takes 1.01 s lease-to-complete on localhost.
 
 Security fix round (issue #1, the three Content-Length cases above): macOS dev box, 2026-11-06, **111/111** (plain process).
 Security fix round (issue #2, the three lease-id cases above): macOS dev box, 2026-11-06, **110/110** (plain process).
+Review round 2 (issues #4, #7, #8, #11, #12, #15; branch issues-2, 0.5): VM, 2026-11-07, **132/132** (plain process),
+**139/139** (`E2E_SERVER=docker`, image built with `docker/server/build.sh --worktree`). #4 adds 12 checks: the
+plausibility band (refused far-worse, two donors' refusals route the job to verifiers, suspect far-better paid only
+after its full re-run), a spot check of 3 of 6 documents (`sub_golden`: a document scores the same alone), adoption,
+a faker inside the band caught on its documents, stale rows dropped by collect, `exclude-donor`. Unit suites on the
+same tree: score 40, sched 40, checker_nan 12, statuspage 19, setup 125, bandwidth_e2e 22.
 
 ## 2. Server throughput (the queue host, loopback, niced)
 
@@ -546,3 +553,34 @@ so only one eviction happened. The four jobs now get one level each, which keeps
 `bandwidth_e2e.py` checks the affinity itself with a real worker: jobs m1, m2, m1 of one level ran as m1, m1, m2, with
 1,000,000 / 0 / 1,000,000 B downloaded.
 
+## 14. The setup wizard (`tests/setup_test.py`, w69, 2026-11-07)
+
+`client/setup.py` against fake machines: a fake root (kfd topology, drm cards and connectors, PCI, /proc, /dev/kfd and
+render nodes, /etc/group, /etc/localtime) plus canned nvidia-smi / rocminfo / docker output. **125/125 checks passed**
+on the VM (Python 3.14, Docker 29.8 + compose 5.6, ~16 s), 12:30-1:00 AM CST; 123/123 on the RTX 4070 box (Python 3.12,
+no compose plugin: the two `docker compose config` checks skipped).
+
+| machine | defaults (cards, VRAM, RAM for jobs) | outcome |
+|---|---|---|
+| RTX 3050 4 GB, 16 GB RAM | 0, 4, 12 | refused: "no 27B job fits below 6 GB" (`--force` overrides) |
+| RTX 4060 Ti 8 GB, 32 GB | 0, 8, 24 | CUDA image; layers up to K6 + groups (small-card mode) |
+| RTX 4070 12 GB driving the display, 32 GB | 0, 11, 24 | layers up to K6, with the note that 12 would add jobs |
+| RTX 4070 12 GB headless, 16 GB | 0, 12, 12 | every trunk job |
+| RX 9070 XT 16 GB, 32 GB | 0, 16, 24 | ROCm image; + evaluations ≤ 4.5 bpw |
+| R9700 32 GB, 64 GB | 0, 32, 48 | + evaluations ≤ 7 bpw and the LM head |
+| iGPU (gfx1036) + 2 × R9700, 64 GB | 1,2 (the iGPU is ROCm index 0), 32, 48 | + TP2 evaluations; choosing the iGPU is an error |
+| gfx1100; GTX 1080 + RTX 3090 on driver 550 | - | refused with the reason (arch; cc 6.1; driver < 570) |
+| no Docker | as above | files written with a warning; the smoke step says so; `--check` passes with the warning |
+| Docker: permission denied / daemon down / Podman; NVIDIA without the toolkit | | explained / warned; the toolkit is an error |
+
+Also checked: `worker.env` 0600, `setup.json` 0600, the directory 0700; the invite only in `worker.env` (not in
+setup.json, the compose file, the run line, stdout or stderr, nor echoed on the terminal by the plain prompts or the
+curses form); every env line parses the same for `docker --env-file` and compose; `docker compose config` accepts
+both compose files and reads the env file; `sh -n docker-run.sh`; nothing written outside the config dir; re-runs
+keep the other answers and the invite and leave `.prev` backups (0600); `--check` passes, and fails on a loose
+mode, a quoted env line, a missing file or a machine with a smaller card / less RAM; it warns on hand edits. The
+display-name rule matches `server/donor.py`. The smoke step validates compose, looks up the image and runs the GPU
+probe with `--network none` and without the env file. Real `--show` on the RTX 4070 box: RTX 4070, driver 615,
+display → 11 GB; the Ryzen iGPU listed as not usable; no Docker or toolkit in that sandbox.
+
+Not tested: real AMD sysfs, the smoke step against a real image, `--start`.

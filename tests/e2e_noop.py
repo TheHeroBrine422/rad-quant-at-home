@@ -172,7 +172,8 @@ class LocalServer:
     def start(self):
         # RADQUANT_UPLOAD_MAX_MB: a 0.2 name on purpose (still read in 0.3: the 413 check depends on it)
         e = {k: v for k, v in os.environ.items() if not k.startswith(("RADQUANT_", "RQAH_"))}
-        e.update(RADQUANT_UPLOAD_MAX_MB="48", RQAH_SPOT_RATE="0", RQAH_SPOT_FIRST="1", RQAH_SEARCH_TOKEN_FILE=f"{W}/secrets/search-token")
+        e.update(RADQUANT_UPLOAD_MAX_MB="48", RQAH_SPOT_RATE="0", RQAH_EVAL_SPOT_RATE="0", RQAH_SPOT_FIRST="1",
+                 RQAH_SEARCH_TOKEN_FILE=f"{W}/secrets/search-token")
         self.p = subprocess.Popen([PY, "-I", f"{HERE}/server/server.py", "--db", DBP, "--data", DATA, "--spool", SPOOL,
                                    "--results", RES, "--port", str(PORT), "--lease-s", "6", "--heartbeat-s", "1.5", "--retry-s", "0.5",
                                    "--admin-token-file", f"{W}/secrets/admin-token", "--status-interval", "1", "--status-dir", STATUS_DIR],
@@ -205,7 +206,8 @@ class DockerServer:
         env = {"RQAH_IMAGE": image, "RQAH_DB_DIR": f"{W}/db", "RQAH_DATA_DIR": DATA, "RQAH_OUT_DIR": f"{W}/out",
                "RQAH_SOURCES_DIR": f"{W}/sources", "RQAH_SECRETS_DIR": f"{W}/secrets", "RQAH_PUBLISH": f"127.0.0.1:{PORT}",
                "RQAH_LEASE_S": "6", "RQAH_HEARTBEAT_S": "1.5", "RQAH_RETRY_S": "0.5", "RADQUANT_UPLOAD_MAX_MB": "48",
-               "RQAH_ADMIN_TOKEN_FILE": "/run/secrets/rqah/admin-token", "RQAH_SPOT_RATE": "0", "RQAH_SPOT_FIRST": "1",
+               "RQAH_ADMIN_TOKEN_FILE": "/run/secrets/rqah/admin-token", "RQAH_SPOT_RATE": "0", "RQAH_EVAL_SPOT_RATE": "0",
+               "RQAH_SPOT_FIRST": "1",
                "RQAH_SEARCH_TOKEN_FILE": "/run/secrets/rqah/search-token", "RQAH_STATUS_INTERVAL": "1",
                "RQAH_STATUS_DIR": "/srv/rqah/out/status"}
         if os.path.exists("/sys/fs/selinux/enforce") and open("/sys/fs/selinux/enforce").read().strip() == "1":
@@ -358,6 +360,9 @@ def run(procs, srv):
     ok("short upload body -> 400 with the old offset, spool truncated back",
        c == 400 and r.get("size") == 0 and req("GET", u2, token=t_client)[1].get("size") == 0, f"{c} {r}")
     ok("another worker's lease -> 403", req("POST", "/api/v0/heartbeat", {"job_id": job2["id"], "lease_id": job2["lease_id"]}, token=toks["wc"])[0] == 403)
+    c1, r1 = req("POST", "/api/v0/heartbeat", {"job_id": 2 ** 70, "lease_id": "0" * 32}, token=t_client)
+    c2, r2 = req("GET", f"/api/v0/me/events?after={10 ** 30}", token=t_client)
+    ok("ids / limits beyond 64 bits -> 400, not a 500 with a traceback (#15)", c1 == 400 and c2 == 400, f"{c1} {r1} | {c2} {r2}")
     req("POST", "/api/v0/fail", {"job_id": job2["id"], "lease_id": job2["lease_id"], "error": "test", "abandon": True}, token=t_client)
     r2 = db().execute("SELECT state, attempts FROM jobs WHERE id=?", (job2["id"],)).fetchone()
     ok("abandon returns the job without counting an attempt", tuple(r2) == ("queued", 0), str(tuple(r2)))
@@ -647,6 +652,7 @@ def run_v02(procs, srv):
     E = v02_eval_setup()
     v02_eval(procs, E)
     v02_spot(procs, E)
+    v05_eval_trust(procs, E)
     v02_golden(procs)
     v02_units(E)
 
@@ -929,6 +935,107 @@ def v02_spot(procs, E):
        any(w_["quarantined"] for w_ in r.get("workers", [])))
 
 
+def pts_job(j): return db().execute("SELECT COALESCE(SUM(lumens), 0) FROM points WHERE job_id=?", (j,)).fetchone()[0]
+
+
+def v05_eval_trust(procs, E):
+    """#4: eval_mix results against the search's prediction, spot checks of a few documents, full trusted re-runs of
+    suspect and adopted candidates, a faker caught on its documents, exclude-donor"""
+    S = "/api/v0/search/batch"
+    EV = ("--gpu-name", "fake32", "--cards", "1", "--vram-gb", "32", "--ram-gb", "64", *GPU, "--radiance", FAKE_RAD,
+          "--job-types", "eval_mix")
+    import array
+    mixes = [{LIN[i]: "k4", LIN[i + 5]: "k3"} for i in range(4)]
+    true = []
+    for mx in mixes:
+        a = array.array("f"); a.frombytes(expected(E, "1", "k2", mx)[1]); true.append(sum(a[0::4]) / (len(a) // 4))
+    # t0 as predicted, t1 predicted 4x better than it is (an honest surprise), t2 predicted 3x worse (so the honest
+    # result looks too good), t3 as predicted (adopted later)
+    preds = [true[0], true[1] / 4, true[2] * 3, true[3] * 1.1]
+    c, b5 = req("POST", S, {"name": "r5", "model": "fm", "revision": "1", "base": "k2", "golden": "xg", "kv": "bf16",
+                            "max_model_len": 4096, "band": {"worse": 99, "better": 0.5},
+                            "candidates": [{"id": f"t{i}", "mix": mx, "pred_kld": preds[i]} for i, mx in enumerate(mixes)]}, token=SEARCH_TOKEN)
+    T = {it["id"]: it["job"] for it in req("GET", f"{S}/{b5['batch']}", token=SEARCH_TOKEN)[1]["items"]}
+    pr = {k: json.loads(jrow(j)["pred"] or "{}") for k, j in T.items()}
+    c2, r2 = req("POST", S, {"name": "x", "model": "fm", "revision": "1", "base": "k2", "golden": "xg",
+                             "candidates": [{"id": "z", "mix": mixes[0], "pred_kld": "low"}]}, token=SEARCH_TOKEN)
+    ok("#4 batch: predictions stay on the server (jobs.pred, not in the params a worker gets); a batch's band is clamped "
+       "(worse 99 -> 10); a bad pred_kld is refused", c == 200 and len(T) == 4 and pr["t0"].get("worse") == 10.0 and
+       all("pred" not in json.loads(jrow(j)["params"]) for j in T.values()) and c2 == 400, f"{pr['t0']} {r2}")
+    with sqlite3.connect(DBP, timeout=30) as d_:            # back to the default band (x3 / x0.5) for the rest
+        for k, j in T.items(): d_.execute("UPDATE jobs SET pred=? WHERE id=?", (json.dumps({"kld": preds[int(k[1])]}), j))
+    # a lazy donor: rows far worse than predicted (bias 0.2 on every KL) -> refused at completion, no lumens
+    w = worker("lazy5", tok("lazy5"), *EV, "--env", "FAKE_RAD_BIAS=0.2", "--idle-exit", "4"); procs.append(w); w.wait(60)
+    rej = [e for j in T.values() for e in events(j, "result_rejected") if "implausible" in (e["detail"] or "")]
+    ok("#4: results far worse than the prediction (x3) are refused at completion (implausible), the jobs stay queued",
+       len(rej) == 4 and all(states()[j] == "queued" for j in T.values()) and
+       db().execute("SELECT COUNT(*) FROM points WHERE worker_id=?", (wid("lazy5"),)).fetchone()[0] == 0, f"{len(rej)} refused")
+    # an honest donor: t0 / t3 pass, t1 refused (now 2 donors: to the verifiers), t2 accepted as suspect
+    w = worker("hon5", tok("hon5"), *EV, "--idle-exit", "4"); procs.append(w); w.wait(60)
+    st = {k: jrow(j) for k, j in T.items()}
+    ok("#4: honest results: as predicted -> accepted (check pass); 4x worse than predicted -> refused, and after two donors "
+       "the job goes to our verifiers; 2x+ better -> accepted as suspect, a full trusted re-run queued, no lumens yet",
+       st["t0"]["check_state"] == "pass" and st["t3"]["state"] == "accepted" and st["t1"]["state"] == "queued" and
+       st["t1"]["needs"] == "verifier" and st["t2"]["check_state"] == "suspect" and st["t2"]["trust_state"] == "pending" and
+       pts_job(T["t2"]) == 0 and pts_job(T["t3"]) > 0, {k: (r["state"], r["check_state"], r["trust_state"], r["needs"]) for k, r in st.items()})
+    spot = db().execute("SELECT * FROM jobs WHERE verify_of IN (?,?,?,?) AND params LIKE '%sub_rows%'", tuple(T.values())).fetchall()
+    sp = json.loads(spot[0]["params"]) if spot else {}
+    ok("#4: the donor's first eval result is spot-checked on a few documents (3 of 6), not the whole golden",
+       len(spot) == 1 and len(sp.get("docs", [])) == 3 and sp["sub_rows"] < sp["rows"], sp.get("docs"))
+    open(f"{W}/search-token", "w").write(SEARCH_TOKEN)
+    sq = subprocess.run([PY, "-I", f"{HERE}/client/searchq.py", "--server", URL, "--token-file", f"{W}/search-token", "adopt",
+                         str(b5["batch"]), "t3"], capture_output=True, text=True)
+    ca, ra = req("POST", f"{S}/{b5['batch']}/adopt", {"candidates": ["t1"]}, token=SEARCH_TOKEN)
+    ok("#4: adopting a candidate queues its full trusted re-run (searchq adopt); adopting a candidate that is not accepted -> 400",
+       sq.returncode == 0 and jrow(T["t3"])["trust_state"] == "pending" and ca == 400, sq.stdout.strip()[:120])
+    # our verifier runs everything queued for it (jitter 1e-4 stands in for another GPU)
+    v = worker("verif", TOKENS["verif"], *EV, "--env", "FAKE_RAD_NOISE=0.0001", "--idle-exit", "6"); procs.append(v)
+    wait(lambda: not db().execute("SELECT 1 FROM jobs WHERE (verify_of IS NOT NULL OR needs='verifier') AND state IN ('queued','leased') "
+                                  "AND type='eval_mix'").fetchone(), 90); v.wait(60)
+    it = {x["id"]: x for x in req("GET", f"{S}/{b5['batch']}", token=SEARCH_TOKEN)[1]["items"]}
+    ok("#4: after the verifier: the spot check passed on its documents; the suspect result confirmed by its full re-run "
+       "and paid only now; the adopted one confirmed; the surprise settled by the verifier itself (confirmed)",
+       jrow(spot[0]["verify_of"])["verify_state"] == "pass" and it["t2"]["trust"] == "confirmed" and pts_job(T["t2"]) > 0 and
+       it["t3"]["trust"] == "confirmed" and it["t3"].get("adopted") and it["t1"]["trust"] == "confirmed" and
+       jrow(T["t1"])["accepted_by"] == wid("verif") and it["t0"]["trust"] in ("spot-pass", "unverified"),
+       {k: x.get("trust") for k, x in it.items()})
+    # a faker within the band (every KL +0.003: a ratio of ~1.2, plausible) is caught by its first spot check
+    cands = [{"id": f"f{i}", "mix": {LIN[i]: "k3", LIN[i + 6]: "k4"}} for i in range(3)]
+    c, b6 = req("POST", S, {"name": "r6", "model": "fm", "revision": "1", "base": "k2", "golden": "xg", "kv": "bf16",
+                            "max_model_len": 4096, "candidates": cands}, token=SEARCH_TOKEN)
+    F = [x["job"] for x in req("GET", f"{S}/{b6['batch']}", token=SEARCH_TOKEN)[1]["items"]]
+    w = worker("fake5", tok("fake5"), *EV, "--env", "FAKE_RAD_BIAS=0.003", "--idle-exit", "4"); procs.append(w); w.wait(60)
+    out6 = f"{W}/collect6"; admin("batch-collect", str(b6["batch"]), out6)
+    had = sorted(os.listdir(out6))
+    # the same donor's second machine delivers one more (it would pass its own spot check: its own first job)
+    tok("fake5b"); admin("link", str(wid("fake5b")), str(db().execute("SELECT donor_id FROM workers WHERE name='fake5'").fetchone()[0]))
+    c, b7 = req("POST", S, {"name": "r7", "model": "fm", "revision": "1", "base": "k2", "golden": "xg", "kv": "bf16",
+                            "max_model_len": 4096, "candidates": [{"id": "g0", "mix": {LIN[1]: "k4", LIN[9]: "k3"}}]}, token=SEARCH_TOKEN)
+    G7 = req("GET", f"{S}/{b7['batch']}", token=SEARCH_TOKEN)[1]["items"][0]["job"]
+    w = worker("fake5b", TOKENS["fake5b"], *EV, "--idle-exit", "4"); procs.append(w); w.wait(60)
+    # the verifier runs the two spot checks (one per machine, priority +10) and nothing else: the invalidated jobs stay queued
+    v = worker("verif", TOKENS["verif"], *EV, "--env", "FAKE_RAD_NOISE=0.0001", "--max-jobs", "2", "--idle-exit", "6"); procs.append(v)
+    v.wait(90)
+    q5 = db().execute("SELECT quarantined, quarantine_reason FROM workers WHERE name='fake5'").fetchone()
+    ok("#4: a faker inside the plausibility band fails its spot check (its documents' rows differ): that worker is "
+       "quarantined, its results invalidated; its sibling machine is not (no automatic donor-wide quarantine)",
+       q5[0] == 1 and "exclude-donor" in (q5[1] or "") and all(jrow(j)["accepted_by"] != wid("fake5") for j in F) and
+       db().execute("SELECT quarantined FROM workers WHERE name='fake5b'").fetchone()[0] == 0 and jrow(G7)["state"] == "accepted",
+       q5[1])
+    st6 = req("GET", f"{S}/{b6['batch']}", token=SEARCH_TOKEN)[1]
+    admin("batch-collect", str(b6["batch"]), out6)
+    ok("#4: the search sees the invalidation: status marks the candidates, collect deletes their stale rows",
+       len(had) == 4 and all(x.get("invalidated") for x in st6["items"] if x["state"] != "accepted") and
+       sorted(os.listdir(out6)) == ["results.jsonl"] + sorted(f"{x['id']}.rows" for x in st6["items"] if x["state"] == "accepted"),
+       f"had {had}, now {sorted(os.listdir(out6))}")
+    did = db().execute("SELECT donor_id FROM workers WHERE name='fake5'").fetchone()[0]
+    rc, o = admin_rc("exclude-donor", str(did), "--reason", "faked eval rows")
+    ok("#4: admin exclude-donor: every worker of the donor quarantined, its unconfirmed results (also the sibling's) invalidated",
+       rc == 0 and db().execute("SELECT quarantined FROM workers WHERE name='fake5b'").fetchone()[0] == 1 and
+       jrow(G7)["state"] == "queued" and pts_job(G7) <= 0 and "1 results invalidated" in o, o.strip())
+    for j in F + [G7]: admin("cancel", str(j))
+
+
 def v02_golden(procs):
     src = f"{W}/v02src"
     docs = [{"prompt": f"public text {i}: " + "lorem ipsum dolor " * (5 + i), "source": f"xcorp/{s}", "score_from": i}
@@ -1032,10 +1139,29 @@ def v02_units(E):
         if case == "mean": a[0] += 0.3
         if case == "short": a = a[:-4]
         open(f"{t}/rows.f32", "wb").write(a.tobytes())
-        try: EM.accept(p, {f: f"{t}/{f}" for f in ("rows.f32", "kld.json", "job.json")}, {}, dp)
+        try: EM.accept(p, {f: f"{t}/{f}" for f in ("rows.f32", "kld.json", "job.json")}, result(j), dp)
         except ValueError: refused.append(case)
+    bad_res = []
+    for res in (dict(result(j), kld_mean=result(j)["kld_mean"] * 0.5), dict(result(j), container_sha256="0" * 64), {}):
+        try: EM.accept(p, {f: f"{RES}/{j}/{f}" for f in ("rows.f32", "kld.json", "job.json")}, res, dp)
+        except ValueError: bad_res.append(1)
     ok("eval_mix accept: refuses a changed reference NLL, a negative KL, rows that disagree with the report, a short file; takes the real one",
        refused == ["nll_p", "neg", "mean", "short"], str(refused))
+    ok("eval_mix accept: refuses a result whose kld_mean / container_sha256 differ from the files (what the search reads, #4)",
+       len(bad_res) == 3, str(bad_res))
+    v = [EM.plausible({"kld": 0.01}, {"kld_mean": x})[0] for x in (0.0311, 0.0299, 0.0051, 0.0049)]
+    ok("eval_mix plausibility (#4): above 3x the prediction (+0.001) refused, below 0.5x suspect, a batch's band clamped",
+       v == ["reject", "pass", "pass", "suspect"] and EM.band_of({"worse": 99, "better": 0.95}) == {"worse": 10.0, "better": 0.9}, v)
+    from jobs import golden_common as G_
+    gm = json.load(open(f"{E['gold']}/kld.json")); spans = G_.doc_spans(gm, [4, 1])
+    sd = f"{W}/subgold"; shutil.rmtree(sd, ignore_errors=True)
+    n = G_.sub_golden({f: f"{E['gold']}/{f}" for f in G_.GOLDEN_FILES}, sd, spans)
+    mdl = f"{E['src']}/exp.rad"
+    fakes.score(mdl, E["gold"], f"{W}/full.json"); fakes.score(mdl, sd, f"{W}/sub.json")
+    A = G_.f32(f"{W}/full.json.rows"); B = G_.f32(f"{W}/sub.json.rows")
+    ok("sub_golden (#4 spot checks): a golden of documents 1 and 4 is consistent and scores them exactly as the whole golden does",
+       n == sum(x[2] for x in spans) and G_.doc_rows(json.load(open(f"{sd}/kld.json")))[0] == n and
+       G_.take_rows(A, spans) == B and G_.compare_rows(f"{W}/full.json.rows", f"{W}/sub.json.rows", EM_TOL, spans)[0], spans)
 
 
 # ======================================================================== w25: donor CLI + public status page

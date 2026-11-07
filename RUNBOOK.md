@@ -62,7 +62,9 @@ $A manifest --jobs 8                                                            
   - Small cards: `--unit group` makes one `quant_tensor` job per Hessian group (4 per layer; needs `datapack --groups`
     once): 6 GB cards take everything but down_proj; 8 GB cards already take whole layers up to K6 (docs/SMALL-CARDS.md).
   - Best of N: `--copies 2` queues each job twice with seed_offset +0 / +1; every copy in its band is accepted (and
-    gives the band a free honest repeat), the export keeps the better one.
+    gives the band a free honest repeat), the export keeps the better one. A donor (all its tokens) is leased at most
+    one copy of a job, and a copy whose codes nearly equal another result's earns nothing (#11). With fewer donors
+    than copies, the spare copies wait for another donor or a verifier.
   - Anchors: the first result for each tensor of a new series waits (provisional) for one re-run on a verifier. To
     skip that, import a level we quantized ourselves with the same settings first: `$A score-import --level k3-i8
     /path/to/ourq/output` (q-LNN.safetensors files). Released models' shards: `$A score-import --level L DIR --published
@@ -70,7 +72,10 @@ $A manifest --jobs 8                                                            
 - **Search candidates** (eval_mix): from the search box, `client/searchq.py --server https://<queue> --token-file
   search-token submit SPEC.json`, then `wait ID` and `collect ID OUT` (rows per candidate in radiance's FILE.rows
   layout). Or on the queue host: `$A batch-submit SPEC.json`, `batch-status ID`, `batch-collect ID OUT`. The spec is in
-  `server/batch.py`. Repeated candidates reuse their earlier result.
+  `server/batch.py`. Repeated candidates reuse their earlier result. Give every candidate the knapsack's prediction
+  (`"pred_kld"`): far-worse results are refused, far-better ones re-run in full before they count (#4). Before the
+  search adopts a candidate: `searchq.py adopt ID CAND... --wait` (or `$A batch-adopt ID CAND...`) queues its full
+  trusted re-run; use it only once its `trust` is `confirmed`.
 - **Reference goldens** (trusted big boxes): `$A enqueue-golden --model qwen38-27b --rev <rev> --corpus xcorp-m2
   --method tp2|staged --top 512 --max-model-len 32768`.
 - Priorities (docs/SCHED.md): higher first, strictly by class. Ladder levels default by K's granularity: integer K 40,
@@ -90,10 +95,13 @@ $A manifest --jobs 8                                                            
   are one person: `$A link WORKER DONOR`. Donors see their own side with `radquant status | jobs | points | logs`.
 - A job that keeps failing: `$A events JOB` (worker errors are in the `fail` events), fix, `$A requeue JOB`. A queued
   job no worker takes (every capable worker failed it within the last `--refail-s`, default 1 h): `$A requeue JOB`
-  resets its attempts and the exclusions at once.
+  resets its attempts and the exclusions at once. A lease ends at its deadline even while it heartbeats
+  (`RQAH_LEASE_CAP_X` 3 × the type's reference runtime, at least `RQAH_LEASE_CAP_MIN_S` 2 h; `expire` events with
+  "past its deadline"): the job is reissued, and the old holder's result still counts if it comes first.
   A level to redo: `$A requeue --level L --force` (accepted results are moved aside). Stop work: `$A cancel --level L`.
 - A gang job waits for a multi-card worker to drain (`reserve` events); a drain that has not finished after
-  `RQAH_RESERVE_MAX_S` is given up and may be retried by another worker.
+  `RQAH_RESERVE_MAX_S` is given up and may be retried by another worker (not by the same one for another
+  `RQAH_RESERVE_MAX_S`).
 
 ## 5. Verify
 
@@ -110,11 +118,16 @@ $A manifest --jobs 8                                                            
   recorded as `check_state='error'`, quarantines nobody, and is retried by a later `$A check --level L --recheck`.
 - **Spot checks** run by themselves: 4% of every donor's accepted results plus its first of each type are re-run on a
   verifier and compared (`spot_draw`, `spot_pass`, `spot_fail` events; `verify_state` in `$A list`). `$A spot JOB`
-  draws one by hand.
+  draws one by hand. eval_mix: 8% (`RQAH_EVAL_SPOT_RATE`), each re-scoring 3 random documents; suspect (far better
+  than predicted) and adopted candidates get a full re-run (`trust_draw`, `trust_pass`, `trust_fail` events). Keep a
+  verifier running while the search works. `suspect` events list results far better than predicted;
+  `implausible_to_verifier` a job two donors returned far worse than predicted (check the prediction).
 - **On a `spot_fail`:** the donor is already quarantined and its unconfirmed results requeued. Read the comparison
   (`verify_detail` of the job: worst tensor / rows out of tolerance / container hashes). A hardware fault or a
   tolerance that is too tight (eval rows: calibrate on the first R9700 pairs) is lifted with `$A unquarantine ID`; a
-  cheat stays, and `$A disable-worker ID` revokes the token.
+  cheat stays, and `$A disable-worker ID` revokes the token. A donor caught faking (any of its workers): `$A
+  exclude-donor DONOR --reason ...` quarantines all its workers and invalidates every result of theirs that nothing
+  confirmed (the search's batches show those candidates as invalidated). Nothing does this donor-wide by itself.
 - **Export** only verified work: `$A export --level L OUT --checked` (ourq layout: knap4 and the search read it; of
   best-of-N copies the passed one with the lowest error, `quant_tensor` groups merged into one shard per layer).
 

@@ -2,7 +2,12 @@
 """Verification, quarantine and points ("lumens") -- stdlib only, shared by server.py and admin.py.
 
 Spot checks: when a donor's result is accepted, it is drawn for a re-run with probability `rate` (default 4%: the
-3-5% band), and always for a donor's first `first` accepted job of each type. A drawn job's verify_state is
+3-5% band; eval_mix: --eval-spot-rate, default 8%), and always for a donor's first `first` accepted job of each type.
+0.5 (#4): an eval_mix spot check re-scores a few random documents of the golden (Policy.docs), not the whole golden,
+and its rows must match the donor's rows of those documents. An eval_mix result far better than the search predicted
+(check_state 'suspect'), or one the search adopts (server/batch.py adopt), is re-run in full on a verifier
+(trust_state); a suspect one earns nothing until that passes. A quarantine keeps only the eval_mix results a full
+re-run confirmed. A drawn job's verify_state is
 "pending" and a copy of it (same type, parameters and inputs; verify_of = the original) is queued for verifier
 workers only (our own hardware, flag `verifier`), never the original donor. When the copy is accepted, the type's
 compare() checks the donor's result against it (quant: proxy error per tensor; eval_mix: the per-position rows and
@@ -19,8 +24,8 @@ pass, and a drawn job its spot check's pass; the other types are verified by the
 Verifier workers earn nothing (our machines); timed-out or superseded leases earn nothing.
 
 0.3: quant jobs whose params say "verify": "score" are verified by score instead (server/score.py, docs/VERIFY.md):
-no replication spot checks; the scorer decides check_state (pass / fail / provisional), a provisional one is re-run
-once on a verifier as an anchor (verify_state untouched), a pass settles points (not for a duplicate of another
+no replication spot checks; the scorer decides check_state (pass / fail / provisional / suspect), a provisional or
+suspect one is re-run once on a verifier as an anchor (verify_state untouched), a pass settles points (not for a duplicate of another
 donor's codes), a fail quarantines. A quarantine leaves score-verified results alone: their quality is proven by
 their own codes, whoever made them."""
 import json, os, secrets, shutil, time
@@ -31,8 +36,12 @@ QUANT = ("quant_layer", "quant_head", "quant_tensor")
 
 
 class Policy:
-    def __init__(self, rate=0.04, first=1, tol=None):
+    """rate / first: the spot-check draw; rates: per-type rates instead of rate (eval_mix: --eval-spot-rate); docs: how
+    many documents an eval_mix spot check re-scores; data: the data root (an eval_mix spot check reads the golden's
+    document list; without it the whole job is re-run, as before 0.5)"""
+    def __init__(self, rate=0.04, first=1, tol=None, rates=None, docs=3, data=None):
         self.rate, self.first, self.tol = rate, first, tol or {}
+        self.rates, self.docs, self.data = rates or {}, docs, data
 
 
 def _draw(rate):
@@ -54,6 +63,7 @@ def settle(S, db, job_id):
     if w is None or w["verifier"] or w["quarantined"]: return 0
     if j["type"] in QUANT and j["check_state"] != "pass": return 0
     if j["verify_state"] not in (None, "pass"): return 0
+    if j["trust_state"] == "fail" or (j["check_state"] == "suspect" and j["trust_state"] != "pass"): return 0   # #4
     if j["check_state"] == "pass" and json.loads(j["check_detail"] or "{}").get("duplicate_of"): return 0
     if net_points(db, job_id, w["id"]) > 0: return 0
     m = jobs.get(j["type"]); p = json.loads(j["params"])
@@ -78,47 +88,91 @@ def after_accept(S, results, job_id, policy):
         if orig is None:
             w = worker(db, j["accepted_by"])
             m = jobs.get(j["type"])
-            if w is not None and not w["verifier"] and hasattr(m, "compare") and j["verify_state"] is None:
+            if w is not None and not w["verifier"] and j["check_state"] == "suspect" and j["trust_state"] is None:
+                enqueue_trusted(S, db, j, "suspect")          # #4: far better than predicted: a full re-run first
+            elif w is not None and not w["verifier"] and hasattr(m, "compare") and j["verify_state"] is None:
                 n_before = db.execute("SELECT COUNT(*) FROM jobs WHERE accepted_by=? AND type=? AND verify_of IS NULL AND "
                                       "(accepted_at<? OR (accepted_at=? AND id<?))",
                                       (w["id"], j["type"], j["accepted_at"], j["accepted_at"], job_id)).fetchone()[0]
-                if n_before < policy.first or _draw(policy.rate):
-                    enqueue_rerun(S, db, j, why="first" if n_before < policy.first else "drawn")
+                if n_before < policy.first or _draw(policy.rates.get(j["type"], policy.rate)):
+                    why = "first" if n_before < policy.first else "drawn"
+                    sp = spot_params(m, j, policy)
+                    enqueue_rerun(S, db, j, why=why, params=sp)
             settle(S, db, job_id)
             return None
     # a re-run came back: compare outside the transaction (reads result files)
     if orig["state"] != "accepted":
         with S.tx() as db:
             db.execute("UPDATE jobs SET verify_state=NULL WHERE id=? AND verify_state='pending'", (orig["id"],))
+            db.execute("UPDATE jobs SET trust_state=NULL WHERE id=? AND trust_state='pending'", (orig["id"],))
             S.event(db, "spot_moot", orig["id"], detail={"rerun": job_id, "orig_state": orig["state"]})
         return None
     return compare_and_record(S, results, orig, j, policy)
 
 
-def enqueue_rerun(S, db, j, why="drawn", mark=True):
-    """the same job for verifier workers only; mark: the original's verify_state becomes pending (spot checks; a
-    score-mode anchor leaves it alone, its scorer decides)"""
-    rid = S.enqueue(db, j["type"], j["version"], json.loads(j["params"]), json.loads(j["inputs"]), json.loads(j["requires"]),
+def spot_params(m, j, policy):
+    """an eval_mix spot check re-scores policy.docs random documents of the golden (#4); None = the whole job"""
+    if not (hasattr(m, "spot_params") and policy.data and policy.docs): return None
+    p = json.loads(j["params"])
+    try: meta = json.load(open(os.path.join(policy.data, m.gfile(p, "kld.json"))))
+    except (OSError, ValueError): return None
+    return m.spot_params(p, meta, policy.docs, secrets.SystemRandom())
+
+
+def enqueue_rerun(S, db, j, why="drawn", mark=True, params=None, state="verify_state"):
+    """the same job (or params: a part of it) for verifier workers only; mark: the original's `state` becomes pending
+    (verify_state: spot checks; trust_state: a full trusted re-run of an eval_mix result, #4; a score-mode anchor
+    leaves both alone, its scorer decides)"""
+    p = params or json.loads(j["params"])
+    req = json.loads(j["requires"])
+    if params is not None:
+        try: req = jobs.requirements(jobs.get(j["type"]), p)
+        except Exception: pass
+    rid = S.enqueue(db, j["type"], j["version"], p, json.loads(j["inputs"]), req,
                     j["input_bytes"], level=None, ukey=None, priority=j["priority"] + 10, max_attempts=j["max_attempts"],
                     needs="verifier", verify_of=j["id"], exclude_worker=j["accepted_by"])
-    if mark: db.execute("UPDATE jobs SET verify_state='pending', verify_detail=NULL WHERE id=?", (j["id"],))
-    S.event(db, "spot_draw", j["id"], j["accepted_by"], detail={"rerun": rid, "why": why})
+    if mark: db.execute(f"UPDATE jobs SET {state}='pending'{', verify_detail=NULL' if state == 'verify_state' else ''} WHERE id=?",
+                        (j["id"],))
+    S.event(db, "spot_draw" if state == "verify_state" else "trust_draw", j["id"], j["accepted_by"],
+            detail={"rerun": rid, "why": why, **({"docs": [d[0] for d in p["docs"]]} if "docs" in p else {})})
     return rid
+
+
+def enqueue_trusted(S, db, j, why):
+    """#4: a full re-run of an eval_mix result on a verifier (the search adopts it, or it is far better than
+    predicted); none if one is pending or passed, or a verifier made the result"""
+    w = worker(db, j["accepted_by"])
+    if j["state"] != "accepted" or j["trust_state"] in ("pending", "pass") or (w is not None and w["verifier"]): return None
+    return enqueue_rerun(S, db, j, why=why, state="trust_state")
 
 
 def compare_and_record(S, results, orig, rerun, policy):
     m = jobs.get(orig["type"])
+    pb = json.loads(rerun["params"])
+    # an eval_mix re-run of the whole job is the trusted re-run (#4, trust_state); one of a few documents a spot check
+    full_trust = orig["type"] == "eval_mix" and "docs" not in pb and orig["trust_state"] == "pending"
     try:
-        ok, detail = m.compare(json.loads(orig["params"]), os.path.join(results, str(orig["id"])),
-                               os.path.join(results, str(rerun["id"])), policy.tol.get(orig["type"]))
+        args = (json.loads(orig["params"]), os.path.join(results, str(orig["id"])), os.path.join(results, str(rerun["id"])),
+                policy.tol.get(orig["type"]))
+        ok, detail = m.compare(*args, pb=pb) if orig["type"] == "eval_mix" else m.compare(*args)
     except Exception as e:
         ok, detail = None, {"error": f"compare failed: {e!r}"[:500]}
     with S.tx() as db:
         st = "error" if ok is None else "pass" if ok else "fail"
-        db.execute("UPDATE jobs SET verify_state=?, verify_detail=? WHERE id=?", (st, json.dumps(detail, default=str)[:20000], orig["id"]))
-        S.event(db, f"spot_{st}", orig["id"], orig["accepted_by"], detail={"rerun": rerun["id"], **{k: v for k, v in detail.items() if k != "ratios"}})
+        if full_trust:
+            db.execute("UPDATE jobs SET trust_state=? WHERE id=?", (st, orig["id"]))
+            if orig["verify_state"] == "pending" and not db.execute(
+                    "SELECT 1 FROM jobs WHERE verify_of=? AND id<>? AND state IN ('queued','leased')", (orig["id"], rerun["id"])).fetchone():
+                db.execute("UPDATE jobs SET verify_state=?, verify_detail=? WHERE id=?", (st, json.dumps(detail, default=str)[:20000], orig["id"]))
+        else:
+            db.execute("UPDATE jobs SET verify_state=?, verify_detail=? WHERE id=?", (st, json.dumps(detail, default=str)[:20000], orig["id"]))
+        kind = "trust" if full_trust else "spot"
+        S.event(db, f"{kind}_{st}", orig["id"], orig["accepted_by"], detail={"rerun": rerun["id"], **{k: v for k, v in detail.items() if k != "ratios"}})
         if ok is False:
-            quarantine(S, db, results, orig["accepted_by"], f"spot check of job {orig['id']} failed (re-run {rerun['id']})")
+            w = worker(db, orig["accepted_by"])
+            quarantine(S, db, results, orig["accepted_by"], f"{'trusted re-run' if full_trust else 'spot check'} of job "
+                       f"{orig['id']} failed (re-run {rerun['id']}); donor {w['donor_id'] if w else '?'}: admin.py exclude-donor "
+                       "drops all its donations")
         else:
             settle(S, db, orig["id"])
     return st
@@ -135,8 +189,8 @@ def invalidate(S, db, results, j, why, exclude=None):
     if d and os.path.exists(d): os.replace(d, d + f".invalid-{int(time.time())}")
     db.execute("UPDATE scores SET state='void' WHERE job_id=? AND state<>'fail'", (j["id"],))     # no longer a reference
     db.execute("UPDATE jobs SET state='queued', attempts=0, accepted_lease=NULL, accepted_by=NULL, accepted_at=NULL, "
-               "result=NULL, files=NULL, check_state=NULL, check_detail=NULL, verify_state=NULL, exclude_worker=?, "
-               "error=?, requeued=?, updated=? WHERE id=?", (exclude, why[:2000], time.time(), time.time(), j["id"]))
+               "result=NULL, files=NULL, check_state=NULL, check_detail=NULL, verify_state=NULL, trust_state=NULL, "
+               "exclude_worker=?, error=?, requeued=?, updated=? WHERE id=?", (exclude, why[:2000], time.time(), time.time(), j["id"]))
     for r in db.execute("SELECT id FROM jobs WHERE verify_of=? AND state IN ('queued','leased')", (j["id"],)).fetchall():
         db.execute("UPDATE leases SET state='cancelled', ended=? WHERE job_id=? AND state='active'", (time.time(), r["id"]))
         db.execute("UPDATE jobs SET state='cancelled', lease_id=NULL, lease_owner=NULL, lease_expires=NULL WHERE id=?", (r["id"],))
@@ -155,9 +209,11 @@ def quarantine(S, db, results, wid, reason):
         db.execute("UPDATE jobs SET state='queued', lease_id=NULL, lease_owner=NULL, lease_expires=NULL, exclude_worker=?, "
                    "updated=? WHERE id=? AND lease_id=?", (wid, now, l["job_id"], l["id"]))
     n = 0
-    for j in db.execute("SELECT * FROM jobs WHERE accepted_by=? AND state='accepted' AND verify_of IS NULL AND "
-                        "(verify_state IS NULL OR verify_state<>'pass')", (wid,)).fetchall():
+    for j in db.execute("SELECT * FROM jobs WHERE accepted_by=? AND state='accepted' AND verify_of IS NULL", (wid,)).fetchall():
         if is_score(json.loads(j["params"])) and j["check_state"] == "pass": continue     # proven by its own codes
+        if j["type"] == "eval_mix":
+            if j["trust_state"] == "pass": continue             # re-run in full; a spot check of a few documents is not proof
+        elif j["verify_state"] == "pass": continue
         invalidate(S, db, results, j, f"donor {wid} quarantined: {reason}", exclude=wid); n += 1
     S.event(db, "quarantine", worker_id=wid, detail={"reason": reason[:300], "invalidated": n})
     return n

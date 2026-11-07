@@ -13,7 +13,15 @@ candidate against the base level's skeleton and the manifest (every piece must e
 (common/radfile.mix_size: exact) and with the model's parameter count the bpw that sets the job's card class, and
 enqueues one eval_mix job per candidate. A candidate identical to an existing job (same base, mix, act, golden, kv,
 length) reuses that job and its result. status() / collect() report per candidate: state, KL mean, spot-check state,
-and collect() copies each finished candidate's rows (radiance's FILE.rows layout) to OUT/<id>.rows."""
+and collect() copies each finished candidate's rows (radiance's FILE.rows layout) to OUT/<id>.rows.
+
+0.5 (#4): a candidate may carry "pred_kld" (the search's predicted mean KL for the mix) and the spec a "band"
+({"worse": x, "better": y}, inside eval_mix.PLAUSIBLE_LIMITS; default x3 / x0.5). The prediction stays on the server
+(jobs.pred, never sent to a worker): a result far worse is refused at completion, a far better one is accepted as
+suspect and re-run in full on a verifier. status() adds per candidate trust (confirmed / rerun-pending / spot-pending /
+spot-pass / unverified), suspect, adopted, pred_kld, and "invalidated" for a result that no longer stands; adopt()
+marks candidates the search acts on and queues a full trusted re-run of each: act on an adopted candidate only once its
+trust is "confirmed". collect() deletes the rows of candidates that are no longer accepted."""
 import json, os, re, shutil, time
 import jobs
 from jobs import eval_mix as E, golden_common as G
@@ -63,6 +71,8 @@ def submit(S, data, man, spec, cache=None):
     sk_rel = E.skeleton(base)
     if sk_rel not in man: raise BatchError(f"{sk_rel} not in the manifest (admin.py ladder-add, then manifest)")
     cache = {} if cache is None else cache
+    if spec.get("band") is not None and not isinstance(spec["band"], dict): raise BatchError("spec: band must be an object")
+    band = E.band_of(spec.get("band"))
     skp = os.path.join(data, sk_rel)
     skel = cache.get(skp) or R.Rad(skp, skeleton=True); cache[skp] = skel
     names = [e["name_s"] for e in skel.entries]
@@ -86,38 +96,86 @@ def submit(S, data, man, spec, cache=None):
         inputs = list(req) + sorted(set(rels.values()) - set(req))
         if f"goldens/{p['golden']}/gen.u8" in man: inputs.append(f"goldens/{p['golden']}/gen.u8")
         jobs.check_inputs("eval_mix", p, inputs)
-        todo.append((c["id"], p, inputs))
+        pred = c.get("pred_kld")
+        if pred is not None and not (isinstance(pred, (int, float)) and not isinstance(pred, bool) and 0 < pred < 100):
+            raise BatchError(f"candidate {c['id']}: pred_kld must be a number in (0, 100)")
+        todo.append((c["id"], p, inputs, None if pred is None else {"kld": float(pred), **band}))
     t = time.time(); out = {"new": 0, "reused": 0}
     with S.tx() as db:
         bid = db.execute("INSERT INTO batches(t, name, spec, n) VALUES(?,?,?,?)",
                          (t, str(spec.get("name", ""))[:64], json.dumps({k: v for k, v in spec.items() if k != "candidates"}), len(todo))).lastrowid
-        for cid, p, inputs in todo:
+        for cid, p, inputs, pred in todo:
             ukey = f"eval_mix/v{E.VERSION}:{stamp(p, 24)}"
             r = db.execute("SELECT id FROM jobs WHERE ukey=?", (ukey,)).fetchone()
-            if r: jid = r[0]; out["reused"] += 1
+            if r:
+                jid = r[0]; out["reused"] += 1
+                if pred:                                    # the first prediction stands; a job not checked yet takes one
+                    db.execute("UPDATE jobs SET pred=? WHERE id=? AND pred IS NULL AND state IN ('queued','leased')", (json.dumps(pred), jid))
             else:
                 jid = S.enqueue(db, "eval_mix", E.VERSION, p, inputs, jobs.requirements(E, p),
                                 sum(man[n]["size"] for n in inputs), level=f"batch-{bid}", ukey=ukey,
                                 priority=int(spec.get("priority", 0)))
+                if pred: db.execute("UPDATE jobs SET pred=? WHERE id=?", (json.dumps(pred), jid))
                 out["new"] += 1
-            db.execute("INSERT INTO batch_items VALUES(?,?,?)", (bid, cid, jid))
+            db.execute("INSERT INTO batch_items(batch_id, cand, job_id) VALUES(?,?,?)", (bid, cid, jid))
         S.event(db, "batch", detail={"batch": bid, **out})
     return {"batch": bid, "candidates": len(todo), **out}
+
+
+def trust(r, verifier):
+    """how far the search may rely on an accepted candidate's rows (#4): confirmed (a verifier ran it, or re-ran it in
+    full and it matched), rerun-pending (that full re-run is queued), spot-pending / spot-pass (a few of its documents
+    re-scored on a verifier), unverified (a donor's rows, plausible against the prediction or without one)"""
+    if verifier or r["trust_state"] == "pass": return "confirmed"
+    if r["trust_state"] == "pending": return "rerun-pending"
+    if r["verify_state"] in ("pending", "pass"): return f"spot-{r['verify_state']}"
+    return "unverified"
 
 
 def status(S, results, bid):
     b = S.q("SELECT * FROM batches WHERE id=?", (bid,))
     if not b: raise BatchError(f"no batch {bid}")
     items = []
-    for r in S.q("SELECT i.cand, j.* FROM batch_items i JOIN jobs j ON j.id=i.job_id WHERE i.batch_id=? ORDER BY i.rowid", (bid,)):
+    for r in S.q("SELECT i.cand, i.adopted, j.*, w.verifier AS by_verifier FROM batch_items i JOIN jobs j ON j.id=i.job_id "
+                 "LEFT JOIN workers w ON w.id=j.accepted_by WHERE i.batch_id=? ORDER BY i.rowid", (bid,)):
         it = {"id": r["cand"], "job": r["id"], "state": r["state"], "verify": r["verify_state"]}
+        pred = json.loads(r["pred"]) if r["pred"] else None
+        if pred: it["pred_kld"] = pred["kld"]
+        if r["adopted"]: it["adopted"] = r["adopted"]
         if r["state"] == "accepted":
             p = json.loads(r["params"]); res = json.loads(r["result"] or "{}")
-            it.update(kld_mean=res.get("kld_mean"), bytes=p["bytes"], bpw=round(E.bpw(p), 4), by=r["accepted_by"])
+            it.update(kld_mean=res.get("kld_mean"), bytes=p["bytes"], bpw=round(E.bpw(p), 4), by=r["accepted_by"],
+                      trust=trust(r, r["by_verifier"]), suspect=r["check_state"] == "suspect")
+        elif r["requeued"] and r["requeued"] > b[0]["t"]:
+            it["invalidated"] = r["requeued"]                # a result seen earlier no longer stands (collect drops its rows)
         items.append(it)
     n = {}
     for it in items: n[it["state"]] = n.get(it["state"], 0) + 1
-    return {"batch": bid, "name": b[0]["name"], "counts": n, "done": n.get("accepted", 0) == len(items), "items": items}
+    conf = sum(1 for it in items if it.get("trust") == "confirmed")
+    return {"batch": bid, "name": b[0]["name"], "counts": n, "done": n.get("accepted", 0) == len(items), "confirmed": conf,
+            "adopted_confirmed": all(it.get("trust") == "confirmed" for it in items if it.get("adopted")), "items": items}
+
+
+def adopt(S, bid, cands):
+    """the search adopts these candidates: each accepted one gets a full re-run on a verifier (#4); the result counts
+    for the search once its trust is confirmed (status). Refuses ids that are not accepted candidates of the batch."""
+    from server import verify as V
+    if not isinstance(cands, list) or not 1 <= len(cands) <= 1000 or not all(isinstance(c, str) for c in cands):
+        raise BatchError("adopt: candidates must be a list of 1..1000 ids")
+    out = {}
+    with S.tx() as db:
+        if not db.execute("SELECT 1 FROM batches WHERE id=?", (bid,)).fetchone(): raise BatchError(f"no batch {bid}")
+        rows = {r["cand"]: r for r in db.execute("SELECT i.cand, j.* FROM batch_items i JOIN jobs j ON j.id=i.job_id "
+                                                 "WHERE i.batch_id=?", (bid,)).fetchall()}
+        bad = [c for c in cands if c not in rows or rows[c]["state"] != "accepted"]
+        if bad: raise BatchError(f"adopt: not accepted candidates of batch {bid}: {bad[:10]}")
+        t = time.time()
+        for c in cands:
+            db.execute("UPDATE batch_items SET adopted=COALESCE(adopted, ?) WHERE batch_id=? AND cand=?", (t, bid, c))
+            rid = V.enqueue_trusted(S, db, rows[c], "adopt")
+            out[c] = {"job": rows[c]["id"], "rerun": rid}
+        S.event(db, "adopt", detail={"batch": bid, "n": len(cands), "reruns": sum(1 for v in out.values() if v["rerun"])})
+    return {"batch": bid, "adopted": out}
 
 
 def rows_path(results, job_id): return os.path.join(results, str(job_id), "rows.f32")
@@ -129,8 +187,10 @@ def collect(S, results, bid, out):
     os.makedirs(out, exist_ok=True)
     n = 0
     for it in st["items"]:
-        if it["state"] != "accepted": continue
         src, dst = rows_path(results, it["job"]), os.path.join(out, f"{it['id']}.rows")
+        if it["state"] != "accepted":
+            if os.path.exists(dst): os.remove(dst)          # collected before, invalidated since: stale
+            continue
         if os.path.exists(dst): os.remove(dst)
         try: os.link(src, dst)
         except OSError: shutil.copyfile(src, dst + ".part"); os.replace(dst + ".part", dst)

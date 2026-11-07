@@ -122,11 +122,63 @@ def compare_goldens(a, b, tol, sample=512):
     return ok, {"nll_mae": dn, "top1_agree": agree, "tol": tol}
 
 
-def compare_rows(a, b, tol):
+def doc_spans(meta, docs):
+    """[[document index, row0, rows]] of the given documents of a kld.json, sorted"""
+    out = []
+    for i in sorted(set(docs)):
+        d = meta["docs"][i]
+        out.append([i, d["row0"], d["tokens"] - 1 - d["score_from"]])
+    return out
+
+
+def spans_ok(meta, spans):
+    """the spans name documents of this kld.json exactly (index, first row, row count), sorted and unique"""
+    idx = [s[0] for s in spans]
+    if idx != sorted(set(idx)) or not spans: return False
+    return all(0 <= i < len(meta["docs"]) and [i, r0, n] == doc_spans(meta, [i])[0] for i, r0, n in spans)
+
+
+def sub_golden(src, dst, spans):
+    """a golden of just these documents ({file: path} -> dir dst), as radiance reads one: kld.json with the documents
+    renumbered (row0 contiguous, rows = their sum), tokens.i32 / top.bin / rows.f32 cut to them. Scoring a document
+    does not depend on the others, so its rows equal its rows in the whole golden (a spot check's few documents)."""
+    meta = json.load(open(src["kld.json"]))
+    if not spans_ok(meta, spans): raise ValueError("documents do not match the golden")
+    T = int(meta.get("top", 0)); w = 3 if "top" in meta else 2
+    tok0, t = [], 0
+    for d in meta["docs"]: tok0.append(t); t += d["tokens"]
+    os.makedirs(dst, exist_ok=True)
+    docs, r = [], 0
+    with open(src["tokens.i32"], "rb") as ft, open(src["top.bin"], "rb") as fp, open(src["rows.f32"], "rb") as fr, \
+            open(f"{dst}/tokens.i32", "wb") as gt, open(f"{dst}/top.bin", "wb") as gp, open(f"{dst}/rows.f32", "wb") as gr:
+        for i, r0, n in spans:
+            d = meta["docs"][i]
+            ft.seek(4 * tok0[i]); gt.write(ft.read(4 * d["tokens"]))
+            fp.seek(8 * T * r0); gp.write(fp.read(8 * T * n))
+            fr.seek(4 * w * r0); gr.write(fr.read(4 * w * n))
+            docs.append(dict(d, row0=r)); r += n
+    sub = {k: v for k, v in meta.items() if k not in ("docs", "rows", "corpus_fnv1a64")}
+    sub.update(docs=docs, rows=r, subset_of=[s[0] for s in spans])
+    with open(f"{dst}/kld.json", "w") as f: json.dump(sub, f)
+    return r
+
+
+def take_rows(A, spans, width=4):
+    """the rows of these spans from a flat [rows, width] array, in span order"""
+    out = array.array(A.typecode)
+    for _, r0, n in spans: out.extend(A[width * r0:width * (r0 + n)])
+    return out
+
+
+def compare_rows(a, b, tol, spans=None):
     """two [rows, 4] {kl, nll_q, nll_p, top1} score files of one candidate on one golden (a donor's, a trusted
     re-run's): nll_p identical (both copied from the golden), and per position |dKL| <= atol + rtol * max(KL) on at
-    least rows_frac of the rows, the mean KL within mean_rel, top-1 flips at most top1_flip"""
+    least rows_frac of the rows, the mean KL within mean_rel, top-1 flips at most top1_flip. spans: b scored only these
+    documents (a spot check): a's rows of them are compared, and also each document's mean KL (doc_mean_rel)"""
     A, B = f32(a), f32(b)
+    if spans is not None:
+        if len(A) % 4 or any(4 * (r0 + n) > len(A) for _, r0, n in spans): return False, {"error": "documents outside the donor's rows"}
+        A = take_rows(A, spans)
     if len(A) != len(B) or len(A) % 4: return False, {"error": f"row counts differ ({len(A) // 4} vs {len(B) // 4})"}
     n = len(A) // 4
     if A[2::4] != B[2::4]: return False, {"error": "reference NLL column differs (another golden?)"}
@@ -136,4 +188,12 @@ def compare_rows(a, b, tol):
     flips = sum(1 for x, y in zip(A[3::4], B[3::4]) if x != y) / n
     rel = abs(ma / mb - 1) if mb else float("inf")
     ok = bad <= (1 - tol["rows_frac"]) * n and rel <= tol["mean_rel"] and flips <= tol["top1_flip"]
-    return ok, {"rows": n, "rows_out_of_tol": bad, "mean_donor": ma, "mean_trusted": mb, "mean_rel": rel, "top1_flips": flips, "tol": tol}
+    det = {"rows": n, "rows_out_of_tol": bad, "mean_donor": ma, "mean_trusted": mb, "mean_rel": rel, "top1_flips": flips, "tol": tol}
+    if spans is not None:                                   # per document: the few documents a spot check re-ran
+        worst, o = 0.0, 0
+        for i, _, m in spans:
+            da, db_ = math.fsum(ka[o:o + m]) / m, math.fsum(kb[o:o + m]) / m; o += m
+            worst = max(worst, abs(da / db_ - 1) if db_ else (0.0 if da == 0 else math.inf))
+        det.update(docs=[x[0] for x in spans], doc_mean_rel=worst)
+        ok = ok and worst <= tol.get("doc_mean_rel", 5e-3)
+    return ok, det

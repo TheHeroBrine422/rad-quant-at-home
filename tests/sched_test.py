@@ -9,7 +9,10 @@ affinity inside a level but never across classes; a budgeted worker gets the lea
 filter (download = uncached inputs only, upload = the type's expected upload) and a randomized property check that no
 granted job exceeds the declared budget; the over-budget answer; the cache report protocol (full list, rev only,
 unknown rev after a server restart); the class-wait drain (a busy worker passing over an aged higher-class job is
-drained for it, not for a same-class one, not before the window); the expect field of a granted job."""
+drained for it, not for a same-class one, not before the window); the expect field of a granted job; /data only
+while a lease is live (#15); a lease's hard deadline (#7: renewals stop at it, the job is reissued, a late result
+still counts, abandon + lease again keeps the clock); a gang drain that timed out is not re-reserved by the same
+worker (#8); one copy of a best-of-N group per donor (#11)."""
 import argparse, json, os, random, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,14 +51,15 @@ def manifest(d, files):
     write_json_atomic(f"{d}/data/manifest.json", {"files": {n: {"sha256": sha(i), "size": s, "mtime": 0} for n, (i, s) in files.items()}})
 
 
-def noop(S, inputs=(), size=1000, prio=0, level=None, ram=0, cards=0, sizes=None):
+def noop(S, inputs=(), size=1000, prio=0, level=None, ram=0, cards=0, sizes=None, grp=None):
     p = {"seconds": 0, "size": size, "seed": 0}
     if inputs: p["inputs"] = list(inputs)
     if ram: p["ram_gb"] = ram
+    if cards: p["cards"] = cards
     m = jobs.get("noop")
     with S.tx() as db:
         return S.enqueue(db, "noop", m.VERSION, p, list(inputs), jobs.requirements(m, p), sum((sizes or {}).get(n, 0) for n in inputs),
-                         level=level, priority=prio)
+                         level=level, priority=prio, grp=grp)
 
 
 def caps(**kw):
@@ -122,6 +126,12 @@ def main():
     ok("admin queue: scheduling order listing", r.returncode == 0 and "by class" in r.stdout, r.stdout.strip().splitlines()[-1:])
     r = adm("reprioritize", "nomatch*", "--by-granularity")
     ok("reprioritize: a pattern that matches nothing is an error", r.returncode != 0)
+    r = adm("enqueue-level", "--model", "m", "--rev", "r", "--K", "3.5", "--codebook", "i8", "--level", "q-k3.5", "--copies", "2", "--head")
+    g = {}
+    for x in S.q("SELECT ukey, grp FROM jobs WHERE level='q-k3.5'"): g.setdefault(x["grp"], []).append(x["ukey"])
+    g0 = {x["grp"] for x in S.q("SELECT grp FROM jobs WHERE level='q-k3'")}
+    ok("enqueue-level --copies 2: the two copies of each unit share a group (q-k3.5:L00, :L01, :head); one copy: none (#11)",
+       sorted(g) == ["q-k3.5:L00", "q-k3.5:L01", "q-k3.5:head"] and all(len(v) == 2 for v in g.values()) and g0 == {None}, g)
 
     # ---------------------------------------------------------------- ordering
     d, a = setup("order")
@@ -278,6 +288,117 @@ def main():
     with S.tx() as db: db.execute("UPDATE jobs SET updated=? WHERE id=?", (time.time() - 1000, hi))
     r = Q.lease(w, dict(c, budget={"down": 100, "up": None}))
     ok("a job over the worker's budget never drains it (it could not run it anyway)", r.get("job") and r["job"]["id"] == lo)
+
+    # ---------------------------------------------------------------- #15: /data only while the lease is live
+    d, a = setup("mayread")
+    manifest(d, files)
+    Q = Queue(a); S = Q.store
+    j = noop(S, ["test/f1"], sizes=sizes); w = worker(S, "w10")
+    r = Q.lease(w, caps())
+    before = Q.may_read(w, "test/f1")
+    with S.tx() as db: db.execute("UPDATE leases SET expires=? WHERE job_id=?", (time.time() - 1, j))     # the reaper has not run yet
+    ok("may_read: an active lease past its expiry no longer opens its inputs (before the reaper marks it) (#15)",
+       r.get("job") and before and not Q.may_read(w, "test/f1") and not Q.may_read(w, "test/f2"))
+
+    # ---------------------------------------------------------------- #7: a lease's hard deadline
+    import hashlib, io
+    d, a = setup("deadline")
+    manifest(d, files)
+    Q = Queue(a); S = Q.store
+    j = noop(S, size=1000, sizes=sizes)
+    wa, wb = worker(S, "w11"), worker(S, "w12")
+    ra = Q.lease(wa, caps())
+    la = S.q("SELECT * FROM leases WHERE job_id=?", (j,))[0]
+    ok("a lease carries a deadline: max(2 h, 3 x the type's reference minutes) after it was issued (#7)",
+       ra.get("job") and abs(la["deadline"] - la["issued"] - 7200) < 1e-6 and ra["job"]["lease_deadline"] == la["deadline"]
+       and Q.lease_cap("noop", {"seconds": 3600, "size": 1, "seed": 0}) == 3 * 60 * 60.1)
+    with S.tx() as db: db.execute("UPDATE leases SET deadline=? WHERE id=?", (time.time() + 10, la["id"]))
+    hb = Q.heartbeat(wa, {"job_id": j, "lease_id": la["id"]})
+    ok("heartbeats renew a lease only up to its deadline", hb["ok"] and hb["lease_expires"] == hb["lease_deadline"] and
+       hb["lease_expires"] < time.time() + a.lease_s - 60, hb)
+    with S.tx() as db: db.execute("UPDATE leases SET deadline=? WHERE id=?", (time.time() - 1, la["id"]))
+    hb = Q.heartbeat(wa, {"job_id": j, "lease_id": la["id"]})
+    st = S.q("SELECT l.state ls, j.state js FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.id=?", (la["id"],))[0]
+    ok("past its deadline a heartbeating lease expires and the job is requeued; the worker is told it may still finish",
+       hb.get("ok") is False and hb.get("cancel") is False and hb.get("deadline") and tuple(st) == ("expired", "queued"), (hb, tuple(st)))
+    rb = Q.lease(wb, caps()); ra2 = Q.lease(wa, caps())
+    ok("the job is reissued to another worker (not to the one that held it: #5's exclusion)",
+       rb.get("job") and rb["job"]["id"] == j and not ra2.get("job"), (rb.get("job", {}).get("id"), ra2.get("job")))
+    body = jobs.get("noop").content(0, 1000)
+    Q.upload(wa, j, la["id"], "out.bin", 0, len(body), io.BytesIO(body))
+    rc = Q.complete(wa, {"job_id": j, "lease_id": la["id"], "files": {"out.bin": {"sha256": hashlib.sha256(body).hexdigest(), "size": 1000}}})
+    lb = S.q("SELECT state FROM leases WHERE id=?", (rb["job"]["lease_id"],))[0][0]
+    ok("a late result from the expired lease still counts while no other result is accepted (the late-result rule)",
+       rc.get("duplicate") is False and S.q("SELECT accepted_by FROM jobs WHERE id=?", (j,))[0][0] == wa["id"] and lb == "superseded", (rc, lb))
+    # abandon and lease again: the same clock
+    j2 = noop(S, size=10, sizes=sizes)
+    wc, wd = worker(S, "w13"), worker(S, "w14")
+    r1 = Q.lease(wc, caps()); l1 = S.q("SELECT * FROM leases WHERE id=?", (r1["job"]["lease_id"],))[0]
+    Q.fail(wc, {"job_id": j2, "lease_id": l1["id"], "abandon": True, "error": "x"})
+    time.sleep(0.01)
+    r2 = Q.lease(wc, caps()); l2 = S.q("SELECT * FROM leases WHERE id=?", (r2["job"]["lease_id"],))[0]
+    ok("abandon + lease again keeps the first lease's deadline (a worker's leases of one job share one clock)",
+       r2["job"]["id"] == j2 and abs(l2["deadline"] - (l1["issued"] + 7200)) < 1e-6 and l2["issued"] > l1["issued"])
+    Q.fail(wc, {"job_id": j2, "lease_id": l2["id"], "abandon": True, "error": "x"})
+    with S.tx() as db: db.execute("UPDATE leases SET issued=issued-7300 WHERE id=?", (l1["id"],))
+    r3, r4 = Q.lease(wc, caps()), Q.lease(wd, caps())
+    ok("... and once that clock has run out the worker is not offered the job again; another worker is",
+       not r3.get("job") and r4.get("job") and r4["job"]["id"] == j2 and
+       S.q("SELECT attempts FROM jobs WHERE id=?", (j2,))[0][0] == 1, (r3.get("job"), r4.get("job", {}).get("id")))
+    # the reaper: an idle lease whose expiry reached its deadline is logged as such
+    j3 = noop(S, size=10, sizes=sizes); we = worker(S, "w15"); r5 = Q.lease(we, caps())
+    with S.tx() as db: db.execute("UPDATE leases SET deadline=?, expires=? WHERE id=?", (time.time() - 1, time.time() - 1, r5["job"]["lease_id"]))
+    S.expire()
+    ev = S.q("SELECT detail FROM events WHERE kind='expire' AND lease_id=?", (r5["job"]["lease_id"],))
+    ok("the reaper expires a lease at its deadline (event: past its deadline)", ev and "deadline" in (ev[0][0] or "") and
+       S.q("SELECT state FROM jobs WHERE id=?", (j3,))[0][0] == "queued")
+
+    # ---------------------------------------------------------------- #8: a drain that never drains
+    d, a = setup("gang")
+    manifest(d, files)
+    Q = Queue(a); S = Q.store
+    g1, g2 = noop(S, cards=1, prio=50, sizes=sizes), noop(S, cards=1, prio=50, sizes=sizes)
+    wa, wb = worker(S, "w16"), worker(S, "w17")
+    cg = caps(gpu=True, cards=2, vram_gb=32, slots=2)
+    Q.lease(wa, cg); Q.lease(wb, cg)                        # each holds one of its two cards
+    gang = noop(S, cards=2, prio=40, sizes=sizes)
+    r1 = Q.lease(wa, cg)
+    with S.tx() as db: db.execute("UPDATE reservations SET t=t-?", (a.reserve_max_s + 1,))
+    r2 = Q.lease(wa, cg)                                     # expire() drops the stale drain first
+    r3 = Q.lease(wb, cg)
+    res = S.q("SELECT job_id, worker_id FROM reservations")
+    ok("a worker whose gang drain timed out without draining cannot reserve the job again; another busy multi-card worker "
+       "can (#8)", r1.get("draining") == gang and not r2.get("draining") and r2.get("job") is None and r3.get("draining") == gang
+       and [tuple(x) for x in res] == [(gang, wb["id"])], (r1.get("draining"), r2, r3.get("draining")))
+    with S.tx() as db:                                      # wa's own job ends: it is idle with two free cards
+        db.execute("UPDATE leases SET state='done' WHERE job_id=?", (g1,)); db.execute("UPDATE jobs SET state='accepted' WHERE id=?", (g1,))
+    r4 = Q.lease(wa, cg)
+    ok("... while an idle worker with the cards free still takes it at once", r4.get("job") and r4["job"]["id"] == gang,
+       r4.get("job", {}).get("id"))
+
+    # ---------------------------------------------------------------- #11: one copy of a best-of-N group per donor
+    d, a = setup("copies")
+    manifest(d, files)
+    Q = Queue(a); S = Q.store
+    c1, c2, c3 = (noop(S, size=10, sizes=sizes, grp="lv:L00") for _ in range(3))
+    other = noop(S, size=10, sizes=sizes, grp="lv:L01")
+    wa = worker(S, "w18")
+    wa2 = S.auth(S.add_worker("w18b", donor_id=wa["donor_id"])[1])          # another token of the same donor
+    wb, wv = worker(S, "w19"), worker(S, "w20")
+    with S.tx() as db: db.execute("UPDATE workers SET verifier=1 WHERE id=?", (wv["id"],))
+    got_a = drain_order(Q, wa, caps(), 5)
+    got_a2 = drain_order(Q, wa2, caps(), 5)
+    got_b = drain_order(Q, wb, caps(), 5)
+    got_v = drain_order(Q, wv, caps(), 5)
+    ok("#11: a donor is leased one copy of a group (not a sibling token either); another donor gets the next copy; our "
+       "verifiers are not limited", got_a == [c1, other] and got_a2 == [] and got_b == [c2] and got_v == [c3], (got_a, got_a2, got_b, got_v))
+    with S.tx() as db:                                      # wa delivers its copy; c2 is handed back
+        db.execute("UPDATE leases SET state='done' WHERE job_id=?", (c1,))
+        db.execute("UPDATE jobs SET state='accepted', accepted_lease=(SELECT id FROM leases WHERE job_id=?) WHERE id=?", (c1, c1))
+    l2 = S.q("SELECT id FROM leases WHERE job_id=? AND state='active'", (c2,))[0][0]
+    Q.fail(wb, {"job_id": c2, "lease_id": l2, "abandon": True, "error": "x"})
+    ok("... and after delivering one, still not another copy of that group", drain_order(Q, wa2, caps(), 3) == [] and
+       drain_order(Q, worker(S, "w21"), caps(), 3) == [c2])
 
     n = sum(1 for _, p in RESULTS if p)
     print(f"\n{n}/{len(RESULTS)} checks passed")

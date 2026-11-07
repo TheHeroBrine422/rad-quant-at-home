@@ -12,15 +12,19 @@ container's sha256 and size, image, GPU, timings).
 
 Server-side check at completion (stdlib, < 1 s per 1M rows): the nll_p column equals the golden's own NLL column bit
 for bit (right golden, every row scored, rows in order), every KL finite and >= 0 (to rounding), top1 in {0, 1}, and
-the report's mean equal to the rows' mean. Spot checks (server/verify.py) re-run the candidate on a trusted worker and
-compare position by position (compare_rows); the container sha256 must be identical (assembly is deterministic)."""
+the report's mean equal to the rows' mean, and the result's kld_mean / container sha256 equal to the files'. 0.5 (#4):
+the mean is checked against the search's predicted KL for the mix (plausible(): far worse is refused, far better is
+suspect); spot checks (server/verify.py) re-score a few random documents of the golden on a trusted worker (params
+docs / sub_rows: the worker cuts a golden of just those documents, sub_golden) and compare position by position and
+per document (compare_rows); a candidate the search adopts, or a suspect one, is re-run in full. The container sha256
+must be identical (assembly is deterministic)."""
 import json, math, os, re, time
 from common import radfile as R
 from common.util import write_json_atomic
 from . import golden_common as G
 from .quant_common import ID
 
-NAME, VERSION, IMPLEMENTED = "eval_mix", 1, True
+NAME, VERSION, IMPLEMENTED = "eval_mix", 2, True     # v2 (0.5): docs / sub_rows (spot checks of a few documents)
 PAIR = {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "string", "pattern": R.WEIGHT_RE.pattern}}
 SCHEMA = {"type": "object", "required": ["model", "revision", "base", "mix", "golden", "kv", "max_model_len", "bytes",
                                          "n_params", "rows"], "properties": {
@@ -32,8 +36,18 @@ SCHEMA = {"type": "object", "required": ["model", "revision", "base", "mix", "go
     "max_model_len": {"type": "integer", "minimum": 256, "maximum": 262144},
     "bytes": {"type": "integer", "minimum": 1, "maximum": 1 << 42, "description": "the assembled container's size"},
     "n_params": {"type": "integer", "minimum": 1, "maximum": 1 << 42, "description": "the model's parameter count (bpw)"},
-    "rows": {"type": "integer", "minimum": 1, "maximum": 50_000_000, "description": "the golden's scored positions"}}}
-TOL = {"row_atol": 1e-3, "row_rtol": 0.05, "rows_frac": 0.995, "mean_rel": 2e-3, "top1_flip": 0.01}
+    "rows": {"type": "integer", "minimum": 1, "maximum": 50_000_000, "description": "the golden's scored positions"},
+    "docs": {"type": "array", "minItems": 1, "maxItems": 64, "description": "a spot check: score only these documents "
+             "[index, row0, rows] of the golden (trusted workers only)", "items": {
+                 "type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "integer", "minimum": 0}}},
+    "sub_rows": {"type": "integer", "minimum": 1, "maximum": 50_000_000, "description": "with docs: their rows"}}}
+TOL = {"row_atol": 1e-3, "row_rtol": 0.05, "rows_frac": 0.995, "mean_rel": 2e-3, "top1_flip": 0.01, "doc_mean_rel": 5e-3}
+# plausibility vs the search's prediction (#4): a mean KL above worse x pred + abs is refused at completion (an honest
+# surprise of the knapsack stays far inside x3), one below better x pred is accepted but suspect (the search hopes to
+# beat its prediction, by a few to ~20 %, not by half) and re-run in full on a trusted worker before it counts. A batch
+# may narrow or widen the band only inside these limits
+PLAUSIBLE = {"worse": 3.0, "better": 0.5, "abs": 1e-3}
+PLAUSIBLE_LIMITS = {"worse": (1.5, 10.0), "better": (0.1, 0.9)}
 HEADROOM_MIB = 8192
 
 
@@ -47,9 +61,18 @@ def check_extra(p):
     if [w for w, _ in acts] != sorted({w for w, _ in acts}): raise ValueError("act: weights must be sorted and unique")
     for w, m in acts:
         if not R.act_ok(m): raise ValueError(f"act: {w}: {m!r} is not f16, a8t or a8g<N>")
+    if ("docs" in p) != ("sub_rows" in p): raise ValueError("docs and sub_rows go together")
+    if "docs" in p:
+        idx = [d[0] for d in p["docs"]]
+        if idx != sorted(set(idx)): raise ValueError("docs: sorted and unique")
+        if sum(d[2] for d in p["docs"]) != p["sub_rows"] or any(d[1] + d[2] > p["rows"] or d[2] < 1 for d in p["docs"]):
+            raise ValueError("docs: rows do not add up")
 
 
 def bpw(p): return p["bytes"] * 8 / p["n_params"]
+
+
+def n_rows(p): return p.get("sub_rows", p["rows"])
 
 
 def requires(p, info=None):
@@ -61,7 +84,7 @@ def requires(p, info=None):
     return {"gpu": True, "cards": 2, "vram_gb": 32, "ram_gb": 32}
 
 
-def lumens(p): return round(max(0.5, p["rows"] / 40_000) * requires(p)["cards"], 3)   # ~2.5 min per 100k positions
+def lumens(p): return round(max(0.5, n_rows(p) / 40_000) * requires(p)["cards"], 3)   # ~2.5 min per 100k positions
 
 
 def root(p): return f"models/{p['model']}@{p['revision']}/rad"
@@ -76,9 +99,9 @@ def inputs(p):
     return req, opt
 
 
-def outputs(p): return {"rows.f32": 16 * p["rows"], "kld.json": 4 << 20, "job.json": 64 << 10}
+def outputs(p): return {"rows.f32": 16 * n_rows(p), "kld.json": 4 << 20, "job.json": 64 << 10}
 def required_outputs(p): return {"rows.f32", "kld.json", "job.json"}
-def upload_bytes(p, sizes): return 16 * p["rows"] + (256 << 10)
+def upload_bytes(p, sizes): return 16 * n_rows(p) + (256 << 10)
 
 
 def run(p, ctx):
@@ -101,10 +124,14 @@ def run(p, ctx):
         info = R.assemble(model, ctx.input(skeleton(p)), paths, dict(p.get("act", [])), clone=True)
         if info["bytes"] != p["bytes"]: raise RuntimeError(f"assembled {info['bytes']} bytes, the job says {p['bytes']}")
         t1 = time.time()
-        # 2. the golden, staged under radiance's file names
+        # 2. the golden, staged under radiance's file names (a spot check: only its documents, cut out)
         gd = os.path.join(ctx.stage_dir, "golden"); os.makedirs(gd)
-        for f in G.GOLDEN_FILES + ("gen.u8",):
-            if gfile(p, f) in ctx.input_names: os.symlink(ctx.input(gfile(p, f)), os.path.join(gd, f))
+        if "docs" in p:
+            if G.sub_golden({f: ctx.input(gfile(p, f)) for f in G.GOLDEN_FILES}, gd, p["docs"]) != p["sub_rows"]:
+                raise RuntimeError("the documents' rows differ from the job's sub_rows")
+        else:
+            for f in G.GOLDEN_FILES + ("gen.u8",):
+                if gfile(p, f) in ctx.input_names: os.symlink(ctx.input(gfile(p, f)), os.path.join(gd, f))
         # 3. radiance --kld-ref (argv from validated values only; no shell)
         rep = os.path.join(ctx.out_dir, "kld.json")
         argv = [ctx.cfg.radiance, "--model", model, "--tp", str(len(ctx.devices) or 1), "--kv-cache-dtype", p["kv"],
@@ -128,29 +155,66 @@ def run(p, ctx):
 
 
 def accept(p, files, result, data_path):
-    if os.path.getsize(files["rows.f32"]) != 16 * p["rows"]: raise ValueError("rows.f32: wrong size")
+    """the checks at completion; returns {"kld_mean"} (the rows' mean) for the plausibility check"""
+    n = n_rows(p)
+    if os.path.getsize(files["rows.f32"]) != 16 * n: raise ValueError("rows.f32: wrong size")
     A = G.f32(files["rows.f32"])
     gm = json.load(open(data_path(gfile(p, "kld.json"))))
     g = G.f32(data_path(gfile(p, "rows.f32")))
     w = 3 if "top" in gm else 2
     if len(g) != w * p["rows"]: raise ValueError("golden size differs from the job's rows")
+    if "docs" in p:
+        if not G.spans_ok(gm, p["docs"]): raise ValueError("docs do not match the golden")
+        g = G.take_rows(g, p["docs"], w)
     if A[2::4] != g[0::w]: raise ValueError("nll_p column is not the golden's: another golden, missing or reordered rows")
     kl, nq, t1 = A[0::4], A[1::4], A[3::4]
     if not all(math.isfinite(x) and x >= -1e-4 for x in kl): raise ValueError("a KL is negative or not finite")
     if not all(math.isfinite(x) for x in nq): raise ValueError("an nll_q is not finite")
     if any(x not in (0.0, 1.0) for x in t1): raise ValueError("top1 not in {0, 1}")
     rep = json.load(open(files["kld.json"]))
-    mean = math.fsum(kl) / p["rows"]
+    mean = math.fsum(kl) / n
     rm = rep["all"]["kld"]["mean"]
-    if rep["all"]["positions"] != p["rows"] or abs(rm - mean) > 1e-5 * max(abs(mean), 1e-6) + 1e-9:
+    close = lambda x: isinstance(x, (int, float)) and abs(x - mean) <= 1e-5 * max(abs(mean), 1e-6) + 1e-9
+    if rep["all"]["positions"] != n or not close(rm):
         raise ValueError(f"report (mean {rm}, {rep['all']['positions']} positions) does not match the rows ({mean})")
     meta = json.load(open(files["job.json"]))
     if meta.get("bytes") != p["bytes"] or not re.fullmatch("[0-9a-f]{64}", str(meta.get("container_sha256"))):
         raise ValueError("job.json: container size / sha256 missing or wrong")
+    # what the search reads (batch status): the result's own numbers must be the files' (#4)
+    if not close(result.get("kld_mean")) or result.get("container_sha256") != meta["container_sha256"]:
+        raise ValueError("result: kld_mean / container_sha256 differ from the rows / job.json")
+    return {"kld_mean": mean}
 
 
-def compare(p, a, b, tol=None):
+def plausible(pred, info):
+    """(verdict, detail) of a result's mean KL against the search's prediction for the mix (#4): reject (far worse:
+    refused), suspect (far better: accepted, re-run in full on a trusted worker before it counts) or pass"""
+    band = {k: pred.get(k, v) for k, v in PLAUSIBLE.items()}
+    kld, want = info["kld_mean"], pred["kld"]
+    det = {"pred_kld": want, "kld_mean": kld, "ratio": kld / want if want > 0 else None, "band": band}
+    if kld > band["worse"] * want + band["abs"]: return "reject", det
+    if kld < band["better"] * want: return "suspect", det
+    return "pass", det
+
+
+def band_of(spec_band):
+    """a batch's band override, kept inside PLAUSIBLE_LIMITS"""
+    out = {}
+    for k, (lo, hi) in PLAUSIBLE_LIMITS.items():
+        if spec_band and k in spec_band: out[k] = min(hi, max(lo, float(spec_band[k])))
+    return out
+
+
+def spot_params(p, meta, k, rng):
+    """the params of a spot check that re-scores k random documents of the golden (kld.json meta)"""
+    spans = G.doc_spans(meta, rng.sample(range(len(meta["docs"])), min(k, len(meta["docs"]))))
+    return dict(p, docs=spans, sub_rows=sum(s[2] for s in spans))
+
+
+def compare(p, a, b, tol=None, pb=None):
+    """a donor's result dir a against a trusted re-run's b (pb: its params; with docs, a spot check of those
+    documents: the donor's rows of them, row by row and per document)"""
     t = dict(TOL, **(tol or {}))
     sa, sb = (json.load(open(os.path.join(d, "job.json"))).get("container_sha256") for d in (a, b))
     if sa != sb: return False, {"error": "assembled containers differ", "donor": sa, "trusted": sb}
-    return G.compare_rows(os.path.join(a, "rows.f32"), os.path.join(b, "rows.f32"), t)
+    return G.compare_rows(os.path.join(a, "rows.f32"), os.path.join(b, "rows.f32"), t, (pb or {}).get("docs"))

@@ -18,11 +18,20 @@ leaderboard = opt-in to the public status page, hidden = the operator took the n
 a worker registered with a personal invite (invites.personal) joins the donor of the invite's first registration.
 
 0.3 (server/score.py, docs/VERIFY.md): scores (one row per scored tensor of a score-mode quant result: series, key, K,
-rel, codes sha256, kind donor | trusted | published, state pass | fail | provisional | void), score_den (tr(W H W^T)
+rel, codes sha256, kind donor | trusted | published, state pass | fail | provisional | suspect | void), score_den (tr(W H W^T)
 per tensor, computed once).
 
 0.4: jobs.requeued (the last admin requeue / invalidate: a worker's failed, rejected or expired leases before it no
-longer exclude it, #5)."""
+longer exclude it, #5).
+
+0.5: leases.deadline (#7: heartbeats renew a lease only up to it; then it expires like a missed heartbeat);
+reserve_lapsed (#8: a gang / class-wait reservation that timed out without the worker draining; that worker may not
+reserve the job again for one more reserve_max_s); jobs.grp (#11: the copies of one best-of-N job share it; a donor
+holds at most one of them), scores.tiles (#11: fingerprints of sampled trellis tiles, for near-duplicate codes),
+meta (server-local secrets, e.g. which tiles are sampled). #4 (eval_mix): jobs.pred (the search's predicted KL and
+plausibility band; server side only, never sent to a worker), jobs.trust_state (a full re-run on a verifier: NULL,
+pending, pass, fail, error; jobs.verify_state is the spot check of a few documents), batch_items.adopted (when the
+search adopted the candidate)."""
 import hashlib, json, os, secrets, sqlite3, threading, time
 
 SCHEMA = """
@@ -47,6 +56,7 @@ CREATE TABLE IF NOT EXISTS points(id INTEGER PRIMARY KEY, t REAL, worker_id INTE
   lumens REAL NOT NULL, kind TEXT NOT NULL, note TEXT);
 CREATE INDEX IF NOT EXISTS points_worker ON points(worker_id);
 CREATE TABLE IF NOT EXISTS reservations(job_id INTEGER PRIMARY KEY, worker_id INTEGER NOT NULL, t REAL);
+CREATE TABLE IF NOT EXISTS reserve_lapsed(job_id INTEGER NOT NULL, worker_id INTEGER NOT NULL, t REAL, PRIMARY KEY(job_id, worker_id));
 CREATE TABLE IF NOT EXISTS batches(id INTEGER PRIMARY KEY, t REAL, name TEXT, spec TEXT, n INTEGER);
 CREATE TABLE IF NOT EXISTS batch_items(batch_id INTEGER NOT NULL, cand TEXT NOT NULL, job_id INTEGER NOT NULL,
   PRIMARY KEY(batch_id, cand));
@@ -59,6 +69,7 @@ CREATE INDEX IF NOT EXISTS scores_tk ON scores(series, key, state);
 CREATE INDEX IF NOT EXISTS scores_sha ON scores(codes_sha);
 CREATE INDEX IF NOT EXISTS scores_job ON scores(job_id);
 CREATE TABLE IF NOT EXISTS score_den(model TEXT NOT NULL, key TEXT NOT NULL, den REAL NOT NULL, PRIMARY KEY(model, key));
+CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 # columns added after v0: (table, column, declaration); added to an existing database on open
 MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "verifier", "INTEGER NOT NULL DEFAULT 0"),
@@ -66,7 +77,8 @@ MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "ve
            ("jobs", "needs", "TEXT"), ("jobs", "verify_of", "INTEGER"), ("jobs", "verify_state", "TEXT"),
            ("jobs", "verify_detail", "TEXT"), ("jobs", "exclude_worker", "INTEGER"),
            ("workers", "donor_id", "INTEGER"), ("invites", "personal", "INTEGER NOT NULL DEFAULT 0"), ("invites", "donor_id", "INTEGER"),
-           ("jobs", "requeued", "REAL")]
+           ("jobs", "requeued", "REAL"), ("leases", "deadline", "REAL"), ("jobs", "grp", "TEXT"), ("scores", "tiles", "BLOB"),
+           ("jobs", "pred", "TEXT"), ("jobs", "trust_state", "TEXT"), ("batch_items", "adopted", "REAL")]
 
 
 def h(s): return hashlib.sha256(s.encode()).hexdigest()
@@ -103,6 +115,14 @@ class Store:
                 try: store.db.execute("COMMIT" if et is None else "ROLLBACK")
                 finally: store.lock.release()
         return T()
+
+    def secret(self, name):
+        """a random value made once per queue database (meta table) and never shown to anyone"""
+        with self.tx() as db:
+            r = db.execute("SELECT v FROM meta WHERE k=?", (name,)).fetchone()
+            if r: return r[0]
+            v = secrets.token_hex(32); db.execute("INSERT INTO meta(k, v) VALUES(?,?)", (name, v))
+        return v
 
     def q(self, sql, args=()):
         with self.lock: return self.db.execute(sql, args).fetchall()
@@ -149,15 +169,15 @@ class Store:
 
     # ------------------------------------------------------------ jobs
     def enqueue(self, db, jtype, version, params, inputs, requires, input_bytes, level=None, ukey=None, priority=0,
-                max_attempts=5, needs=None, verify_of=None, exclude_worker=None):
+                max_attempts=5, needs=None, verify_of=None, exclude_worker=None, grp=None):
         if ukey and db.execute("SELECT 1 FROM jobs WHERE ukey=?", (ukey,)).fetchone(): return None
         t = time.time()
         if needs is None and requires.get("trusted"): needs = "trusted"
         cur = db.execute("INSERT INTO jobs(type, version, params, inputs, requires, input_bytes, state, priority, "
-                         "max_attempts, level, ukey, created, updated, needs, verify_of, exclude_worker) "
-                         "VALUES(?,?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?)",
+                         "max_attempts, level, ukey, created, updated, needs, verify_of, exclude_worker, grp) "
+                         "VALUES(?,?,?,?,?,?,'queued',?,?,?,?,?,?,?,?,?,?)",
                          (jtype, version, json.dumps(params, sort_keys=True), json.dumps(inputs), json.dumps(requires),
-                          input_bytes, priority, max_attempts, level, ukey, t, t, needs, verify_of, exclude_worker))
+                          input_bytes, priority, max_attempts, level, ukey, t, t, needs, verify_of, exclude_worker, grp))
         self.event(db, "enqueue", job_id=cur.lastrowid)
         return cur.lastrowid
 
@@ -170,16 +190,28 @@ class Store:
                        "worker_id IN (SELECT id FROM workers WHERE last_seen < ? OR quarantined=1 OR disabled=1)",
                        (now - getattr(self, "reserve_idle_s", 300),))
             if getattr(self, "reserve_max_s", None):
+                # a drain that never freed the cards: that worker may not reserve the job again for another
+                # reserve_max_s, so another busy multi-card worker gets its turn (#8)
+                db.execute("INSERT OR REPLACE INTO reserve_lapsed SELECT job_id, worker_id, ? FROM reservations WHERE t < ?",
+                           (now, now - self.reserve_max_s))
                 db.execute("DELETE FROM reservations WHERE t < ?", (now - self.reserve_max_s,))
+                db.execute("DELETE FROM reserve_lapsed WHERE t < ? OR job_id NOT IN (SELECT id FROM jobs WHERE state='queued')",
+                           (now - self.reserve_max_s,))
             for l in db.execute("SELECT * FROM leases WHERE state='active' AND expires<?", (now,)).fetchall():
-                db.execute("UPDATE leases SET state='expired', ended=? WHERE id=?", (now, l["id"]))
-                j = db.execute("SELECT * FROM jobs WHERE id=?", (l["job_id"],)).fetchone()
-                if j and j["state"] == "leased" and j["lease_id"] == l["id"]:
-                    st = "failed" if j["attempts"] >= j["max_attempts"] else "queued"
-                    db.execute("UPDATE jobs SET state=?, lease_id=NULL, lease_owner=NULL, lease_expires=NULL, updated=?, "
-                               "error=COALESCE(error, '') || ? WHERE id=?", (st, now, f"[lease {l['id'][:8]} expired]", j["id"]))
-                self.event(db, "expire", l["job_id"], l["worker_id"], l["id"]); n += 1
+                past = l["deadline"] is not None and l["expires"] >= l["deadline"]
+                self.expire_lease(db, l, now, why="past its deadline" if past else "expired"); n += 1
         return n
+
+    def expire_lease(self, db, l, now, why="expired"):
+        """lease l ends as expired; its job goes back to the queue (or fails: no attempts left). The worker may still
+        finish it: a late result counts while the job is open (Queue.complete)"""
+        db.execute("UPDATE leases SET state='expired', ended=? WHERE id=?", (now, l["id"]))
+        j = db.execute("SELECT * FROM jobs WHERE id=?", (l["job_id"],)).fetchone()
+        if j and j["state"] == "leased" and j["lease_id"] == l["id"]:
+            st = "failed" if j["attempts"] >= j["max_attempts"] else "queued"
+            db.execute("UPDATE jobs SET state=?, lease_id=NULL, lease_owner=NULL, lease_expires=NULL, updated=?, "
+                       "error=COALESCE(error, '') || ? WHERE id=?", (st, now, f"[lease {l['id'][:8]} {why}]", j["id"]))
+        self.event(db, "expire", l["job_id"], l["worker_id"], l["id"], None if why == "expired" else {"why": why})
 
     def end_lease(self, db, lease, state, job_state=None, error=None, count_attempt=True):
         now = time.time()

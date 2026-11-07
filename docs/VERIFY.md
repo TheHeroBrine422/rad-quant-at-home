@@ -45,12 +45,18 @@ from the codes, and finding codes with low error is exactly the work being donat
 3. **Error**: the exact decode and `rel` per tensor (above). `tr(W H Wᵀ)` is the same for every result of a tensor
    and is computed once (`score_den`).
 4. **Band**: `log rel ≤ log center + tol` for every tensor (next section).
-5. **Replay / duplicates**: the sha256 of each tensor's code material (trellis + suh + svh) is stored. Codes equal to
-   a released model's (imported with `score-import --published`) fail. Codes equal to another donor's earlier result
-   for the same tensor pass (they are a valid result) but earn nothing: the first submission of given codes earns.
+5. **Replay / duplicates**: the sha256 of each tensor's code material (trellis + suh + svh) is stored, and (0.5, #11)
+   fingerprints of 256 of its 16 × 16 trellis tiles (4 bytes each), sampled at positions drawn from a secret of the
+   queue database. Codes equal to a released model's (imported with `score-import --published`), or sharing at least
+   half of the sampled tiles with them, fail. The same against another donor's earlier result for the same tensor
+   and K (or the donor's own other copy): they pass (they are a valid result) but earn nothing: the first submission
+   of given codes earns. Honest copies use another `seed_offset`, so other sign vectors and other codes in every
+   tile; dodging the check means changing words in more than half the tiles, and 1 % of the words already costs
+   ×1.1–4 in rel (out of the band). The scheduler also leases each donor at most one copy of a job (`jobs.grp`).
 
-Verdicts: every tensor in its band → **pass** (points granted, a reference for later jobs). Any tensor out of its band
-or a structure / format error → **fail**: the donor is quarantined as before, its accepted results that nothing
+Verdicts: every tensor in its band → **pass** (points granted, a reference for later jobs). A tensor in the trusted
+band but out of the all-rows band, with no trusted row at its K → **suspect** (next section; an anchor decides). Any
+tensor out of its band or a structure / format error → **fail**: the donor is quarantined as before, its accepted results that nothing
 confirmed are requeued, but **its score-verified results stand** (their quality is proven by their own codes). No
 reference yet for some tensor → **provisional** (next sections).
 
@@ -62,7 +68,7 @@ The center comes from earlier **passed** rows of the same tensor in the same ser
 
 | basis | when | center | tol (log), + the noise term |
 |---|---|---|---|
-| repeat | rows at the same K (honest repeats, best-of-N copies, the anchor) | their minimum | 0.02 |
+| repeat | rows at the same K (honest repeats, best-of-N copies, the anchor) | trusted rows: their minimum; all passed rows: their upper median | 0.02 |
 | interp | rows below and above K | linear in log rel between the nearest K on each side | 0.04 (k/v: 0.08) |
 | extrap | rows on one side only | the nearest, moved along the codebook's slope: −d log rel / dK = 1.37 | 0.04 + 0.03 · \|ΔK\| (k/v: 0.08 + 0.12 · \|ΔK\|) |
 
@@ -71,8 +77,17 @@ plus a **noise term** `4 · NOISE / √n` for a tensor of n = in × out weights:
 (q/k/v_proj, in_proj_qkv, in_proj_z: lighter damping, noisier) and 8 for the rest. At the 27B that adds 0.3 % (mlp)
 to 5 % (k_proj, v_proj: 5 M weights);
 on a 0.8B proxy up to 9 %. When trusted rows exist (our verifiers' re-runs, or our own results imported with
-`score-import`), a second bound is computed from them alone and both must hold. That way a chain of donor results,
-each a little worse than the previous, cannot drag the curve.
+`score-import`), a second bound is computed from them alone. That way a chain of donor results, each a little worse
+than the previous, cannot drag the curve.
+
+**The trusted bound is the authority (0.5, #12).** A result that fails it fails. A result that passes it but fails the
+all-rows bound is not failed: with trusted rows at its own K (repeat basis) it passes, otherwise it is **suspect**
+(accepted, no points yet, not a reference) and the job is re-run once on a verifier; that anchor at the same K then
+decides it. Without trusted rows the all-rows bound decides alone. The all-rows bound is centred on the **upper median**
+of the passed rows at a K, not their minimum: one result a few percent better than the honest quantizer (more search
+effort, another quantizer) is allowed, and it must not turn every honest repeat after it into a fail and quarantine
+their donors. A result more than the repeat tolerance below our own trusted center passes and writes a
+`score_outlier` event for the operator (better than our quantizer: worth a look, not a punishment).
 
 **Why these numbers** (`tools/curve_loo.py`, `tools/seed_spread.py`; TESTS.md section 10):
 
@@ -118,9 +133,10 @@ are not re-checked.
 | lazy, cheaper quant | fewer bits of search (e.g. a lower-K trellis inside the K container, a constrained search), no Hessian / LDLQ | rel above the band: a lower K costs +17 % per 1/8 bit, ignoring the Hessian costs more | real 0.8B: K2 quality re-encoded as K3 codes; K3 with the Hessian damped away |
 | wrong K | codes of a lower K, declared as K | the trellis shape (16K words per tile): structure error; padded to the right shape: garbage decode | K2 shard as K3; K2 codes padded to K3 |
 | wrong format | another codebook (mul1 instead of i8), wrong marker, broken scales | decoded with the declared codebook: rel far out; marker / NaN / zero / huge scales: format error | real mul1 codes declared i8; marker; NaN scale |
-| replay | a published model's codes for the same tensor | sha256 match with a `--published` import | replay test |
-| duplicate | the same codes submitted twice (two copies of a best-of-N job, or colluding donors) | sha256 match with another donor's row: accepted, no points | duplicate test |
+| replay | a published model's codes for the same tensor, as is or with a few words changed | sha256 or near-duplicate (≥ half the sampled tiles) match with a `--published` import | replay tests |
+| duplicate | the same codes submitted twice (two copies of a best-of-N job, or colluding donors), as is or with a few words changed per copy | sha256 or near-duplicate match with another donor's row or the donor's own other copy: accepted, no points; one copy of a job per donor in the scheduler | duplicate and perturbed-copy tests |
 | collusion on quality | several donors return the same slightly-worse quant | the trusted bound (anchors / imports) and re-checks against neighbouring K | 1/8-bit-worse test, re-check test |
+| griefing honest donors | one result a few % better than honest, so that honest repeats fall out of a band centred on it | the all-rows center is the upper median; an all-only fail with the trusted bound passing is suspect, decided by an anchor, never a quarantine (#12) | better-than-honest-then-honest test |
 | wrong data | quantizing another tensor, another layer, other weights | rel against our weights: garbage-level | (follows from the decode) |
 
 **What it does not catch** (and why that is acceptable):
@@ -131,12 +147,33 @@ are not re-checked.
   the donor sees a result.
 - Determinism: the quantizer is deterministic on one GPU and software stack (the smoke test's donor and verifier,
   same card, returned bit-identical codes), so two honest donors with identical setups may too; the second earns
-  nothing for that tensor. Codes equal to a *trusted* row (our anchor or import) are not counted as a duplicate.
-  Best-of-N copies avoid it by construction (each copy has its own `seed_offset`).
+  nothing for that tensor. Codes equal (or nearly equal) to a *trusted* row (our anchor or import) are not counted as
+  a duplicate. Best-of-N copies avoid it by construction (each copy has its own `seed_offset`).
 - A cheat that stays inside the tolerance (≤ 3–5 % worse than honest) passes. That is the price of not replicating,
   and it is below the spread between neighbouring ladder steps.
 - Binding codes to the seed (checking that `sign(suh)` / `sign(svh)` follow the job's seed) would stop copying across
   best-of-N copies. It needs the quantizer's device RNG on the server, so it is left out.
+
+### Identity: trust is per worker, not per donor (#9, won't fix)
+
+Quarantine, the spot-check draw (a worker's first result of each type, then a random share) and the exclusion of a
+worker from a job it was caught on all key on the worker id. A donor can hold several ids (a personal invite with
+`--uses N`, `rqah link`, more invites), so a caught donor's other machines keep working until the operator acts.
+Keying these on the donor instead would not stop a cheater: registering again with a fresh invite makes a new donor
+as easily as a new worker, so donor-wide automation would cost complexity and protect nothing. What it would do is
+punish honest donors for one broken machine (a bad card or driver fails a re-run; its siblings are fine). So:
+
+- **Every worker is checked on its own.** A new token's first result of each type is always re-run (or scored), so a
+  new identity buys no unchecked work; counting the first N per donor would be weaker, not stronger.
+- **Nothing a worker delivers counts without a check that does not trust it.** Quant codes are scored by the server
+  itself; for evaluations (#4) a result far off the knapsack's prediction is refused or re-run in full, a share is
+  spot-checked on random documents, and anything the search adopts is re-run in full on our hardware. A cheat that
+  re-registers starts from zero unchecked work.
+- **Donor-wide action is the operator's call:** `admin.py exclude-donor DONOR --reason ...` quarantines every worker
+  of the donor and invalidates every result of theirs that nothing confirmed (lumens revoked, jobs requeued for
+  others, the search's batches see them as invalidated). `disable-worker` revokes a token.
+- **Later, if re-registration becomes a real problem:** limits on invites (they are the only way in, and the operator
+  hands them out), and blocks by IP range at the reverse proxy.
 
 ## Cost
 

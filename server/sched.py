@@ -29,10 +29,11 @@ def norm_req(r):
     return r
 
 
-def job_filter(wr, caps, failed=frozenset()):
+def job_filter(wr, caps, failed=frozenset(), groups=frozenset()):
     """f(job row) -> its normalised requirements if worker row wr with declared caps may ever run it, else None (the
     free-cards / free-RAM part is the caller's). failed: ids of queued jobs this worker already failed, rejected or let
-    expire since their last requeue (one attempt per worker per job)"""
+    expire since their last requeue (one attempt per worker per job). groups: best-of-N groups (jobs.grp) of which the
+    worker's donor already holds or delivered a copy (#11: one copy of a group per donor)"""
     types = set(caps.get("job_types") or ()) & {n for n, m in jobs.REGISTRY.items() if m.IMPLEMENTED}
     vers = caps.get("versions", {})
     disk = caps.get("disk_gb", 0) * 1e9
@@ -42,6 +43,7 @@ def job_filter(wr, caps, failed=frozenset()):
         if j["type"] not in types or vers.get(j["type"], j["version"]) != j["version"]: return None
         if j["exclude_worker"] == wr["id"]: return None
         if j["id"] in failed: return None
+        if groups and j["grp"] in groups: return None
         if j["needs"] == "verifier" and not wr["verifier"]: return None
         if j["needs"] == "trusted" and not (wr["trusted"] or wr["verifier"]): return None
         r = norm_req(json.loads(j["requires"]))
@@ -77,6 +79,16 @@ class Transfers:
             if m["sha256"][:16] in cached: have += m["size"]
             else: down += m["size"]
         return down, have
+
+
+def donor_groups(db, wr):
+    """jobs.grp of the copies the worker's donor (any of its workers) holds a lease on or delivered the accepted result
+    of; verifiers (our own boxes) are not limited"""
+    if wr["verifier"]: return frozenset()
+    return frozenset(r[0] for r in db.execute(
+        "SELECT DISTINCT j.grp FROM leases l JOIN jobs j ON j.id=l.job_id JOIN workers w ON w.id=l.worker_id "
+        "WHERE w.donor_id=? AND j.grp IS NOT NULL AND (l.state='active' OR (l.state='done' AND j.state='accepted' "
+        "AND j.accepted_lease=l.id))", (wr["donor_id"],)))
 
 
 def fits_budget(budget, down, up):

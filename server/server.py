@@ -39,6 +39,7 @@ passing over drains that worker once it has waited --class-wait-s.
   POST /api/v0/search/batch           an eval_mix batch (server/batch.py)      } only with --search-token-file,
   GET  /api/v0/search/batch/ID        its status and per-candidate results    } bearer = that token; enqueues
   GET  /api/v0/search/batch/ID/rows/C candidate C's rows ([rows, 4] f32)       } eval_mix jobs on public goldens only
+  POST /api/v0/search/batch/ID/adopt  {candidates: [C, ...]}: the search adopts them; each gets a full trusted re-run
 
 Nothing else that changes the queue goes over HTTP: admin.py works on the database and the data root directly, on
 this host (or in the server container: `rqah admin ...`)."""
@@ -57,6 +58,7 @@ from server import sched as SCH
 from server.sched import norm_req, job_filter
 
 CHUNK_MAX = 64 << 20
+IMPLAUSIBLE_TO_VERIFIER = 2            # #4: after this many donors' implausible results a job goes to our verifiers
 JSON_MAX = 1 << 20
 BATCH_MAX = 32 << 20
 CAPS = {"type": "object", "required": ["job_types"], "properties": {
@@ -105,13 +107,15 @@ class Queue:
         self.upload_max = int(a.upload_max_mb * (1 << 20)) if a.upload_max_mb else None
         self.spool_max = int(a.spool_max_gb * 1e9) if a.spool_max_gb else None
         self.refail_s = float(getattr(a, "refail_s", 3600))
+        self.cap_x, self.cap_min_s = float(getattr(a, "lease_cap_x", 3.0)), float(getattr(a, "lease_cap_min_s", 7200))
         # bytes in the spool, cached: an os.walk per upload chunk grew with the orphans; uploads add, fail / complete
         # subtract, and the reaper's recount (sweep_spool, every tick) keeps it honest
         self.spool_lock = threading.Lock()
         self.spool_used = _dir_bytes(self.spool)
         self.admin_hash = self._token_hash(a.admin_token_file, "admin")
         self.search_hash = self._token_hash(a.search_token_file, "search")
-        self.policy = V.Policy(a.spot_rate, a.spot_first)
+        self.policy = V.Policy(a.spot_rate, a.spot_first, rates={"eval_mix": getattr(a, "eval_spot_rate", 0.08)},
+                               docs=getattr(a, "eval_spot_docs", 3), data=self.data)
         self.store.reserve_max_s = a.reserve_max_s; self.store.reserve_idle_s = max(4 * a.lease_s, 60)
         self.piece_cache = {}
         self.up_memo = {}                                   # job id -> expected upload bytes (sched.Transfers)
@@ -195,7 +199,10 @@ class Queue:
             failed = frozenset() if wr["verifier"] else {r["job_id"] for r in db.execute(
                 "SELECT DISTINCT l.job_id FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND j.state='queued' "
                 "AND l.state IN ('failed','rejected','expired') AND l.issued > COALESCE(j.requeued, 0)" + win, (w["id"],))}
-            eligible = job_filter(wr, caps, failed)
+            if not wr["verifier"]:                          # #7: abandon + lease again does not restart the deadline
+                failed = set(failed) | {jid for jid, t0 in self._held(db, w["id"]).items()
+                                        if (c := self._cap_of(db, jid)) is not None and t0 + c <= now}
+            eligible = job_filter(wr, caps, failed, SCH.donor_groups(db, wr))
             tr = SCH.Transfers(self.manifest(), self.up_memo)
 
             def fits_now(r): return r["cards"] <= free_cards and r["ram_gb"] <= free_ram
@@ -222,6 +229,7 @@ class Queue:
                               "why": f"draining for job {j['id']} ({r['cards']} cards)"}
             over, starving = 0, None
             reserved = {r[0] for r in db.execute("SELECT job_id FROM reservations")}
+            reserved |= {r[0] for r in db.execute("SELECT job_id FROM reserve_lapsed WHERE worker_id=?", (w["id"],))}   # #8
             for (prio,) in db.execute("SELECT DISTINCT priority FROM jobs WHERE state='queued' ORDER BY priority DESC").fetchall():
                 cands = []
                 for j in db.execute("SELECT * FROM jobs WHERE state='queued' AND priority=? ORDER BY id LIMIT ?",
@@ -248,10 +256,36 @@ class Queue:
                     "why": f"{over} queued jobs this worker could run need more data than its budget has left"}
         return {"job": None, "retry_s": self.a.retry_s}
 
+    def lease_cap(self, jtype, params):
+        """#7: the longest a lease may be held, renewed or not: --lease-cap-x times the type's reference runtime
+        (lumens(p) = R9700 card-minutes), at least --lease-cap-min-s; None = no cap (--lease-cap-x 0)"""
+        if self.cap_x <= 0: return None
+        try: lum = float(jobs.get(jtype).lumens(params))
+        except Exception: lum = 0.0
+        return max(self.cap_min_s, self.cap_x * 60 * lum)
+
+    def _cap_of(self, db, job_id):
+        j = db.execute("SELECT type, params FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return self.lease_cap(j["type"], json.loads(j["params"])) if j else None
+
+    @staticmethod
+    def _held(db, wid, job_id=None):
+        """{job id: when this worker first leased it} over its abandoned leases of still-queued jobs since their last
+        requeue: a worker's leases of one job share one deadline"""
+        q = ("SELECT l.job_id, MIN(l.issued) t0 FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND "
+             "l.state='abandoned' AND l.issued > COALESCE(j.requeued, 0)")
+        a = [wid]
+        if job_id is not None: q += " AND l.job_id=?"; a.append(job_id)
+        return {r["job_id"]: r["t0"] for r in db.execute(q + " GROUP BY l.job_id", a)}
+
     def _grant(self, db, w, j, r, now, tr=None, cached=frozenset()):
-        lid = secrets.token_hex(16); exp = now + self.lease_s
+        lid = secrets.token_hex(16)
+        cap = self.lease_cap(j["type"], json.loads(j["params"]))
+        deadline = None if cap is None else min(now, self._held(db, w["id"], j["id"]).get(j["id"], now)) + cap
+        exp = now + self.lease_s if deadline is None else min(now + self.lease_s, deadline)
         db.execute("DELETE FROM reservations WHERE job_id=?", (j["id"],))
-        db.execute("INSERT INTO leases VALUES(?,?,?,?,?, 'active', NULL, NULL)", (lid, j["id"], w["id"], now, exp))
+        db.execute("INSERT INTO leases(id, job_id, worker_id, issued, expires, state, deadline) VALUES(?,?,?,?,?, 'active', ?)",
+                   (lid, j["id"], w["id"], now, exp, deadline))
         db.execute("UPDATE jobs SET state='leased', attempts=attempts+1, lease_id=?, lease_owner=?, lease_expires=?, "
                    "updated=? WHERE id=?", (lid, w["id"], exp, now, j["id"]))
         self.store.event(db, "lease", j["id"], w["id"], lid)
@@ -261,7 +295,7 @@ class Queue:
                         "expect": {"down": tr.down(j, cached)[0], "up": tr.up(j)},
                         "inputs": [{"name": n, "sha256": man[n]["sha256"], "size": man[n]["size"]} for n in json.loads(j["inputs"])],
                         "outputs": jobs.get(j["type"]).outputs(params), "requires": r,
-                        "lease_id": lid, "lease_expires": exp, "heartbeat_s": self.hb_s}}
+                        "lease_id": lid, "lease_expires": exp, "lease_deadline": deadline, "heartbeat_s": self.hb_s}}
 
     def _lease(self, db, w, job_id, lease_id):
         l = db.execute("SELECT * FROM leases WHERE id=? AND job_id=?", (str(lease_id), job_id)).fetchone()
@@ -277,10 +311,15 @@ class Queue:
             if l["state"] != "active" or j["state"] in ("accepted", "cancelled", "failed"):
                 late_ok = l["state"] == "expired" and j["state"] in ("queued", "leased")
                 return {"ok": False, "cancel": not late_ok, "state": l["state"], "job_state": j["state"]}
-            exp = now + self.lease_s
+            if l["deadline"] is not None and now >= l["deadline"]:
+                # #7: held as long as the job type may take (x3, >= 2 h): the job goes back to the queue. The worker may
+                # still finish: its result counts if it arrives before another one is accepted
+                self.store.expire_lease(db, l, now, why="past its deadline")
+                return {"ok": False, "cancel": False, "state": "expired", "job_state": "queued", "deadline": True}
+            exp = now + self.lease_s if l["deadline"] is None else min(now + self.lease_s, l["deadline"])
             db.execute("UPDATE leases SET expires=? WHERE id=?", (exp, l["id"]))
             db.execute("UPDATE jobs SET lease_expires=? WHERE id=?", (exp, j["id"]))
-            return {"ok": True, "cancel": False, "lease_expires": exp}
+            return {"ok": True, "cancel": False, "lease_expires": exp, "lease_deadline": l["deadline"]}
 
     def fail(self, w, b):
         with self.store.tx() as db:
@@ -391,13 +430,28 @@ class Queue:
         if bad:
             with self.store.tx() as db: self.store.event(db, "upload_bad", job_id, w["id"], lease_id, {"files": bad})
             raise HTTPError(422, "uploaded bytes do not match the declared sha256 / size: re-upload", bad=bad)
+        check = None
         try:
-            m.accept(params, {n: os.path.join(d, n) for n in files}, result, lambda rel: self.data_path(rel))
+            info = m.accept(params, {n: os.path.join(d, n) for n in files}, result, lambda rel: self.data_path(rel))
+            if j["pred"] and hasattr(m, "plausible") and isinstance(info, dict):    # #4: vs the search's prediction
+                verdict, det = m.plausible(json.loads(j["pred"]), info)
+                if verdict == "reject" and not w["verifier"]:
+                    raise ValueError(f"implausible: mean KL {det['kld_mean']:.6g} is more than {det['band']['worse']:g} x the "
+                                     f"predicted {det['pred_kld']:.6g}")
+                check = (verdict if verdict != "reject" else "pass", det)          # our own verifier: a fact, not a fake
         except Exception as e:
             with self.store.tx() as db:
                 l2 = db.execute("SELECT * FROM leases WHERE id=?", (lease_id,)).fetchone()
                 self.store.end_lease(db, l2, "rejected", error=f"result rejected: {e}")
                 self.store.event(db, "result_rejected", job_id, w["id"], lease_id, {"error": str(e)[:500]})
+                if str(e).startswith("implausible") and not j["needs"]:
+                    # two donors agree the mix is far worse than predicted: the prediction is off, not both donors.
+                    # Our verifiers settle it (an honest surprise must not fail the job for good)
+                    n = db.execute("SELECT COUNT(DISTINCT worker_id) FROM events WHERE job_id=? AND kind='result_rejected' AND "
+                                   "detail LIKE '%implausible%' AND t > ?", (job_id, j["requeued"] or 0)).fetchone()[0]
+                    if n >= IMPLAUSIBLE_TO_VERIFIER:
+                        db.execute("UPDATE jobs SET needs='verifier' WHERE id=?", (job_id,))
+                        self.store.event(db, "implausible_to_verifier", job_id, detail={"donors": n})
             gone = _dir_bytes(d); shutil.rmtree(d, ignore_errors=True)
             with self.spool_lock: self.spool_used -= gone
             raise HTTPError(422, f"result rejected: {e}", rejected=True)
@@ -421,6 +475,9 @@ class Queue:
             db.execute("UPDATE jobs SET state='accepted', accepted_lease=?, accepted_by=?, accepted_at=?, result=?, files=?, "
                        "lease_id=NULL, lease_owner=NULL, lease_expires=NULL, updated=? WHERE id=?",
                        (lease_id, w["id"], now, json.dumps(result), json.dumps(files), now, job_id))
+            if check:
+                db.execute("UPDATE jobs SET check_state=?, check_detail=? WHERE id=?", (check[0], json.dumps(check[1]), job_id))
+                if check[0] == "suspect": self.store.event(db, "suspect", job_id, w["id"], lease_id, check[1])
             self.store.event(db, "accept_late" if late else "accept", job_id, w["id"], lease_id)
         shutil.rmtree(jd, ignore_errors=True)
         with self.spool_lock: self.spool_used -= gone
@@ -429,8 +486,9 @@ class Queue:
         return {"ok": True, "duplicate": False}
 
     def may_read(self, w, rel):
-        for r in self.store.q("SELECT j.inputs FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND l.state='active'",
-                              (w["id"],)):
+        """a lease that is active and not past its expiry (the reaper marks it expired up to a tick later)"""
+        for r in self.store.q("SELECT j.inputs FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND l.state='active' "
+                              "AND l.expires>?", (w["id"], time.time())):
             if rel in json.loads(r["inputs"]): return True
         return False
 
@@ -551,7 +609,7 @@ class Handler(BaseHTTPRequestHandler):
         except HTTPError as e:
             if method == "PUT" and e.code != 200: self.close_connection = True    # unread body
             self._send(e.code, {"error": e.msg, **e.extra})
-        except (KeyError, ValueError, TypeError) as e:
+        except (KeyError, ValueError, TypeError, OverflowError) as e:     # OverflowError: an id beyond SQLite's 64 bits
             self.close_connection = True
             self._send(400, {"error": f"bad request: {e!r}"[:300]})
         except Exception as e:
@@ -602,6 +660,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, B.submit(Q.store, Q.data, Q.manifest(), self._json(BATCH_MAX), Q.piece_cache))
             if method == "GET" and len(ep) == 2 and ep[0] == "batch":
                 return self._send(200, B.status(Q.store, Q.results, int(ep[1])))
+            if method == "POST" and len(ep) == 3 and ep[0] == "batch" and ep[2] == "adopt":
+                return self._send(200, B.adopt(Q.store, int(ep[1]), self._json().get("candidates")))
             if method == "GET" and len(ep) == 4 and ep[0] == "batch" and ep[2] == "rows":
                 it = [x for x in B.status(Q.store, Q.results, int(ep[1]))["items"] if x["id"] == ep[3]]
                 if not it or it[0]["state"] != "accepted": raise HTTPError(404, "no finished candidate of that id")
@@ -662,11 +722,16 @@ def main():
     ap.add_argument("--class-scan", type=int, default=env("CLASS_SCAN", 5000, int),
                     help="queued jobs of one priority class looked at per lease request")
     ap.add_argument("--reserve-max-s", type=float, default=env("RESERVE_MAX_S", 6 * 3600, float),
-                    help="a drain that has not freed the cards by then is given up (the job may be reserved again)")
+                    help="a drain that has not freed the cards by then is given up; that worker may not reserve the same "
+                         "job again for as long (#8), another worker may")
     ap.add_argument("--spot-rate", type=float, default=env("SPOT_RATE", 0.04, float),
                     help="fraction of each donor's accepted jobs re-run on a verifier (spot checks)")
     ap.add_argument("--spot-first", type=int, default=env("SPOT_FIRST", 1, int),
                     help="always re-run a donor's first N accepted jobs of each type")
+    ap.add_argument("--eval-spot-rate", type=float, default=env("EVAL_SPOT_RATE", 0.08, float),
+                    help="fraction of each donor's eval_mix results spot-checked (a few random documents re-scored on a verifier)")
+    ap.add_argument("--eval-spot-docs", type=int, default=env("EVAL_SPOT_DOCS", 3, int),
+                    help="documents an eval_mix spot check re-scores (0: the whole golden)")
     ap.add_argument("--search-token-file", default=env("SEARCH_TOKEN_FILE"),
                     help="enables /api/v0/search/... (eval_mix batches of the search) for this bearer token")
     ap.add_argument("--chunk-max-mb", type=float, default=env("CHUNK_MAX_MB", CHUNK_MAX >> 20, float), help="largest upload PUT")
@@ -677,6 +742,11 @@ def main():
     ap.add_argument("--refail-s", type=float, default=env("REFAIL_S", 3600, float),
                     help="a worker that failed / let expire a job may lease it again after this many seconds (0: only "
                          "after the job is requeued; default 1 h)")
+    ap.add_argument("--lease-cap-x", type=float, default=env("LEASE_CAP_X", 3.0, float),
+                    help="a lease expires after this many times its job type's reference runtime even while it heartbeats "
+                         "(#7; the job is requeued, a late result still counts while the job is open; 0: no cap)")
+    ap.add_argument("--lease-cap-min-s", type=float, default=env("LEASE_CAP_MIN_S", 7200, float),
+                    help="... but never before this many seconds (default 2 h)")
     ap.add_argument("--admin-token-file", default=env("ADMIN_TOKEN_FILE"),
                     help="enables the read-only GET /api/v0/admin/summary for this bearer token")
     ap.add_argument("--status-interval", type=float, default=env("STATUS_INTERVAL", 60, float),
@@ -726,7 +796,7 @@ def main():
     signal.signal(signal.SIGTERM, on_term); signal.signal(signal.SIGINT, on_term)
     print(f"rad-quant-at-home queue on http://{a.bind}:{srv.server_address[1]}  db={a.db}  data={a.data}  results={a.results}  "
           f"admin summary {'on' if a.admin_token_file else 'off'}, search API {'on' if a.search_token_file else 'off'}, "
-          f"spot checks {a.spot_rate:.0%} + first {a.spot_first}, scorer {'on' if a.score_threads > 0 else 'off'}, status page "
+          f"spot checks {a.spot_rate:.0%} (eval {a.eval_spot_rate:.0%}, {a.eval_spot_docs} docs) + first {a.spot_first}, scorer {'on' if a.score_threads > 0 else 'off'}, status page "
           f"{f'every {a.status_interval:g}s' + (' -> ' + a.status_dir if a.status_dir else '') if a.status_interval > 0 else 'off'}", flush=True)
     srv.serve_forever()
     srv.server_close()

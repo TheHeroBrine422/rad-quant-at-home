@@ -6,11 +6,20 @@
   status ID                   per-candidate state, KL mean, spot-check state
   wait ID [--poll S] [--timeout S]   until every candidate is accepted (exit 1 on timeout)
   collect ID OUT              OUT/<candidate>.rows ([rows, 4] f32 {kl, nll_q, nll_p, top1}, radiance's FILE.rows) for
-                              every finished candidate + OUT/results.jsonl; rows already there (same size) are kept
+                              every finished candidate + OUT/results.jsonl; rows already there (same size) are kept,
+                              rows of candidates no longer accepted (invalidated) are deleted
+  adopt ID C [C ...] [--wait] the search acts on these candidates: each gets a full re-run on a trusted worker; --wait
+                              until all are "confirmed" (exit 1 if one fails, i.e. stops being accepted)
+
+Each candidate in status / results.jsonl has a "trust": confirmed (a trusted worker ran or fully re-ran it),
+rerun-pending, spot-pending / spot-pass (a few documents re-scored), unverified. A candidate may carry "pred_kld" in the
+spec (the predicted mean KL): far worse results are refused, far better ones are "suspect" and re-run in full.
 
 The token is the server's --search-token-file token: it can enqueue eval_mix jobs on public goldens and read their
 results, nothing else."""
-import argparse, json, os, sys, time, urllib.request, urllib.error
+import argparse, json, os, re, sys, time, urllib.request, urllib.error
+
+CAND_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
 def call(a, method, path, body=None, raw=False):
@@ -35,6 +44,8 @@ def main():
     x = sp.add_parser("wait"); x.add_argument("id", type=int); x.add_argument("--poll", type=float, default=30)
     x.add_argument("--timeout", type=float, default=0)
     x = sp.add_parser("collect"); x.add_argument("id", type=int); x.add_argument("out")
+    x = sp.add_parser("adopt"); x.add_argument("id", type=int); x.add_argument("cands", nargs="+")
+    x.add_argument("--wait", action="store_true"); x.add_argument("--poll", type=float, default=30)
     a = ap.parse_args()
     if a.cmd == "submit": print(json.dumps(call(a, "POST", "/batch", json.load(open(a.spec)))))
     elif a.cmd == "status": print(json.dumps(call(a, "GET", f"/batch/{a.id}"), indent=1))
@@ -50,8 +61,11 @@ def main():
         st = call(a, "GET", f"/batch/{a.id}")
         os.makedirs(a.out, exist_ok=True); n = 0
         for it in st["items"]:
-            if it["state"] != "accepted": continue
+            if not CAND_RE.fullmatch(str(it["id"])): continue          # the server's id becomes a file name
             dst = os.path.join(a.out, f"{it['id']}.rows")
+            if it["state"] != "accepted":
+                if os.path.exists(dst): os.remove(dst)              # invalidated since an earlier collect
+                continue
             b = call(a, "GET", f"/batch/{a.id}/rows/{it['id']}", raw=True)
             if not (os.path.exists(dst) and os.path.getsize(dst) == len(b)):
                 with open(dst + ".part", "wb") as f: f.write(b)
@@ -61,6 +75,14 @@ def main():
             for it in st["items"]: f.write(json.dumps(it) + "\n")
         os.replace(os.path.join(a.out, "results.jsonl.part"), os.path.join(a.out, "results.jsonl"))
         print(json.dumps({"batch": a.id, "collected": n, "of": len(st["items"])}))
+    elif a.cmd == "adopt":
+        print(json.dumps(call(a, "POST", f"/batch/{a.id}/adopt", {"candidates": a.cands})), flush=True)
+        while a.wait:
+            st = {it["id"]: it for it in call(a, "GET", f"/batch/{a.id}")["items"]}
+            gone = [c for c in a.cands if st[c]["state"] != "accepted"]
+            if gone: sys.exit(f"no longer accepted (failed its trusted re-run?): {gone}")
+            if all(st[c].get("trust") == "confirmed" for c in a.cands): print("confirmed"); break
+            time.sleep(a.poll)
 
 
 if __name__ == "__main__":

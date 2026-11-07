@@ -15,6 +15,9 @@ from the queue server with your worker's own token (server/donor.py). Inside the
   config set [--display-name NAME] [--leaderboard on|off]   the leaderboard entry (opt-in; off by default)
   link --other-token-file F      join this worker's donor with the donor of another of your workers (both tokens
                                  prove they are yours): status, jobs and points then cover both
+  setup [--check | --yes ...]    on the host, not in the container: detect the GPUs, RAM, disk and Docker, ask what
+                                 to donate, write worker.env / compose.yaml / docker-run.sh (client/setup.py,
+                                 docs/SETUP.md; its own flags: rqah setup --help)
 
 --json on every command (before or after it): one JSON object on stdout (logs --follow: one per line), keys as in
 the server's answer plus "ok"; errors as {"ok": false, "error", "http"}. Exit codes: 0 ok, 1 server error, 2 usage /
@@ -289,6 +292,10 @@ def cmd_link(a):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["setup"]:                         # the host-side wizard has its own flags and no server or token
+        from client import setup as wizard
+        return wizard.main(argv[1:])
     common = argparse.ArgumentParser(add_help=False)
     S = argparse.SUPPRESS                             # sub-command copies must not reset what was given before the command
     common.add_argument("--json", action="store_true", default=S, help="machine-readable output")

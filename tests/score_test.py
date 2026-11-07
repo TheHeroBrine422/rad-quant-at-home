@@ -11,7 +11,11 @@ honest repeat by another donor passes on the repeat basis); attacks that must fa
 lower-K codes padded to the declared K's shape, a lower-K shape, a wrong codebook marker, a non-finite scale, a
 published result replayed, a result 1/8 bit worse than the curve); a duplicate of another donor's codes passes but
 earns nothing; a failed score quarantines and invalidates that donor's unconfirmed results but leaves its
-score-verified ones; re-checks fail an earlier extrapolated pass once neighbours arrive; best of N at export."""
+score-verified ones; re-checks fail an earlier extrapolated pass once neighbours arrive; #12: the all band's
+center is the upper median, an honest result after a better-than-honest one is suspect (not failed) and its anchor
+passes it, a trusted-band fail still fails, an outlier-better result logs an event; best of N at export; #11:
+tile fingerprints, perturbed best-of-N copies and another donor's perturbed copy earn nothing, a perturbed published
+result is a replay."""
 import json, math, os, shutil, struct, sys, tempfile, time
 import numpy as np
 
@@ -136,9 +140,15 @@ def job(jid): return S.q("SELECT * FROM jobs WHERE id=?", (jid,))[0]
 def lumens(worker): return S.q("SELECT COALESCE(SUM(lumens), 0) FROM points WHERE worker_id=?", (WK[worker],))[0][0]
 
 
+def lumens_of(jid): return S.q("SELECT COALESCE(SUM(lumens), 0) FROM points WHERE job_id=?", (jid,))[0][0]
+
+
 def run():
     global S
     SC.NOISE, SC.NOISE_DEFAULT = {}, 0.0        # the logic, without the seed-noise term (calibrated on real runs: score_real.py)
+    # the synthetic "honest repeats" below are C0 with two words changed (the only good codes this fixture has): exactly
+    # what near-duplicate detection (#11) calls a copy, so it is off until its own section
+    near_dup = SC.NEAR_DUP; SC.NEAR_DUP = 1.01
     os.makedirs(RES, exist_ok=True)
     C0 = setup()
     S = Store(f"{W}/q.sqlite")
@@ -283,6 +293,60 @@ def run():
     finally:
         SC.series = series_orig
 
+    # #12: the all band's center is the upper median, and the trusted band is the authority
+    b = SC.bound([(3.0, 0.02), (3.0, 0.019), (3.0, 0.025), (2.0, 0.08)], 3.0, "i8", "x.mlp.up_proj", center="median")
+    b2 = SC.bound([(3.0, 0.02), (3.0, 0.0192)], 3.0, "i8", "x.mlp.up_proj", center="median")
+    ok("band (#12): the all bound's center is the upper median of the rows at K (min stays for trusted rows)",
+       abs(math.exp(b[0]) - 0.02) < 1e-12 and abs(math.exp(b2[0]) - 0.02) < 1e-12)
+    ser4 = "griefing-test"
+    pg = dict(P, level="k3-gr"); pg["stamp"] = Q.settings_stamp(pg)
+    cs_c = mutate(C0, 2, 61)
+    make_result(f"{W}/probe-gr", cs_c, pg)
+    crel = {r["key"]: r["rel"] for r in SC.score_files(S, "quant_layer", pg, f"{W}/probe-gr", dp)[0]}
+    for key in KEYS:                    # honest = carol's quality / 1.01; one passed donor row 4% better than honest at K3;
+        h = crel[key] / 1.01            # our only trusted rows one bit away (extrap)
+        S.q("INSERT INTO scores(series, key, K, rel, kind, state, basis, t) VALUES(?,?,?,?,?,?,?,?)",
+            (ser4, key, 2.0, h * math.exp(1.37), "trusted", "pass", "import", time.time()))
+        S.q("INSERT INTO scores(series, key, K, rel, kind, state, basis, t, worker_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            (ser4, key, 3.0, h * 0.96, "donor", "pass", "repeat", time.time(), WK["mallory"]))
+    SC.series = lambda p: ser4 if p.get("level") == "k3-gr" else series_orig(p)
+    try:
+        jc = accept_job(pg, cs_c, "carol")
+        before = lumens("carol")
+        st = SC.score_job(S, RES, dp, jc)
+        rr = S.q("SELECT * FROM jobs WHERE verify_of=?", (jc,))
+        ok("#12: after one donor row 4% better than honest, an honest +1% repeat (trusted band passes, all band fails) is "
+           "suspect: not quarantined, no points yet, an anchor re-run queued",
+           st == "suspect" and S.q("SELECT quarantined FROM workers WHERE id=?", (WK["carol"],))[0][0] == 0 and lumens("carol") == before
+           and len(rr) == 1 and rr[0]["needs"] == "verifier" and job(jc)["state"] == "accepted", st)
+        S.q("UPDATE jobs SET state='accepted', accepted_by=?, accepted_at=? WHERE id=?", (WK["ver"], time.time(), rr[0]["id"]))
+        make_result(f"{RES}/{rr[0]['id']}", mutate(C0, 2, 62), pg)
+        SC.score_job(S, RES, dp, rr[0]["id"])
+        ok("#12: the anchor at that K (trusted, repeat basis) then decides it: pass, lumens granted",
+           job(jc)["check_state"] == "pass" and lumens("carol") > before, job(jc)["check_state"])
+        S.q("UPDATE scores SET state='void' WHERE series=? AND kind='trusted' AND K=3.0", (ser4,))
+        jm = accept_job(pg, mutate(C0, 123, 63, keys={KEYS[0]}), "mallory")
+        ok("#12: a result that fails the trusted band still fails (and quarantines)", SC.score_job(S, RES, dp, jm) == "fail" and
+           S.q("SELECT quarantined FROM workers WHERE id=?", (WK["mallory"],))[0][0] == 1)
+        S.q("UPDATE workers SET quarantined=0 WHERE id=?", (WK["mallory"],))
+    finally:
+        SC.series = series_orig
+    ser5 = "outlier-test"
+    po = dict(P, level="k3-out"); po["stamp"] = Q.settings_stamp(po)
+    for key in KEYS:                    # our own K3 rows 20% worse than this donor's
+        S.q("INSERT INTO scores(series, key, K, rel, kind, state, basis, t) VALUES(?,?,?,?,?,?,?,?)",
+            (ser5, key, 3.0, crel[key] * 1.2, "trusted", "pass", "import", time.time()))
+    SC.series = lambda p: ser5 if p.get("level") == "k3-out" else series_orig(p)
+    try:
+        jo = accept_job(po, cs_c, "trent")
+        S.q("UPDATE workers SET quarantined=0 WHERE id=?", (WK["trent"],))
+        st = SC.score_job(S, RES, dp, jo)
+        ev = S.q("SELECT detail FROM events WHERE job_id=? AND kind='score_outlier'", (jo,))
+        ok("#12: a result more than the repeat tolerance below our trusted center passes and logs a score_outlier event",
+           st == "pass" and ev and len(json.loads(ev[0][0])["tensors"]) == len(KEYS), st)
+    finally:
+        SC.series = series_orig
+
     # best of N at export
     from server import admin
     pb = dict(P, level="k3-best"); pb["stamp"] = Q.settings_stamp(pb)
@@ -293,6 +357,41 @@ def run():
     best = SC.best_of_group(S, [job(j) for j in js])
     ok("best of N: export keeps the passed copy with the lowest total error", best is not None and best["id"] == js[1],
        f"{[(j, job(j)['check_state'], round(json.loads(job(j)['check_detail'] or '{}').get('total_rel', 0), 5)) for j in js]}")
+
+    # #11: near-duplicate codes (on from here; the fingerprints of everything above are forgotten: a fresh campaign)
+    SC.NEAR_DUP = near_dup
+    S.q("UPDATE scores SET tiles=NULL")
+    big = codes(3, 77)["trellis"]; big = np.concatenate([big] * 16, 0).reshape(64, 64, 48)      # 4096 tiles: sampled
+    f0, f1 = SC.tiles_fp(big, "k", "seed-a"), SC.tiles_fp(mutate({"k": {"trellis": big}}, 1, 5)["k"]["trellis"], "k", "seed-a")
+    fr = SC.tiles_fp(codes(3, 78)["trellis"], "k", "seed-a"), SC.tiles_fp(codes(3, 79)["trellis"], "k", "seed-a")
+    ok("#11 fingerprints: 256 sampled tiles; one changed word keeps >= 255 of them, independent codes share none, and "
+       "which tiles are sampled depends on the queue's secret",
+       len(f0) == 4 * SC.TILES and SC.tiles_same(f0, f1) >= 255 / 256 and SC.tiles_same(*fr) == 0 and
+       SC.tiles_fp(big, "k", "seed-b") != f0 and S.secret("tiles") == S.secret("tiles"), f"{SC.tiles_same(f0, f1):.4f}")
+    pn = dict(P, level="k3-nd")
+    def copy(c, who, base):
+        pc = dict(pn, settings=dict(pn["settings"], seed_offset=c)); pc["stamp"] = Q.settings_stamp(pc)
+        j = accept_job(pc, base, who); return j, SC.score_job(S, RES, dp, j)
+    WK["dave"] = S.add_worker("dave")[0]; WK["erin"] = S.add_worker("erin")[0]
+    q0 = mutate(C0, 2, 91)
+    l0 = lumens("dave")
+    got = [copy(c, "dave", mutate(q0, 1, 92 + c) if c else q0) for c in range(3)]
+    l1 = lumens("dave")
+    dups = [json.loads(job(j)["check_detail"]).get("duplicate_of") for j, _ in got]
+    ok("#11: one quant submitted as 3 best-of-N copies with one trellis word changed per tensor: all pass (valid codes), "
+       "only the first earns", [st for _, st in got] == ["pass"] * 3 and dups == [None, got[0][0], got[0][0]] and
+       abs((l1 - l0) - lumens_of(got[0][0])) < 1e-9 and lumens_of(got[1][0]) == lumens_of(got[2][0]) == 0, f"{dups}, +{l1 - l0}")
+    je, st = copy(3, "erin", mutate(q0, 3, 96))
+    nd = [t.get("near_duplicate") for t in json.loads(job(je)["check_detail"])["tensors"]]
+    ok("#11: another donor's copy of those codes with words changed: a duplicate (no points), near_duplicate on every tensor",
+       st == "pass" and lumens("erin") == 0 and json.loads(job(je)["check_detail"]).get("duplicate_of") == got[0][0] and
+       all(x and x > 0.98 for x in nd), str(nd[:3]))
+    pub2 = mutate(C0, 3, 97); make_result(f"{W}/published2", pub2)
+    SC.import_reference(S, dp, "quant_layer", P, f"{W}/published2", kind="published", note="released v3 level")
+    jr_, st = copy(4, "mallory", mutate(pub2, 2, 98))
+    ok("#11: a published result with words changed is a replay (fail), not a duplicate, though it matches donor rows too",
+       st == "fail" and {r[0] for r in S.q("SELECT basis FROM scores WHERE job_id=?", (jr_,))} == {"replay"}, st)
+    S.q("UPDATE workers SET quarantined=0 WHERE id=?", (WK["mallory"],))
 
     # quant_tensor export: a layer's groups merged into one shard = the whole-layer shard, tensor for tensor
     from common.st import merge_shards, subset_shard

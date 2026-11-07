@@ -82,14 +82,30 @@ small job, of a lower class. Two drains prevent this:
   for a job over the worker's budget (the worker could not run it anyway).
 
 In both cases another worker that can run the job at once still takes it, and the reservation goes away. A drain
-that has not freed the room within `--reserve-max-s` (default 6 h) is given up, after which the job may reserve
-again. A worker's soft preferences (level order, cache affinity, budget order) thus delay a higher class by at most
+that has not freed the room within `--reserve-max-s` (default 6 h) is given up. That worker may not reserve the same
+job again for another `--reserve-max-s` (0.5, #8), so a worker that never drains cannot keep a job reserved: the next
+busy worker that could run it reserves it instead, and an idle one takes it at once. A worker's soft preferences (level order, cache affinity, budget order) thus delay a higher class by at most
 one lease cycle. Hard constraints delay it by at most `--class-wait-s` plus the time the running jobs need to end.
 
 Cost: a lease request now looks at every candidate of the highest class that has one, instead of stopping at the
 first fit. On the VM, with 5000 queued jobs in one class, a request takes ~29 ms (~36 ms with a 1000-entry cache
 report and a budget), all inside the database transaction. `--class-scan` (default 5000) caps how many jobs of one
 class are looked at.
+
+## 3a. How long a worker may hold a job (0.5, #7)
+
+A heartbeat renews a lease for `--lease-s`, but never past the lease's **deadline**: `--lease-cap-x` (default 3) times
+the job type's reference runtime (`lumens(p)`, R9700 card-minutes), and at least `--lease-cap-min-s` (default 2 h),
+after the lease was issued. At the deadline the lease expires like one that missed its heartbeat: the job goes back to
+the queue (an attempt counted) and the next eligible worker gets it. The holder is not offered it again for
+`--refail-s` (§1), but it may keep working: its result still counts if it arrives before another one is accepted
+(the late-result rule), and the newer lease is then superseded. The heartbeat that finds the deadline passed answers
+`{"ok": false, "cancel": false, "deadline": true}`.
+
+Abandoning a lease refunds its attempt (a budget hand-back or a graceful stop is not a failure), but a worker's
+leases of one job share one clock: leasing it again after an abandon keeps the first lease's deadline, and once that
+has passed the worker is not offered the job again until it is requeued. So holding a job by heartbeating, or by
+abandon + lease loops, ends after one deadline per worker. `--lease-cap-x 0` turns the cap off.
 
 ## 4. What the worker declares
 
