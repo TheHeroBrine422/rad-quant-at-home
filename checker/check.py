@@ -7,7 +7,8 @@
 
 1. structure: the shard holds exactly {key}.trellis / suh / svh / mul1 of every linear in the layer plan, with the
    dtypes and shapes the bf16 weights imply; proxy.jsonl covers each tensor once with the job's K / codebook /
-   scaled-Hessian setting; job.json carries the job's settings stamp.
+   scaled-Hessian setting; job.json carries the job's settings stamp; suh / svh finite, non-zero, |x| <= 1e3 and mul1
+   the MUL1 marker (docs/VERIFY.md "Format", the score verifier's rule).
 2. proxy recompute: each tensor decoded from its codes (exl3dec), rel = tr(dW H dW^T) / tr(W H W^T) against OUR
    input Hessian and OUR bf16 weight, compared with the proxy_err the worker logged (exllamav3's post-refit error,
    which is the same quantity against the undamped Hessian): |rel / logged - 1| <= tol. --rows-frac F < 1 scores a
@@ -15,7 +16,7 @@
    the worker's per-row claim (rowerr.npz: ourq --save-wq's err / ref per output row) on exactly those blocks; the
    claim's whole-tensor total must also match the log. ~4x cheaper at F = 0.25.
 --wq (ourq mode): also compare the decode with ourq's own dequantized weights in OUT/wq (decoder validation)."""
-import argparse, json, os, struct, sys, time
+import argparse, json, math, os, struct, sys, time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,7 +24,21 @@ from checker import exl3dec
 from common.util import st_header
 
 TOL = 2e-3            # default |rel / logged - 1| (TESTS.md: measured decode-vs-log spread, x ~10)
+LIMIT_SCALE = 1e3     # |suh|, |svh| above this (or 0, or not finite): invalid codes (shared with server/score.py)
 _DT = {"F32": np.float32, "F16": np.float16, "I16": np.int16, "I32": np.int32, "BF16": np.uint16, "I64": np.int64}
+
+
+def validity(key, t, K):
+    """format checks beyond the shapes (quant_common.check_shard): finite, non-zero, bounded scales; the mul1 marker;
+    the trellis width of the declared K"""
+    for x in ("suh", "svh"):
+        a = t[x].astype(np.float32)
+        if not np.isfinite(a).all(): return f"{key}.{x}: not finite"
+        if (a == 0).any(): return f"{key}.{x}: zero scale"
+        if np.abs(a).max() > LIMIT_SCALE: return f"{key}.{x}: scale above {LIMIT_SCALE:g}"
+    if int(t["mul1"]) & 0xFFFFFFFF != exl3dec.MUL1: return f"{key}.mul1: marker {int(t['mul1']) & 0xFFFFFFFF:#x}"
+    if t["trellis"].shape[-1] != round(16 * K): return f"{key}.trellis: {t['trellis'].shape[-1]} words per tile, K{K} needs {round(16 * K)}"
+    return None
 
 
 class ST:
@@ -81,11 +96,14 @@ def check_tensors(plan, shard, get_weight, hess_path, K, cb, logged, rows_frac=1
             rec = num / den
             r = {"key": key, "rel": rec, "logged": logged.get(key), "cols": len(cols), "n": n,
                  "decode_s": round(t1 - t0, 2), "s": round(time.time() - t0, 2)}
+            if not math.isfinite(rec): r["bad"] = "decoded rel is not finite"
             if r["logged"] and sel is None: r["ratio"] = rec / r["logged"]
             c = (claims or {}).get(key)
             if c is not None:
                 err, ref = np.asarray(c[0], np.float64), np.asarray(c[1], np.float64)
-                if err.shape != (n,) or ref.shape != (n,): r["claim_bad_shape"] = True
+                if err.shape != (n,) or ref.shape != (n,): r["bad"] = "claim shape"
+                elif not (np.isfinite(err).all() and np.isfinite(ref).all() and ref[cols].sum() > 0 and ref.sum() > 0):
+                    r["bad"] = "claim not finite or reference not positive"
                 else:
                     r["claim_sel_ratio"] = rec / (err[cols].sum() / ref[cols].sum())
                     if r["logged"]: r["claim_log_ratio"] = (err.sum() / ref.sum()) / r["logged"]
@@ -102,11 +120,12 @@ def check_tensors(plan, shard, get_weight, hess_path, K, cb, logged, rows_frac=1
 
 def verdict(rows, tol):
     """every tensor needs a comparison: the full-tensor ratio, or (sampled) the claim on the sampled blocks; every
-    comparison present must be within tol"""
+    comparison present must be a finite number within tol"""
     bad, worst = [], 0.0
     for r in rows:
         rs = [r[k] for k in ("ratio", "claim_sel_ratio", "claim_log_ratio") if k in r]
-        if r.get("claim_bad_shape") or not ("ratio" in r or "claim_sel_ratio" in r): bad.append(r["key"]); continue
+        if r.get("bad") or not ("ratio" in r or "claim_sel_ratio" in r) or not all(math.isfinite(x) for x in rs):
+            bad.append(r["key"]); continue
         w = max(abs(x - 1) for x in rs); worst = max(worst, w)
         if w > tol: bad.append(r["key"])
     return not bad, bad, worst
@@ -131,11 +150,16 @@ def check_job(jtype, p, res_dir, data_path, rows_frac=1.0, tol=None, seed=None):
     try:
         Q.check_shard(p, plan, os.path.join(res_dir, shard_name), data_path(f"{Q.root(p)}/weights/{wfile}"))
         rows, meta = Q.check_log(p, plan, os.path.join(res_dir, "proxy.jsonl"), os.path.join(res_dir, "job.json"))
+        sh = ST(os.path.join(res_dir, shard_name))
+        for _, keys in plan:
+            for key in keys:
+                bad = validity(key, {x: sh.get(f"{key}.{x}") for x in ("trellis", "suh", "svh", "mul1")}, float(p["K"]))
+                if bad: raise ValueError(bad)
     except Exception as e:
         rep["summary"] = f"structure: {e}"; return rep
     wts = ST(data_path(f"{Q.root(p)}/weights/{wfile}"))
     t0 = time.time()
-    res = check_tensors(plan, ST(os.path.join(res_dir, shard_name)), lambda k: wts.get(f"{k}.weight"),
+    res = check_tensors(plan, sh, lambda k: wts.get(f"{k}.weight"),
                         lambda h: data_path(f"{Q.root(p)}/hessians/{h}.safetensors"), p["K"], p["codebook"],
                         {r["key"]: r["proxy_err"] for r in rows}, rows_frac, seed,
                         claims=load_claims(os.path.join(res_dir, "rowerr.npz")))

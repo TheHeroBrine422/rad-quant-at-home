@@ -2,8 +2,8 @@
 # Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
 """checker_tamper.py RESULTDIR PARAMS.json DATAROOT SCRATCH -- does the checker catch bad results? Copies an accepted
 quant_layer result and tampers with it: codes of one tensor changed (1% of its trellis words), the per-row claim
-shrunk 10%, the logged proxy shrunk 5%, a tensor removed, a wrong settings stamp; each must
-FAIL, the untouched copy must PASS (full and sampled)."""
+shrunk 10%, the logged proxy shrunk 5%, a tensor removed, a wrong settings stamp, a NaN scale, a NaN per-row claim,
+a 0/0 per-row claim; each must FAIL, the untouched copy must PASS (full and sampled)."""
 import json, os, shutil, struct, sys
 import numpy as np
 
@@ -68,6 +68,22 @@ run("a tensor missing from the shard", d, False)
 d = copy("stamp")
 j = json.load(open(os.path.join(d, "job.json"))); j["settings_stamp"] = "0" * 16; json.dump(j, open(os.path.join(d, "job.json"), "w"))
 run("wrong settings stamp", d, False)
+
+d = copy("nanscale")
+t = stn.load_file(os.path.join(d, shard)); meta = check.ST(os.path.join(d, shard)).hdr.get("__metadata__")
+t[f"{key}.suh"][0] = np.float16("nan"); stn.save_file(t, os.path.join(d, shard), metadata=meta)
+run("a NaN scale in one tensor", d, False)
+
+d = copy("nanclaim")
+z = dict(np.load(os.path.join(d, "rowerr.npz"))); z[f"{key}.err"] = np.full_like(z[f"{key}.err"], np.nan)
+np.savez(os.path.join(d, "rowerr.npz"), **z)
+run("per-row claim NaN", d, False, 0.25, 4)
+
+d = copy("zeroclaim")
+z = dict(np.load(os.path.join(d, "rowerr.npz"))); z[f"{key}.err"] = z[f"{key}.err"].copy(); z[f"{key}.ref"] = z[f"{key}.ref"].copy()
+z[f"{key}.err"][:] = 0; z[f"{key}.ref"][:] = 0
+np.savez(os.path.join(d, "rowerr.npz"), **z)
+run("per-row claim 0/0", d, False, 0.25, 5)
 
 n_ok = sum(x[1] for x in out)
 print(f"{n_ok}/{len(out)} tamper checks as expected")

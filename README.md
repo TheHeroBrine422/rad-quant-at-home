@@ -385,7 +385,8 @@ For each returned shard:
 1. **Structure:** exactly `{key}.trellis` (int16 `[in/16, out/16, 16K]`), `.suh` (f16 `[in]`), `.svh`
    (f16 `[out]`) and `.mul1` (int32 marker) for every linear of the layer plan, with the shapes our bf16 weights
    imply. `proxy.jsonl` covers each tensor once with the job's K, codebook and scaled-Hessian setting. `job.json`
-   carries the job's settings stamp.
+   carries the job's settings stamp. `suh` / `svh` finite, non-zero, |x| ≤ 1e3, and `.mul1` is the MUL1 marker
+   (docs/VERIFY.md "Format"; the same rule the score verifier applies).
 2. **Proxy recompute:** `exl3dec.py` decodes each tensor from its codes on the CPU. It is a numpy transcription of
    exllamav3's decode: integer and fractional K, qtf2's sub-1 salt, the mul1/i8/i8c/i4 codebooks. The checker
    then computes rel = tr(ΔW H ΔWᵀ) / tr(W H Wᵀ) against our own Hessian and bf16 weight.
@@ -397,7 +398,8 @@ For each returned shard:
 
    Tolerance: `|ratio − 1| ≤ 2e-3`. Measured spread for honest results is ≤ 1.7e-4, which comes from fp16
    rounding of the stored scales. Results are not bit-identical across GPUs, but the check compares the codes a
-   worker returned with that worker's own numbers, so cross-GPU nondeterminism doesn't enter it.
+   worker returned with that worker's own numbers, so cross-GPU nondeterminism doesn't enter it. A comparison that is
+   not a finite number fails.
 3. Valid-but-bad codes with an honest log pass this check; the spot checks below catch them (a trusted re-run's
    proxy error per tensor, within the seed spread).
 
@@ -760,7 +762,8 @@ exercised yet.
 - `tests/cuda_smoke.sh` (0.3): a local server with its scorer + one `quant_tensor` job and its anchor re-run from the
   CUDA image (`MODE=docker`), from its extracted filesystem (`MODE=rootfs`) or from the box's own stack
   (`MODE=native`).
-- `tests/quant_e2e.sh`: one real layer vs a direct ourq run (GPU). `tests/checker_tamper.py`, `tests/dec_rates.sh`.
+- `tests/quant_e2e.sh`: one real layer vs a direct ourq run (GPU). `tests/checker_tamper.py`, `tests/checker_nan_test.py`
+  (the replicate checker on the synthetic layer: NaN scale / NaN claim / 0-0 claim, CPU), `tests/dec_rates.sh`.
 - Measurement tools (`tools/`): `hfrange.py` (single tensors of a HF checkpoint by HTTP range), `memwrap.py` (peak VRAM
   / RSS of a quantizer run), `curve_loo.py` and `seed_spread.py` (the data behind the score band).
 
