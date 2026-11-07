@@ -301,7 +301,7 @@ def link(S, w, other_token):
         else:
             od = db.execute("SELECT * FROM donors WHERE id=?", (old,)).fetchone()
             n = db.execute("UPDATE workers SET donor_id=? WHERE donor_id=?", (o["donor_id"], old)).rowcount
-            if od is not None:          # the operator's moderation and the older name survive the merge
+            if od is not None:          # the operator's hide survives the merge; the old name only fills a missing one
                 db.execute("UPDATE donors SET hidden=MAX(hidden, ?), display_name=COALESCE(display_name, ?) WHERE id=?",
                            (od["hidden"], od["display_name"], o["donor_id"]))
             db.execute("DELETE FROM donors WHERE id=?", (old,))
