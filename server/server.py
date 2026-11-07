@@ -442,11 +442,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(b)
 
     def _content_length(self, limit):
-        """the request body's declared length, refused when missing-but-required, negative or over the cap"""
+        """the request body's declared length; 0 when absent, refused (and the connection closed: the body stays unread) when not an integer, negative or over the cap"""
         try: n = int(self.headers.get("Content-Length") or 0)
-        except ValueError: raise HTTPError(400, "bad content-length")
-        if n < 0: raise HTTPError(400, "bad content-length")
-        if n > limit: raise HTTPError(413, "body too large")
+        except ValueError: self.close_connection = True; raise HTTPError(400, "bad content-length")
+        if n < 0: self.close_connection = True; raise HTTPError(400, "bad content-length")
+        if n > limit: self.close_connection = True; raise HTTPError(413, f"body too large (max {limit} bytes)")
         return n
 
     def _json(self, limit=JSON_MAX):
@@ -502,7 +502,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, Q.upload(w, job_id, lease_id, name, off, self._content_length(Q.chunk_max), self.rfile))
             raise HTTPError(404, "no such endpoint")
         except HTTPError as e:
-            if e.code != 200 and (method == "PUT" or e.msg == "bad content-length"): self.close_connection = True    # unread body
+            if method == "PUT" and e.code != 200: self.close_connection = True    # unread body
             self._send(e.code, {"error": e.msg, **e.extra})
         except (KeyError, ValueError, TypeError) as e:
             self.close_connection = True

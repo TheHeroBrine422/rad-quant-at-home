@@ -10,7 +10,8 @@ every job is accepted exactly once with the right bytes.
 
 Scenarios (TESTS.md): tokens / invites, 3 workers with one killed mid-job (lease expires, job reassigned, accepted
 once), a killed worker restarted before / after its lease expired, duplicate completion, corrupted upload, upload
-caps, disk-cap eviction and the disk-based lease filter, Range resume of a partial download, data access rules,
+caps, a negative Content-Length (JSON and upload), a short upload chunk truncated back, disk-cap eviction and the
+disk-based lease filter, Range resume of a partial download, data access rules,
 malformed jobs from the real server (known type, bad params) and from a fake malicious server (unknown type, extra
 keys, path traversal, inputs the type does not allow, a malformed eval_mix, a bad stamp), graceful stop (finish /
 abandon), time windows, env-only configuration (RQAH_*, then the 0.2 RADQUANT_* names).
@@ -346,9 +347,9 @@ def run(procs, srv):
     c, r = req("POST", "/api/v0/lease", caps, token=t_client); job2 = r["job"]
     u2 = f"/api/v0/upload/{job2['id']}/{job2['lease_id']}/out.bin"
     auth = {"Authorization": f"Bearer {t_client}"}
-    c, r = raw("POST", "/api/v0/register", {"Content-Length": "-1", "Content-Type": "application/json"}, b"x" * 4096)
+    c, r = raw("POST", "/api/v0/register", {"Content-Length": "-1", "Content-Type": "application/json"}, b"x" * 4096, shutdown=False)
     ok("negative Content-Length on a JSON endpoint -> 400, body not read", c == 400 and "content-length" in r.get("error", ""), f"{c} {r}")
-    c, r = raw("PUT", f"{u2}?offset=0", {**auth, "Content-Length": "-1"}, b"x" * 4096)
+    c, r = raw("PUT", f"{u2}?offset=0", {**auth, "Content-Length": "-1"}, b"x" * 4096, shutdown=False)
     ok("negative Content-Length on an upload -> 400, spool unchanged",
        c == 400 and req("GET", u2, token=t_client)[1].get("size") == 0, f"{c} {r}")
     c, r = raw("PUT", f"{u2}?offset=0", {**auth, "Content-Length": "3000"}, body[:1000])

@@ -739,7 +739,7 @@ exercised yet.
 
 ### Tests
 
-- `tests/e2e_noop.py`: no GPU, ~5 min, 108 checks (115 with the container). Runs the server as a subprocess, or
+- `tests/e2e_noop.py`: no GPU, ~5 min, 111 checks (118 with the container). Runs the server as a subprocess, or
   `E2E_SERVER=docker` for the container; the workers always run on the host. The GPU side is faked on the CPU (`tests/fakes.py`,
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
   privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record; w25: the donor CLI (every
