@@ -84,6 +84,15 @@ class HTTPError(Exception):
     def __init__(self, code, msg, **extra): super().__init__(msg); self.code, self.msg, self.extra = code, msg, extra
 
 
+def _dir_bytes(path):
+    n = 0
+    for dp, _, fn in os.walk(path):
+        for f in fn:
+            try: n += os.path.getsize(os.path.join(dp, f))
+            except OSError: pass
+    return n
+
+
 class Queue:
     def __init__(self, a):
         self.a = a
@@ -95,6 +104,10 @@ class Queue:
         self.chunk_max = int(a.chunk_max_mb * (1 << 20))
         self.upload_max = int(a.upload_max_mb * (1 << 20)) if a.upload_max_mb else None
         self.spool_max = int(a.spool_max_gb * 1e9) if a.spool_max_gb else None
+        # bytes in the spool, cached: an os.walk per upload chunk grew with the orphans; uploads add, fail / complete
+        # subtract, and the reaper's recount (sweep_spool, every tick) keeps it honest
+        self.spool_lock = threading.Lock()
+        self.spool_used = _dir_bytes(self.spool)
         self.admin_hash = self._token_hash(a.admin_token_file, "admin")
         self.search_hash = self._token_hash(a.search_token_file, "search")
         self.policy = V.Policy(a.spot_rate, a.spot_first)
@@ -274,6 +287,9 @@ class Queue:
             self.store.end_lease(db, l, {"abandon": "abandoned", "reject": "rejected", "fail": "failed"}[kind],
                                  error=err, count_attempt=kind != "abandon")
             self.store.event(db, kind, j["id"], w["id"], l["id"], {"error": err[:500]})
+        d = os.path.join(self.spool, str(int(b["job_id"])), str(b["lease_id"]))
+        gone = _dir_bytes(d); shutil.rmtree(d, ignore_errors=True)
+        with self.spool_lock: self.spool_used -= gone
         return {"ok": True}
 
     # ------------------------------------------------------------ uploads
@@ -304,22 +320,39 @@ class Queue:
             raise HTTPError(507, "server upload spool is full, retry later", size=cur)
         with open(p, "ab") as f:
             left = n
-            while left:
-                b = rfile.read(min(left, 1 << 20))
-                if not b: break
-                f.write(b); left -= len(b)
+            try:
+                while left:
+                    b = rfile.read(min(left, 1 << 20))
+                    if not b: break
+                    f.write(b); left -= len(b)
+            finally:
+                with self.spool_lock: self.spool_used += n - left
         if left:
-            os.truncate(p, cur)
+            os.truncate(p, cur)                            # #16: a short chunk is not kept
+            with self.spool_lock: self.spool_used -= n - left   # #22's counter: those bytes are gone again
             raise HTTPError(400, "short body", size=cur)
         return {"size": cur + n}
 
-    def spool_bytes(self):
-        n = 0
-        for dp, _, fn in os.walk(self.spool):
-            for f in fn:
-                try: n += os.path.getsize(os.path.join(dp, f))
-                except OSError: pass
-        return n
+    def spool_bytes(self): return self.spool_used
+
+    def sweep_spool(self):
+        """uploads that can no longer complete: whole jobs that are accepted / failed / cancelled, and inside open
+        jobs the leases that ended other than by expiry (an expired lease may still finish: the late-result rule)"""
+        try: jobs_ = os.listdir(self.spool)
+        except OSError: return
+        for jd in jobs_:
+            if not jd.isdigit(): continue
+            j = self.store.q("SELECT state FROM jobs WHERE id=?", (int(jd),))
+            if not j or j[0]["state"] in ("accepted", "failed", "cancelled"):
+                shutil.rmtree(os.path.join(self.spool, jd), ignore_errors=True); continue
+            try: leases_ = os.listdir(os.path.join(self.spool, jd))
+            except OSError: continue                       # removed by complete() or fail() meanwhile
+            for ld in leases_:
+                l = self.store.q("SELECT state FROM leases WHERE id=?", (ld,))
+                if not l or l[0]["state"] not in ("active", "expired"):
+                    shutil.rmtree(os.path.join(self.spool, jd, ld), ignore_errors=True)
+        n = _dir_bytes(self.spool)
+        with self.spool_lock: self.spool_used = n
 
     # ------------------------------------------------------------ completion
     def complete(self, w, b):
@@ -348,7 +381,9 @@ class Queue:
             p = os.path.join(d, n)
             if not os.path.exists(p) or os.path.getsize(p) != meta.get("size") or sha256_file(p) != meta.get("sha256"):
                 bad.append(n)
-                if os.path.exists(p): os.remove(p)
+                if os.path.exists(p):
+                    gone = os.path.getsize(p); os.remove(p)
+                    with self.spool_lock: self.spool_used -= gone
         if bad:
             with self.store.tx() as db: self.store.event(db, "upload_bad", job_id, w["id"], lease_id, {"files": bad})
             raise HTTPError(422, "uploaded bytes do not match the declared sha256 / size: re-upload", bad=bad)
@@ -359,7 +394,8 @@ class Queue:
                 l2 = db.execute("SELECT * FROM leases WHERE id=?", (lease_id,)).fetchone()
                 self.store.end_lease(db, l2, "rejected", error=f"result rejected: {e}")
                 self.store.event(db, "result_rejected", job_id, w["id"], lease_id, {"error": str(e)[:500]})
-            shutil.rmtree(d, ignore_errors=True)
+            gone = _dir_bytes(d); shutil.rmtree(d, ignore_errors=True)
+            with self.spool_lock: self.spool_used -= gone
             raise HTTPError(422, f"result rejected: {e}", rejected=True)
         with self.store.tx() as db:
             j = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -367,6 +403,7 @@ class Queue:
                 self.store.event(db, "duplicate", job_id, w["id"], lease_id)
                 return {"ok": True, "duplicate": True, "yours": False}
             if j["state"] in ("cancelled", "failed"): raise HTTPError(409, f"job {j['state']}")
+            jd = os.path.join(self.spool, str(job_id)); gone = _dir_bytes(jd)   # this lease's files move out, the rest go
             dst = os.path.join(self.results, str(job_id))
             if os.path.exists(dst): shutil.rmtree(dst)
             try: os.replace(d, dst)
@@ -381,7 +418,8 @@ class Queue:
                        "lease_id=NULL, lease_owner=NULL, lease_expires=NULL, updated=? WHERE id=?",
                        (lease_id, w["id"], now, json.dumps(result), json.dumps(files), now, job_id))
             self.store.event(db, "accept_late" if late else "accept", job_id, w["id"], lease_id)
-        shutil.rmtree(os.path.join(self.spool, str(job_id)), ignore_errors=True)
+        shutil.rmtree(jd, ignore_errors=True)
+        with self.spool_lock: self.spool_used -= gone
         try: V.after_accept(self.store, self.results, job_id, self.policy)        # spot-check draw / comparison, points
         except Exception: traceback.print_exc()
         return {"ok": True, "duplicate": False}
@@ -651,7 +689,7 @@ def main():
     def reaper():
         while True:
             time.sleep(min(5.0, a.lease_s / 4))
-            try: Handler.Q.store.expire()
+            try: Handler.Q.store.expire(); Handler.Q.sweep_spool()
             except Exception: traceback.print_exc()
     threading.Thread(target=reaper, daemon=True).start()
     if a.status_interval > 0:

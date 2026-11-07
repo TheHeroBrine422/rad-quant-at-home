@@ -160,13 +160,14 @@ itself: [research-kit/](research-kit/README.md).
 
 - **Server** (`server/server.py`, Python stdlib only): workers register with an invite code and get a token (only
   its sha256 is stored). The job table holds type, params, inputs, requirements, state, lease owner / expiry,
-  attempts, result, spot-check state. A reaper thread puts jobs whose leases missed their heartbeat back in the queue;
-  a job fails for good after `max_attempts` (default 5). Completion is idempotent: once a job is accepted, any later
-  completion or upload for it is acknowledged and ignored. A late result from an expired lease is still accepted if
-  nobody has finished the job yet, and the newer lease is then told to stop. Files are served with HTTP Range support,
-  only to a worker holding an active lease on a job that lists the file, and goldens / corpora only while their
-  privacy marker says public. No HTTP endpoint changes anything as admin; the search's batch endpoint (its own token)
-  can only enqueue eval_mix jobs on public goldens.
+  attempts, result, spot-check state. A reaper thread puts jobs whose leases missed their heartbeat back in the queue
+  and deletes the spooled uploads of leases that can no longer complete (an expired lease's upload is kept while its
+  job is still open: the late-result rule); a job fails for good after `max_attempts` (default 5). Completion is
+  idempotent: once a job is accepted, any later completion or upload for it is acknowledged and ignored. A late
+  result from an expired lease is still accepted if nobody has finished the job yet, and the newer lease is then
+  told to stop. Files are served with HTTP Range support, only to a worker holding an active lease on a job that
+  lists the file, and goldens / corpora only while their privacy marker says public. No HTTP endpoint changes
+  anything as admin; the search's batch endpoint (its own token) can only enqueue eval_mix jobs on public goldens.
 - **Scheduler** (0.2, 0.4: docs/SCHED.md): every job type declares what one job needs (`requires`: GPU, cards, VRAM per card, host RAM;
   by model size or bpw), every worker what it has (`--gpus` / `--cards`, `--vram-gb`, `--ram-gb`, `--cache-gb`). A job
   is leased only to a worker whose declaration covers it and whose cards and RAM are free now (the server counts its

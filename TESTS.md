@@ -39,6 +39,7 @@ see section 7.
 Security fix round (issue #5, one attempt per worker per job; verifiers exempt): a worker that failed a job is not
 offered it again until `admin requeue`, and a verifier that failed one is offered it again. macOS dev box, 2026-11-06,
 **110/110** (plain process).
+Security fix round (issue #6, spool cleanup: abandoned lease deleted at once, cancelled job swept): macOS dev box, 2026-11-06, **110/110** (plain process).
 
 Request overhead: a 1 s noop job takes 1.01 s lease-to-complete on localhost.
 
