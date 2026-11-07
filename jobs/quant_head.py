@@ -32,5 +32,6 @@ def run(p, ctx):
 
 
 def accept(p, files, result, data_path):
-    Q.check_shard(p, plan(p), files["q-head.safetensors"], data_path(f"{Q.root(p)}/weights/head.safetensors"))
+    hdr = Q.check_shard(p, plan(p), files["q-head.safetensors"], data_path(f"{Q.root(p)}/weights/head.safetensors"))
     Q.check_log(p, plan(p), files["proxy.jsonl"], files["job.json"])
+    if not Q.score_mode(p): Q.check_claims(plan(p), hdr, files["rowerr.npz"])

@@ -53,5 +53,6 @@ def run(p, ctx):
 
 
 def accept(p, files, result, data_path):
-    Q.check_shard(p, plan(p), files[shard(p)], data_path(f"{Q.root(p)}/weights/{wfile(p)}"))
+    hdr = Q.check_shard(p, plan(p), files[shard(p)], data_path(f"{Q.root(p)}/weights/{wfile(p)}"))
     Q.check_log(p, plan(p), files["proxy.jsonl"], files["job.json"])
+    if not Q.score_mode(p): Q.check_claims(plan(p), hdr, files["rowerr.npz"])

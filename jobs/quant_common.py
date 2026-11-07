@@ -263,3 +263,19 @@ def check_log(p, plan, proxy_path, job_path):
     meta = json.load(open(job_path))
     if meta.get("settings_stamp") != p["stamp"]: raise ValueError("job.json: settings stamp differs")
     return rows, meta
+
+def check_claims(plan, hdr, path):
+    """the per-row claim (rowerr.npz) is a zip of float arrays <key>.err / <key>.ref, one pair per tensor of the plan,
+    each as long as the tensor has output rows (so the checker can sample it and nothing malformed reaches np.load
+    in admin.py check)"""
+    import numpy as np
+    try: z = np.load(path, allow_pickle=False); files = set(z.files)
+    except Exception as e: raise ValueError(f"rowerr.npz: not a valid npz ({type(e).__name__})")
+    keys = qwen.keys(plan)
+    want = {f"{k}.{x}" for k in keys for x in ("err", "ref")}
+    if files != want: raise ValueError(f"rowerr.npz: keys differ from the plan (missing {sorted(want - files)[:3]}, extra {sorted(files - want)[:3]})")
+    for k in keys:
+        n = hdr[f"{k}.svh"]["shape"][0]
+        for x in ("err", "ref"):
+            a = z[f"{k}.{x}"]
+            if a.ndim != 1 or a.shape[0] != n or a.dtype.kind != "f": raise ValueError(f"rowerr.npz {k}.{x}: shape {a.shape} dtype {a.dtype}, want ({n},) float")

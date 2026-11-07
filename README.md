@@ -385,7 +385,8 @@ For each returned shard:
    (f16 `[out]`) and `.mul1` (int32 marker) for every linear of the layer plan, with the shapes our bf16 weights
    imply. `proxy.jsonl` covers each tensor once with the job's K, codebook and scaled-Hessian setting. `job.json`
    carries the job's settings stamp. `suh` / `svh` finite, non-zero, |x| ≤ 1e3, and `.mul1` is the MUL1 marker
-   (docs/VERIFY.md "Format"; the same rule the score verifier applies).
+   (docs/VERIFY.md "Format"; the same rule the score verifier applies); in replicate mode `rowerr.npz` is a valid npz
+   with one float `err`/`ref` pair per tensor of the right length.
 2. **Proxy recompute:** `exl3dec.py` decodes each tensor from its codes on the CPU. It is a numpy transcription of
    exllamav3's decode: integer and fractional K, qtf2's sub-1 salt, the mul1/i8/i8c/i4 codebooks. The checker
    then computes rel = tr(ΔW H ΔWᵀ) / tr(W H Wᵀ) against our own Hessian and bf16 weight.

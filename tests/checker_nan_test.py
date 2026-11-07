@@ -79,6 +79,23 @@ def run():
     rep = check.check_job("quant_tensor", pg, d, T.dp)
     ok("quant_tensor group 0, honest, full: PASS", rep["pass"], rep["summary"])
 
+    # a malformed rowerr.npz must be refused at completion and must not abort the checker (issue #13)
+    from jobs import quant_layer as QL
+    def bad_rowerr(name, write):
+        d = result(name, C0, p, logged, claims); write(f"{d}/rowerr.npz")
+        try: QL.accept(p, {f: f"{d}/{f}" for f in os.listdir(d)}, {}, T.dp); acc = "accepted"
+        except ValueError as e: acc = f"refused: {e}"
+        try: rep = check.check_job("quant_layer", p, d, T.dp, rows_frac=0.25, seed=1); chk = rep["summary"]; chk_ok = not rep["pass"] and chk.startswith("structure:")
+        except Exception as e: chk, chk_ok = f"raised {e!r}", False
+        ok(f"rowerr.npz {name}: accept refuses, check_job fails on structure", acc.startswith("refused") and chk_ok, f"{acc} | {chk}")
+    bad_rowerr("not a zip", lambda f: open(f, "wb").write(b"garbage"))
+    def drop_ref(f):
+        z = dict(np.load(f)); z.pop(f"{k0}.ref"); np.savez(f, **z)
+    bad_rowerr("missing a .ref", drop_ref)
+    def short_err(f):
+        z = dict(np.load(f)); z[f"{k0}.err"] = z[f"{k0}.err"][:-1]; np.savez(f, **z)
+    bad_rowerr("wrong length", short_err)
+
     n_ok = sum(1 for _, c in RESULTS if c)
     print(f"\n{n_ok}/{len(RESULTS)} checks passed")
     shutil.rmtree(T.W, ignore_errors=True)

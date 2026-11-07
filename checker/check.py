@@ -146,9 +146,11 @@ def check_job(jtype, p, res_dir, data_path, rows_frac=1.0, tol=None, seed=None):
     plan = m.plan(p)
     shard_name, wfile = m.shard(p), m.wfile(p)
     rep = {"pass": False, "summary": ""}
+    rowerr = os.path.join(res_dir, "rowerr.npz")
     try:
-        Q.check_shard(p, plan, os.path.join(res_dir, shard_name), data_path(f"{Q.root(p)}/weights/{wfile}"))
+        hdr = Q.check_shard(p, plan, os.path.join(res_dir, shard_name), data_path(f"{Q.root(p)}/weights/{wfile}"))
         rows, meta = Q.check_log(p, plan, os.path.join(res_dir, "proxy.jsonl"), os.path.join(res_dir, "job.json"))
+        if not Q.score_mode(p) and os.path.exists(rowerr): Q.check_claims(plan, hdr, rowerr)   # full mode without a claim is allowed
         sh = ST(os.path.join(res_dir, shard_name))
         for _, keys in plan:
             for key in keys:
@@ -161,7 +163,7 @@ def check_job(jtype, p, res_dir, data_path, rows_frac=1.0, tol=None, seed=None):
     res = check_tensors(plan, sh, lambda k: wts.get(f"{k}.weight"),
                         lambda h: data_path(f"{Q.root(p)}/hessians/{h}.safetensors"), p["K"], p["codebook"],
                         {r["key"]: r["proxy_err"] for r in rows}, rows_frac, seed,
-                        claims=load_claims(os.path.join(res_dir, "rowerr.npz")))
+                        claims=load_claims(rowerr))
     ok, bad, worst = verdict(res, tol)
     rep.update({"pass": ok, "bad": bad, "worst": worst, "tensors": res, "ourq_stamp": meta.get("ourq_stamp"),
                 "seconds": round(time.time() - t0, 1),
