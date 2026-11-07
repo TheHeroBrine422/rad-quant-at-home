@@ -353,6 +353,11 @@ ok("SELinux: the bind mount gets :z", S.state_mount(dict(base, state="/srv/rqah"
 hwe = S.detect(host_of(*machine("ext4", amd=[(120001, 31.86, "0x7551", False)], ram_gb=64, fs="ext4")))
 _, Wn = S.validate(dict(base), hwe)
 ok("ext4 cache on an eval card: reflink note", any("no reflinks" in w for w in Wn))
+_, Wd = S.validate(dict(base, leaderboard=True), hw)
+_, Wo = S.validate(dict(base, leaderboard=True, name="Ada"), hw)
+_, Wf = S.validate(dict(base, leaderboard=False), hw)
+ok("leaderboard with the default name 'donor': warned (the board credits by name); own name or not listed: no warning",
+   any("default name" in w for w in Wd) and not any("default name" in w for w in Wo + Wf), str(Wd))
 
 # ================================================================ 7. plain prompts (scripted)
 root, spec = machine("plain", nvidia=[("NVIDIA GeForce RTX 4070", 12282, "8.9", True)], ram_gb=32)

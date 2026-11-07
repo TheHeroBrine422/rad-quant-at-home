@@ -520,6 +520,9 @@ def validate(cfg, hw, secret=None):
     if cfg["mem_limit_gb"] and cfg["mem_limit_gb"] < cfg["ram_gb"] + 2:
         E.append("mem_limit_gb: the container limit must be a few GB above ram_gb")
     if ram_total and cfg["mem_limit_gb"] > ram_total: W.append("mem_limit_gb is above this machine's RAM")
+    if cfg["leaderboard"] and cfg["name"].casefold() == DEFAULTS["name"]:
+        W.append(f"leaderboard with the default name {cfg['name']!r}: the board credits by name, so you would share a row "
+                 "with everyone who kept it; pick your own")
     # disk
     free, fs, where = disk_at(hw["_host"], state_dir_for_disk(st, hw))
     if cfg["cache_gb"] < 10: E.append("cache_gb: at least 10 (a 27B layer's inputs are ~1.5 GB, an eval's up to 17 GB)")
@@ -680,7 +683,8 @@ def summary_lines(cfg, hw, secret_state, cfgdir, E=(), W=()):
          f"up {budget('up')}" + (f" (month from day {cfg['budget_reset_day']})" if cfg["max_down_gb_month"] or cfg["max_up_gb_month"] else ""),
          f"  when            {', '.join(cfg['windows']) + ' (' + (hw['tz'] or 'local time') + ')' if cfg['windows'] else 'always'}"
          + f"; on stop: {cfg['on_stop']} the running jobs",
-         f"  leaderboard     " + (f"listed as {cfg['name']!r}" if cfg["leaderboard"] else f"not listed (worker name {cfg['name']!r})"), "",
+         f"  leaderboard     " + (f"listed as {cfg['name']!r} (with every opted-in machine of that name)" if cfg["leaderboard"]
+                                  else f"not listed (worker name {cfg['name']!r})"), "",
          "Jobs it will get" + (" (small-card mode, docs/SMALL-CARDS.md):" if 0 < cfg["vram_gb"] < 12 else ":")]
     for t, ok in jobs_for(cfg["vendor"], cfg["vram_gb"], cfg["ram_gb"], len(cfg["gpus"] or [])):
         L.append(f"  {'+' if ok else '-'} {t}")
@@ -891,8 +895,10 @@ QUESTIONS = [
     Q("server", "Queue URL", "text", "the https:// URL you got with your invite", "Account"),
     Q("invite", "Invite code", "secret", "the one-time code from us; hidden while you type, stored only in worker.env (0600); "
       "Enter keeps the stored one, '-' removes it", "Account"),
-    Q("name", "Display name", "text", "worker name; also your public name if you opt in below: 1-32 characters, no e-mail or URL", "Account"),
-    Q("leaderboard", "On the public leaderboard", "bool", "opt in to be listed by display name on the status page", "Account"),
+    Q("name", "Display name", "text", "worker name; also your public name if you opt in below: 1-32 characters, no e-mail or URL. "
+      "Use the same name on every machine to be credited together", "Account"),
+    Q("leaderboard", "On the public leaderboard", "bool", "opt in to be listed by display name on the status page (one row per "
+      "name: every opted-in machine with this name adds to it; anyone can use any name)", "Account"),
     Q("vendor", "GPU vendor", "choice", "AMD (ROCm image) or NVIDIA (CUDA image): one worker per vendor", "GPUs",
       choices=("amd", "nvidia")),
     Q("gpus", "Cards to donate", "gpus", "device indices, e.g. 0 or 0,1; all = every usable card", "GPUs"),
