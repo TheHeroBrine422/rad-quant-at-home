@@ -33,7 +33,7 @@ import jobs
 from common.util import stamp
 from jobs import quant_common as Q
 from checker import exl3dec
-from checker.check import ST, hessian, validity, LIMIT_SCALE
+from checker.check import ST, hessian, validity
 
 # tolerances in log rel: a base per basis (the curve's own scatter, 27B levels) + Z x the honest seed noise of the
 # tensor, NOISE / sqrt(in x out) (a quant's error is a sum over many independent tiles); docs/VERIFY.md

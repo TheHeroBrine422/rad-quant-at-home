@@ -7,7 +7,8 @@
 
 1. structure: the shard holds exactly {key}.trellis / suh / svh / mul1 of every linear in the layer plan, with the
    dtypes and shapes the bf16 weights imply; proxy.jsonl covers each tensor once with the job's K / codebook /
-   scaled-Hessian setting; job.json carries the job's settings stamp.
+   scaled-Hessian setting; job.json carries the job's settings stamp; suh / svh finite, non-zero, |x| <= 1e3 and mul1
+   the MUL1 marker (docs/VERIFY.md "Format", the score verifier's rule).
 2. proxy recompute: each tensor decoded from its codes (exl3dec), rel = tr(dW H dW^T) / tr(W H W^T) against OUR
    input Hessian and OUR bf16 weight, compared with the proxy_err the worker logged (exllamav3's post-refit error,
    which is the same quantity against the undamped Hessian): |rel / logged - 1| <= tol. --rows-frac F < 1 scores a
