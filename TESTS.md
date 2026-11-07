@@ -37,6 +37,8 @@ see section 7.
 
 Request overhead: a 1 s noop job takes 1.01 s lease-to-complete on localhost.
 
+2026-11-06: 109/109 (plain process) with the two lease-id cases (issue #2).
+
 ## 2. Server throughput (the queue host, loopback, niced)
 
 One noop job with a 1.5 GB input and a 64 MB output: download + sha256 check **4.7 s** (~320 MB/s, limited by

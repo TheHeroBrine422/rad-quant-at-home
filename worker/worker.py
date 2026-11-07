@@ -446,9 +446,9 @@ class Worker:
         """check a leased (or resumed) job, give it its cards and RAM and a thread; refuse what does not fit"""
         try: m, own = self.validate(job)
         except jobs.Rejected as e:
-            log(f"job {str(job.get('id'))[:80]!r}: REJECTED: {e}")
+            log(f"job {str(job.get('id'))[:80]}: REJECTED: {e}")
             self.fail(job, f"rejected by worker: {e}", reject=True)
-            if cur and self.ids_ok(job): self.cleanup(cur)
+            if cur: self.cleanup(cur)
             return
         sreq = job.get("requires") or {}
         need = max(int(sreq.get("cards", 0)), own["cards"]); ram = max(float(sreq.get("ram_gb", 0)), own["ram_gb"])
