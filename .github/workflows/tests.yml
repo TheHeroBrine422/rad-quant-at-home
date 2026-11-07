@@ -37,7 +37,7 @@ jobs:
         run: |
           set -e
           for t in tests/score_test.py tests/sched_test.py tests/checker_nan_test.py tests/statuspage_test.py \
-                   tests/setup_test.py; do
+                   tests/setup_test.py tests/probation_test.py; do
             echo "::group::$t"; python -I "$t"; echo "::endgroup::"
           done
       - name: bandwidth e2e

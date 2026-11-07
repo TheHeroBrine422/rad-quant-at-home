@@ -150,9 +150,16 @@ def cmd_status(a):
                                ("COULD RUN", lambda w: w["could_run"] if w["could_run"] is not None else "-"),
                                ("LUMENS", lambda w: f"{w['lumens']:.2f}"),
                                ("DATA LEFT", lambda w: budget_cell(w)),
-                               ("FLAGS", lambda w: ",".join(k for k in ("trusted", "verifier", "quarantined", "disabled") if w[k]) or "-")]))
+                               ("FLAGS", lambda w: ",".join([k for k in ("trusted", "verifier", "quarantined", "disabled") if w[k]] +
+                                                            [t for t in [(w.get("tier") or {}).get("tier")] if t not in (None, "full")]) or "-")]))
     for w in m["workers"]:
         if w["quarantined"]: print(f"\nworker {w['id']} is QUARANTINED: {w['quarantine_reason']} (ask the operator)")
+        t = w.get("tier") or {}
+        if t.get("tier") in ("probation", "quant"):
+            print(f"\nworker {w['id']} is on probation (registered without an invite): quantization jobs only"
+                  + (f", one at a time until {t['probation_pass']} results pass" if t["tier"] == "probation" else "")
+                  + f"; evaluations after {t['eval_unlock']} passed results ({t['passed']} so far)"
+                  + (" (locked by its quarantine: ask the operator)" if w["quarantined"] else ""))
         b = w.get("budget")
         if b and b["spent"]:
             until = lt(b["reset"]) if b.get("reset") else "the next reset"

@@ -26,6 +26,9 @@ the 0.2 names $RADQUANT_* are still read in 0.3)
   model-info MODEL REV [--n-params N]    (re)write models/MODEL@REV/model.json (n_params: sets requirements / bpw)
   trust ID [--off] | verifier ID [--off] the per-worker flags: trusted (big-box job types), verifier (spot-check re-runs)
   quarantine ID --reason R | unquarantine ID
+  probation ID [--off]                   a worker registered without an invite starts on probation (score-mode quant
+                                         only until it has passed results; docs/VERIFY.md): --off lifts it, also
+                                         the lock a quarantine puts on it; without --off puts a worker on it
   spot JOB                               re-run an accepted job on a verifier now (a manual spot check)
   ladder-add MODEL REV LEVEL FILE.rad    cut a ladder level's container into models/MODEL@REV/rad/LEVEL/ (skeleton +
                                          one piece per weight) for eval_mix; then `manifest`
@@ -616,6 +619,7 @@ def main():
     for c in ("trust", "verifier"): x = sp.add_parser(c); x.add_argument("id", type=int); x.add_argument("--off", action="store_true")
     x = sp.add_parser("quarantine"); x.add_argument("id", type=int); x.add_argument("--reason", required=True)
     x = sp.add_parser("unquarantine"); x.add_argument("id", type=int)
+    x = sp.add_parser("probation"); x.add_argument("id", type=int); x.add_argument("--off", action="store_true")
     x = sp.add_parser("spot"); x.add_argument("ids", nargs="+")
     x = sp.add_parser("ladder-add"); x.add_argument("model"); x.add_argument("rev"); x.add_argument("level"); x.add_argument("rad")
     x = sp.add_parser("golden-add"); x.add_argument("name"); x.add_argument("dir"); x.add_argument("--public", action="store_true")
@@ -687,7 +691,8 @@ def main():
     elif a.cmd == "add-worker": wid, tok = S.add_worker(a.name); print(f"worker {wid} token {tok}")
     elif a.cmd == "workers":
         for r in S.q("SELECT * FROM workers ORDER BY id"):
-            fl = ",".join(k for k in ("disabled", "trusted", "verifier", "quarantined") if r[k])
+            fl = ",".join(k for k in ("disabled", "trusted", "verifier", "quarantined") if r[k]) + \
+                 {0: "", 1: ",probation", 2: ",probation-locked"}.get(r["probation"], "")
             print(r["id"], r["name"], f"donor {r['donor_id']}", fl, time.strftime("%Y-%m-%d %H:%M", time.gmtime(r["last_seen"] or 0)), r["caps"],
                   r["quarantine_reason"] or "")
     elif a.cmd == "disable-worker":
@@ -723,6 +728,12 @@ def main():
         with S.tx() as db:
             db.execute("UPDATE workers SET quarantined=0, quarantine_reason=NULL WHERE id=?", (a.id,)); S.event(db, "unquarantine", worker_id=a.id)
         print(f"worker {a.id}: quarantine lifted (its invalidated results stay requeued)")
+    elif a.cmd == "probation":
+        with S.tx() as db:
+            if db.execute("UPDATE workers SET probation=? WHERE id=?", (0 if a.off else 1, a.id)).rowcount != 1:
+                sys.exit(f"no worker {a.id}")
+            S.event(db, f"probation{'-off' if a.off else ''}", worker_id=a.id)
+        print(f"worker {a.id}: probation {'off' if a.off else 'on'}")
     elif a.cmd == "spot": cmd_spot(a, S)
     elif a.cmd == "ladder-add": cmd_ladder_add(a, S)
     elif a.cmd == "golden-add": cmd_golden_add(a, S)

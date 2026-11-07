@@ -2,9 +2,9 @@
 # Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
 """server.py --db QUEUE.sqlite --data DATAROOT --spool DIR --results DIR [--bind 127.0.0.1] [--port 8740]
 
-The rad-quant-at-home job queue (stdlib only). Workers authenticate with a bearer token (from /register with an invite
-code, or admin.py add-worker). Plain HTTP: put it behind a TLS terminator or a tunnel before anything leaves localhost
-/ LAN. Every flag can also come from the environment as RQAH_<FLAG> (e.g. RQAH_DB, RQAH_PORT,
+The rad-quant-at-home job queue (stdlib only). Workers authenticate with a bearer token (from /register, with an
+invite code or, with open registration, without one: then on probation; or admin.py add-worker). Plain HTTP: put it
+behind a TLS terminator or a tunnel before anything leaves localhost / LAN. Every flag can also come from the environment as RQAH_<FLAG> (e.g. RQAH_DB, RQAH_PORT,
 RQAH_ADMIN_TOKEN_FILE; the 0.2 names RADQUANT_<FLAG> are still read in 0.3); a flag on the command line wins. The
 container image (docker/server/) configures it that way.
 
@@ -21,7 +21,13 @@ when they change). A worker may declare a data budget (bytes left to download / 
 uncached inputs and expected upload (jobs/*.upload_bytes) fit. A higher-class job a busy worker could run but keeps
 passing over drains that worker once it has waited --class-wait-s.
 
-  POST /api/v0/register   {invite, name}                              -> {worker_id, token}
+  POST /api/v0/register   {invite?, name, leaderboard?}               -> {worker_id, token, probation}
+
+Open registration (0.5, docs/VERIFY.md "Identity"): /register without an invite makes a worker on probation (score-mode
+quant jobs only, one lease at a time, until --probation-pass of its results passed; eval_mix and every type whose check
+takes our hardware after --eval-unlock), rate-limited per client address (--reg-per-ip-day, IPv6 per /64) and in total
+(--reg-global-hour): 429 with retry_s. --no-open-registration: invites only (403). The client address is the peer's,
+or, when the peer is one of --trusted-proxy, the rightmost X-Forwarded-For entry that is not a trusted proxy.
   POST /api/v0/lease      {caps}                                      -> {job: {...}} | {job: null, retry_s}
   POST /api/v0/heartbeat  {job_id, lease_id}                          -> {ok, cancel, lease_expires}
   GET  /api/v0/upload/J/LEASE/NAME                                    -> {size} (resume point)
@@ -122,6 +128,30 @@ class Queue:
         self.cache_reports = {}                             # worker id -> (rev, set of sha256[:16])
         self.page, self.page_t = None, 0.0
         self.campaign = a.campaign or os.path.join(os.path.dirname(os.path.abspath(a.db)), "campaign.json")
+        self.probation = (int(getattr(a, "probation_pass", SCH.PROBATION_PASS)), int(getattr(a, "eval_unlock", SCH.EVAL_UNLOCK)))
+        self.store.probation = self.probation                # the donor API reports the tiers with the same thresholds
+        self.proxies = {x.strip() for x in (getattr(a, "trusted_proxy", None) or "").split(",") if x.strip()}
+
+    def tier(self, q, wr):
+        """(tier, passed quant results) of worker row wr (sched.tier)"""
+        if not wr["probation"] or wr["verifier"]: return "full", None
+        n = SCH.passed_quant(q, wr["id"])
+        return SCH.tier(wr, n, *self.probation), n
+
+    def register(self, b, addr):
+        """POST /register: with an invite as before; without one (open registration) on probation, rate-limited"""
+        name = str(b.get("name", ""))[:64]
+        if not NAME_RE.match(name): raise HTTPError(400, "bad name")
+        inv, lb = b.get("invite"), b.get("leaderboard") is True
+        if inv:
+            r = self.store.register(str(inv), name, leaderboard=lb)
+            if r is None: raise HTTPError(403, "bad invite")
+            return {"worker_id": r[0], "token": r[1], "probation": False}
+        if not getattr(self.a, "open_registration", True):
+            raise HTTPError(403, "registration needs an invite on this server (open registration is off)")
+        wid, x = self.store.register_open(name, addr, getattr(self.a, "reg_per_ip_day", 5), getattr(self.a, "reg_global_hour", 60), lb)
+        if wid is None: raise HTTPError(429, "too many registrations without an invite; try again later", retry_s=x)
+        return {"worker_id": wid, "token": x, "probation": True}
 
     def build_page(self):
         """the status page from the database (kept in memory; / serves the last good one)"""
@@ -188,7 +218,11 @@ class Queue:
                         "verification); ask the operator"}
             act = db.execute("SELECT j.requires FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND l.state='active'",
                              (w["id"],)).fetchall()
-            if len(act) >= slots: return {"job": None, "retry_s": 30, "why": "all slots busy"}
+            tr_, passed = self.tier(lambda sql, args: db.execute(sql, args).fetchall(), wr)
+            if tr_ == "probation": slots = 1
+            if len(act) >= slots:
+                return {"job": None, "retry_s": 30, "why": "all slots busy" if tr_ != "probation" else
+                        f"probation: one job at a time until {self.probation[0]} quantization results pass ({passed} so far)"}
             used = [norm_req(json.loads(r["requires"])) for r in act]
             free_cards = cards - sum(r["cards"] for r in used); free_ram = caps.get("ram_gb", 0) - sum(r["ram_gb"] for r in used)
 
@@ -202,7 +236,7 @@ class Queue:
             if not wr["verifier"]:                          # #7: abandon + lease again does not restart the deadline
                 failed = set(failed) | {jid for jid, t0 in self._held(db, w["id"]).items()
                                         if (c := self._cap_of(db, jid)) is not None and t0 + c <= now}
-            eligible = job_filter(wr, caps, failed, SCH.donor_groups(db, wr))
+            eligible = job_filter(wr, caps, failed, SCH.donor_groups(db, wr), tr_)
             tr = SCH.Transfers(self.manifest(), self.up_memo)
 
             def fits_now(r): return r["cards"] <= free_cards and r["ram_gb"] <= free_ram
@@ -498,7 +532,7 @@ class Queue:
         if w is not None:                                   # the asking worker's own standing (its points, flags)
             me = self.store.q("SELECT COALESCE(SUM(lumens), 0) FROM points WHERE worker_id=?", (w["id"],))[0][0]
             out["me"] = {"id": w["id"], "name": w["name"], "lumens": me, "trusted": bool(w["trusted"]),
-                         "quarantined": bool(w["quarantined"])}
+                         "quarantined": bool(w["quarantined"]), "tier": self.tier(self.store.q, w)[0]}
         return out
 
     def health(self):
@@ -562,6 +596,16 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(b, dict): raise HTTPError(400, "bad json")
         return b
 
+    def _client_addr(self):
+        """the peer's address; behind one of --trusted-proxy, the rightmost X-Forwarded-For entry that is not a trusted
+        proxy (the one our proxy appended: entries further left are whatever the client sent)"""
+        peer = self.client_address[0]
+        if peer not in self.Q.proxies: return peer
+        hops = [x.strip() for x in ",".join(self.headers.get_all("X-Forwarded-For") or []).split(",") if x.strip()]
+        for x in reversed(hops):
+            if x not in self.Q.proxies: return x
+        return peer
+
     def _worker(self):
         a = self.headers.get("Authorization", "")
         w = self.Q.store.auth(a[7:] if a.startswith("Bearer ") else None)
@@ -585,12 +629,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._data(self._worker(), "/".join(parts[1:]))
             if parts[:2] != ["api", API]: raise HTTPError(404, "no such endpoint")
             ep = parts[2:]
-            if method == "POST" and ep == ["register"]:
-                b = self._json(); name = str(b.get("name", ""))[:64]
-                if not NAME_RE.match(name): raise HTTPError(400, "bad name")
-                r = Q.store.register(str(b.get("invite", "")), name, leaderboard=b.get("leaderboard") is True)
-                if r is None: raise HTTPError(403, "bad invite")
-                return self._send(200, {"worker_id": r[0], "token": r[1]})
+            if method == "POST" and ep == ["register"]: return self._send(200, Q.register(self._json(), self._client_addr()))
             w = self._worker()
             if method == "POST" and ep == ["lease"]: return self._send(200, Q.lease(w, self._json().get("caps", {})))
             if method == "POST" and ep == ["heartbeat"]: return self._send(200, Q.heartbeat(w, self._json()))
@@ -758,6 +797,21 @@ def main():
                     help="score score-mode quant results in this process (docs/VERIFY.md; ~2.6 GB RAM each at the 27B); "
                          "0: run `admin.py score --loop` beside it instead")
     ap.add_argument("--score-poll-s", type=float, default=env("SCORE_POLL_S", 10, float))
+    ap.add_argument("--open-registration", action=argparse.BooleanOptionalAction,
+                    default=env("OPEN_REGISTRATION", True, lambda v: v.lower() not in ("0", "false", "no", "off")),
+                    help="/register without an invite makes a worker on probation (default on; --no-open-registration: "
+                         "invites only)")
+    ap.add_argument("--reg-per-ip-day", type=int, default=env("REG_PER_IP_DAY", 5, int),
+                    help="registrations without an invite per client address (IPv6: per /64) in 24 h (0: no limit)")
+    ap.add_argument("--reg-global-hour", type=int, default=env("REG_GLOBAL_HOUR", 60, int),
+                    help="registrations without an invite in total per hour (0: no limit)")
+    ap.add_argument("--trusted-proxy", default=env("TRUSTED_PROXY", ""),
+                    help="comma-separated addresses of the reverse proxy in front: only from these is X-Forwarded-For "
+                         "read for the client address (in the container: the address the proxy reaches it from)")
+    ap.add_argument("--probation-pass", type=int, default=env("PROBATION_PASS", SCH.PROBATION_PASS, int),
+                    help="passed quant results after which a worker registered without an invite may hold more than one lease")
+    ap.add_argument("--eval-unlock", type=int, default=env("EVAL_UNLOCK", SCH.EVAL_UNLOCK, int),
+                    help="... and after which it may run eval_mix and every other type whose check takes our hardware")
     ap.add_argument("--verbose", action="store_true", default=env("VERBOSE", False, lambda v: v not in ("0", "false", "no")))
     a = ap.parse_args()
     miss = [f"--{k} (RQAH_{k.upper()})" for k in ("db", "data", "spool", "results") if not getattr(a, k)]
@@ -794,8 +848,11 @@ def main():
         print(f"signal {signum}: shutting down", flush=True)
         threading.Thread(target=srv.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, on_term); signal.signal(signal.SIGINT, on_term)
+    reg = (f"open (probation {a.probation_pass}/{a.eval_unlock}, {a.reg_per_ip_day}/address/day, {a.reg_global_hour}/h)"
+           if a.open_registration else "invites only")
     print(f"rad-quant-at-home queue on http://{a.bind}:{srv.server_address[1]}  db={a.db}  data={a.data}  results={a.results}  "
           f"admin summary {'on' if a.admin_token_file else 'off'}, search API {'on' if a.search_token_file else 'off'}, "
+          f"registration {reg}, "
           f"spot checks {a.spot_rate:.0%} (eval {a.eval_spot_rate:.0%}, {a.eval_spot_docs} docs) + first {a.spot_first}, scorer {'on' if a.score_threads > 0 else 'off'}, status page "
           f"{f'every {a.status_interval:g}s' + (' -> ' + a.status_dir if a.status_dir else '') if a.status_interval > 0 else 'off'}", flush=True)
     srv.serve_forever()

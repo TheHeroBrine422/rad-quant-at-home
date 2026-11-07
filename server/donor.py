@@ -3,8 +3,8 @@
 CLI client/rqah.py). Authenticated with any one worker token; the answer covers every worker of that worker's
 donor (store.py: donors).
 
-  GET  /api/v0/me                  profile, workers (caps as declared, flags, running jobs, lumens), totals, queue depth
-                                   (and how many queued jobs each worker could run)
+  GET  /api/v0/me                  profile, workers (caps as declared, flags, tier, running jobs, lumens), totals, queue
+                                   depth (and how many queued jobs each worker could run)
   GET  /api/v0/me/jobs?limit=N&worker=ID&active=1     leases of the donor's workers, newest first, each with its
                                    verification state (VERIFICATION below) and lumens
   GET  /api/v0/me/points?limit=N   lumens per worker and type, the ledger (grants / revokes), what is still pending,
@@ -196,8 +196,18 @@ def _expected(j):
     except Exception: return None
 
 
+def tier_of(S, x):
+    """(sched.tier of worker row x, its passed quant results or None when it was never on probation)"""
+    if not x["probation"] or x["verifier"]: return "full", None
+    n = sched.passed_quant(S.q, x["id"])
+    return sched.tier(x, n, *_thresholds(S)), n
+
+
+def _thresholds(S): return getattr(S, "probation", (sched.PROBATION_PASS, sched.EVAL_UNLOCK))
+
+
 def me(S, w):
-    ws = donor_workers(S, w); wids = [x["id"] for x in ws]; d = _donor(S, w)
+    ws = donor_workers(S, w); wids = [x["id"] for x in ws]; d = _donor(S, w); pp, eu = _thresholds(S)
     net = net_by_job(S, wids)
     run = {}
     for r in S.q(f"SELECT l.worker_id, j.id, j.type FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.state='active' "
@@ -211,7 +221,8 @@ def me(S, w):
     for x in ws:
         caps = json.loads(x["caps"] or "{}")
         lum = [v for (wi, _), v in net.items() if wi == x["id"] and v > 1e-9]
-        f = sched.job_filter(x, caps) if caps.get("job_types") else None
+        tr, passed = tier_of(S, x)
+        f = sched.job_filter(x, caps, tier_=tr) if caps.get("job_types") else None
         workers.append({"id": x["id"], "name": x["name"], "registered": x["created"], "last_seen": x["last_seen"],
                         "gpu_name": scrub(caps.get("gpu_name", ""), 64), "cards": caps.get("cards"), "vram_gb": caps.get("vram_gb"),
                         "ram_gb": caps.get("ram_gb"), "disk_gb": caps.get("disk_gb"), "job_types": caps.get("job_types", []),
@@ -219,6 +230,7 @@ def me(S, w):
                         "cached_inputs": (caps.get("cache") or {}).get("n") if isinstance(caps.get("cache"), dict) else None,
                         "trusted": bool(x["trusted"]), "verifier": bool(x["verifier"]), "quarantined": bool(x["quarantined"]),
                         "disabled": bool(x["disabled"]),
+                        "tier": {"tier": tr, "passed": passed, "probation_pass": pp, "eval_unlock": eu} if x["probation"] else {"tier": tr},
                         "quarantine_reason": scrub(x["quarantine_reason"]) if x["quarantined"] else None,
                         "running": run.get(x["id"], []), "lumens": round(sum(lum), 4), "verified_jobs": len(lum),
                         "could_run": sum(1 for j in queued if f(j) is not None) if f else None})

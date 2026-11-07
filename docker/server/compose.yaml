@@ -53,6 +53,15 @@ services:
       RQAH_RESERVE_MAX_S: ${RQAH_RESERVE_MAX_S:-21600}
       RQAH_LEASE_CAP_X: ${RQAH_LEASE_CAP_X:-3}
       RQAH_LEASE_CAP_MIN_S: ${RQAH_LEASE_CAP_MIN_S:-7200}
+      # open registration (docs/VERIFY.md "Identity"): /register without an invite -> a worker on probation, rate-limited;
+      # TRUSTED_PROXY: the address(es) the reverse proxy reaches the server from (here: usually the bridge gateway);
+      # only from those is X-Forwarded-For read. Without it every client behind the proxy shares one address's limit.
+      RQAH_OPEN_REGISTRATION: ${RQAH_OPEN_REGISTRATION:-1}
+      RQAH_REG_PER_IP_DAY: ${RQAH_REG_PER_IP_DAY:-5}
+      RQAH_REG_GLOBAL_HOUR: ${RQAH_REG_GLOBAL_HOUR:-60}
+      RQAH_TRUSTED_PROXY: ${RQAH_TRUSTED_PROXY:-}
+      RQAH_PROBATION_PASS: ${RQAH_PROBATION_PASS:-3}
+      RQAH_EVAL_UNLOCK: ${RQAH_EVAL_UNLOCK:-5}
       RQAH_VERBOSE: ${RQAH_VERBOSE:-${RADQUANT_VERBOSE:-0}}
     ports:
       - "${RQAH_PUBLISH:-${RADQUANT_PUBLISH:-127.0.0.1:8740}}:8740"

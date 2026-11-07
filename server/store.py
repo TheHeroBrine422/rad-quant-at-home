@@ -31,8 +31,14 @@ holds at most one of them), scores.tiles (#11: fingerprints of sampled trellis t
 meta (server-local secrets, e.g. which tiles are sampled). #4 (eval_mix): jobs.pred (the search's predicted KL and
 plausibility band; server side only, never sent to a worker), jobs.trust_state (a full re-run on a verifier: NULL,
 pending, pass, fail, error; jobs.verify_state is the spot check of a few documents), batch_items.adopted (when the
-search adopted the candidate)."""
-import hashlib, json, os, secrets, sqlite3, threading, time
+search adopted the candidate).
+
+0.5 (open registration, docs/VERIFY.md "Identity"): workers.probation (0: registered with an invite or by the
+operator; 1: registered without an invite, on probation until enough quant results pass, server/sched.py tier();
+2: a probation worker that was quarantined: it never unlocks, admin.py probation ID off clears it); reg_log (one
+row per registration without an invite: time and a keyed hash of the client address or IPv6 /64, never the address
+itself; rows older than a day are dropped), for the rate limits."""
+import hashlib, hmac, ipaddress, json, os, secrets, sqlite3, threading, time
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL,
@@ -70,6 +76,8 @@ CREATE INDEX IF NOT EXISTS scores_sha ON scores(codes_sha);
 CREATE INDEX IF NOT EXISTS scores_job ON scores(job_id);
 CREATE TABLE IF NOT EXISTS score_den(model TEXT NOT NULL, key TEXT NOT NULL, den REAL NOT NULL, PRIMARY KEY(model, key));
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS reg_log(t REAL NOT NULL, ipk TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS reg_log_ip ON reg_log(ipk, t);
 """
 # columns added after v0: (table, column, declaration); added to an existing database on open
 MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "verifier", "INTEGER NOT NULL DEFAULT 0"),
@@ -78,7 +86,8 @@ MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "ve
            ("jobs", "verify_detail", "TEXT"), ("jobs", "exclude_worker", "INTEGER"),
            ("workers", "donor_id", "INTEGER"), ("invites", "personal", "INTEGER NOT NULL DEFAULT 0"), ("invites", "donor_id", "INTEGER"),
            ("jobs", "requeued", "REAL"), ("leases", "deadline", "REAL"), ("jobs", "grp", "TEXT"), ("scores", "tiles", "BLOB"),
-           ("jobs", "pred", "TEXT"), ("jobs", "trust_state", "TEXT"), ("batch_items", "adopted", "REAL")]
+           ("jobs", "pred", "TEXT"), ("jobs", "trust_state", "TEXT"), ("batch_items", "adopted", "REAL"),
+           ("workers", "probation", "INTEGER NOT NULL DEFAULT 0")]
 
 
 def h(s): return hashlib.sha256(s.encode()).hexdigest()
@@ -153,6 +162,38 @@ class Store:
             if r["personal"] and not r["donor_id"]: db.execute("UPDATE invites SET donor_id=? WHERE code_hash=?", (did, h(invite)))
             cur = db.execute("INSERT INTO workers(name, token_hash, created, donor_id) VALUES(?,?,?,?)", (name, h(token), time.time(), did))
             self.event(db, "register", worker_id=cur.lastrowid, detail={"name": name, "donor": did})
+        return cur.lastrowid, token
+
+    def reg_key(self, addr):
+        """the rate-limit key of a client address: a keyed hash (the address itself is never stored) of the IPv4
+        address, or of the IPv6 /64 (one home connection usually has a whole /64)"""
+        try:
+            ip = ipaddress.ip_address(addr)
+            if ip.version == 6 and ip.ipv4_mapped: ip = ip.ipv4_mapped
+            k = str(ipaddress.ip_network(f"{ip}/64", strict=False)) if ip.version == 6 else str(ip)
+        except ValueError:
+            k = str(addr)[:100]
+        return hmac.new(self.secret("reg_ip_key").encode(), k.encode(), hashlib.sha256).hexdigest()[:32]
+
+    def register_open(self, name, addr, per_ip_day=5, global_hour=60, leaderboard=False, now=None):
+        """registration without an invite: a new donor and a worker on probation. -> (worker id, token), or
+        (None, seconds until a registration from this address would be allowed) when a rate limit is reached
+        (per_ip_day per client address / IPv6 /64 in 24 h, global_hour in total in one hour; 0 = no limit)"""
+        now = now or time.time(); ipk = self.reg_key(addr)
+        with self.tx() as db:
+            db.execute("DELETE FROM reg_log WHERE t < ?", (now - 86400,))
+            if per_ip_day > 0:
+                r = db.execute("SELECT COUNT(*), MIN(t) FROM reg_log WHERE ipk=? AND t >= ?", (ipk, now - 86400)).fetchone()
+                if r[0] >= per_ip_day: return None, max(1, int(r[1] + 86400 - now) + 1)
+            if global_hour > 0:
+                r = db.execute("SELECT COUNT(*), MIN(t) FROM reg_log WHERE t >= ?", (now - 3600,)).fetchone()
+                if r[0] >= global_hour: return None, max(1, int(r[1] + 3600 - now) + 1)
+            db.execute("INSERT INTO reg_log(t, ipk) VALUES(?,?)", (now, ipk))
+            token = new_token()
+            did = self.new_donor(db, name, leaderboard)
+            cur = db.execute("INSERT INTO workers(name, token_hash, created, donor_id, probation) VALUES(?,?,?,?,1)",
+                             (name, h(token), now, did))
+            self.event(db, "register", worker_id=cur.lastrowid, detail={"name": name, "donor": did, "probation": True})
         return cur.lastrowid, token
 
     def add_worker(self, name, donor_id=None):
