@@ -2,7 +2,8 @@
 # Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
 """checker_nan_test.py -- the replicate-mode checker (checker/check.py) on the synthetic layer of tests/score_test.py,
 no GPU: an honest result passes in full and sampled mode; a shard with a NaN scale, a per-row claim with a NaN, and a
-claim whose rows are all 0/0 must each FAIL (a NaN comparison used to pass, issue #3)."""
+claim whose rows are all 0/0 must each FAIL (a NaN comparison used to pass, issue #3); an honest quant_tensor group-0
+result passes against its own shard and group weights file (issue #14)."""
 import json, os, shutil, sys
 import numpy as np
 
@@ -68,6 +69,15 @@ def run():
     bad = dict(claims); bad[k0] = (np.zeros_like(e), np.zeros_like(r))
     rep = check.check_job("quant_layer", p, result("zero-claim", C0, p, logged, bad), T.dp, rows_frac=0.25, seed=1)
     ok("an all-zero per-row claim (0/0), sampled 25%: FAIL", not rep["pass"] and k0 in rep.get("bad", []), rep["summary"])
+
+    # quant_tensor: group 0 of the layer, its own weights file and shard name (issue #14)
+    g0 = T.PLAN[0]; gk = g0[1]; pg = dict(p, group=0)
+    wts_all = check.ST(f"{T.ROOT}/weights/L00.safetensors")
+    T.write_st(f"{T.ROOT}/weights/L00-g0.safetensors", {f"{k}.weight": ("BF16", T.bf16(wts_all.get(f"{k}.weight"))) for k in gk})
+    d = result("tensor-g0", {k: C0[k] for k in gk}, pg, logged)
+    os.replace(f"{d}/q-L00.safetensors", f"{d}/q-L00-g0.safetensors")
+    rep = check.check_job("quant_tensor", pg, d, T.dp)
+    ok("quant_tensor group 0, honest, full: PASS", rep["pass"], rep["summary"])
 
     n_ok = sum(1 for _, c in RESULTS if c)
     print(f"\n{n_ok}/{len(RESULTS)} checks passed")

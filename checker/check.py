@@ -144,8 +144,7 @@ def check_job(jtype, p, res_dir, data_path, rows_frac=1.0, tol=None, seed=None):
     tol = TOL if tol is None else tol
     m = jobs.get(jtype)
     plan = m.plan(p)
-    shard_name = f"q-L{p['layer']:02d}.safetensors" if jtype == "quant_layer" else "q-head.safetensors"
-    wfile = m.wfile(p) if jtype == "quant_layer" else "head.safetensors"
+    shard_name, wfile = m.shard(p), m.wfile(p)
     rep = {"pass": False, "summary": ""}
     try:
         Q.check_shard(p, plan, os.path.join(res_dir, shard_name), data_path(f"{Q.root(p)}/weights/{wfile}"))
