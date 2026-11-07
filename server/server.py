@@ -39,6 +39,7 @@ passing over drains that worker once it has waited --class-wait-s.
   POST /api/v0/search/batch           an eval_mix batch (server/batch.py)      } only with --search-token-file,
   GET  /api/v0/search/batch/ID        its status and per-candidate results    } bearer = that token; enqueues
   GET  /api/v0/search/batch/ID/rows/C candidate C's rows ([rows, 4] f32)       } eval_mix jobs on public goldens only
+  POST /api/v0/search/batch/ID/adopt  {candidates: [C, ...]}: the search adopts them; each gets a full trusted re-run
 
 Nothing else that changes the queue goes over HTTP: admin.py works on the database and the data root directly, on
 this host (or in the server container: `rqah admin ...`)."""
@@ -57,6 +58,7 @@ from server import sched as SCH
 from server.sched import norm_req, job_filter
 
 CHUNK_MAX = 64 << 20
+IMPLAUSIBLE_TO_VERIFIER = 2            # #4: after this many donors' implausible results a job goes to our verifiers
 JSON_MAX = 1 << 20
 BATCH_MAX = 32 << 20
 CAPS = {"type": "object", "required": ["job_types"], "properties": {
@@ -112,7 +114,8 @@ class Queue:
         self.spool_used = _dir_bytes(self.spool)
         self.admin_hash = self._token_hash(a.admin_token_file, "admin")
         self.search_hash = self._token_hash(a.search_token_file, "search")
-        self.policy = V.Policy(a.spot_rate, a.spot_first)
+        self.policy = V.Policy(a.spot_rate, a.spot_first, rates={"eval_mix": getattr(a, "eval_spot_rate", 0.08)},
+                               docs=getattr(a, "eval_spot_docs", 3), data=self.data)
         self.store.reserve_max_s = a.reserve_max_s; self.store.reserve_idle_s = max(4 * a.lease_s, 60)
         self.piece_cache = {}
         self.up_memo = {}                                   # job id -> expected upload bytes (sched.Transfers)
@@ -427,13 +430,28 @@ class Queue:
         if bad:
             with self.store.tx() as db: self.store.event(db, "upload_bad", job_id, w["id"], lease_id, {"files": bad})
             raise HTTPError(422, "uploaded bytes do not match the declared sha256 / size: re-upload", bad=bad)
+        check = None
         try:
-            m.accept(params, {n: os.path.join(d, n) for n in files}, result, lambda rel: self.data_path(rel))
+            info = m.accept(params, {n: os.path.join(d, n) for n in files}, result, lambda rel: self.data_path(rel))
+            if j["pred"] and hasattr(m, "plausible") and isinstance(info, dict):    # #4: vs the search's prediction
+                verdict, det = m.plausible(json.loads(j["pred"]), info)
+                if verdict == "reject" and not w["verifier"]:
+                    raise ValueError(f"implausible: mean KL {det['kld_mean']:.6g} is more than {det['band']['worse']:g} x the "
+                                     f"predicted {det['pred_kld']:.6g}")
+                check = (verdict if verdict != "reject" else "pass", det)          # our own verifier: a fact, not a fake
         except Exception as e:
             with self.store.tx() as db:
                 l2 = db.execute("SELECT * FROM leases WHERE id=?", (lease_id,)).fetchone()
                 self.store.end_lease(db, l2, "rejected", error=f"result rejected: {e}")
                 self.store.event(db, "result_rejected", job_id, w["id"], lease_id, {"error": str(e)[:500]})
+                if str(e).startswith("implausible") and not j["needs"]:
+                    # two donors agree the mix is far worse than predicted: the prediction is off, not both donors.
+                    # Our verifiers settle it (an honest surprise must not fail the job for good)
+                    n = db.execute("SELECT COUNT(DISTINCT worker_id) FROM events WHERE job_id=? AND kind='result_rejected' AND "
+                                   "detail LIKE '%implausible%' AND t > ?", (job_id, j["requeued"] or 0)).fetchone()[0]
+                    if n >= IMPLAUSIBLE_TO_VERIFIER:
+                        db.execute("UPDATE jobs SET needs='verifier' WHERE id=?", (job_id,))
+                        self.store.event(db, "implausible_to_verifier", job_id, detail={"donors": n})
             gone = _dir_bytes(d); shutil.rmtree(d, ignore_errors=True)
             with self.spool_lock: self.spool_used -= gone
             raise HTTPError(422, f"result rejected: {e}", rejected=True)
@@ -457,6 +475,9 @@ class Queue:
             db.execute("UPDATE jobs SET state='accepted', accepted_lease=?, accepted_by=?, accepted_at=?, result=?, files=?, "
                        "lease_id=NULL, lease_owner=NULL, lease_expires=NULL, updated=? WHERE id=?",
                        (lease_id, w["id"], now, json.dumps(result), json.dumps(files), now, job_id))
+            if check:
+                db.execute("UPDATE jobs SET check_state=?, check_detail=? WHERE id=?", (check[0], json.dumps(check[1]), job_id))
+                if check[0] == "suspect": self.store.event(db, "suspect", job_id, w["id"], lease_id, check[1])
             self.store.event(db, "accept_late" if late else "accept", job_id, w["id"], lease_id)
         shutil.rmtree(jd, ignore_errors=True)
         with self.spool_lock: self.spool_used -= gone
@@ -639,6 +660,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, B.submit(Q.store, Q.data, Q.manifest(), self._json(BATCH_MAX), Q.piece_cache))
             if method == "GET" and len(ep) == 2 and ep[0] == "batch":
                 return self._send(200, B.status(Q.store, Q.results, int(ep[1])))
+            if method == "POST" and len(ep) == 3 and ep[0] == "batch" and ep[2] == "adopt":
+                return self._send(200, B.adopt(Q.store, int(ep[1]), self._json().get("candidates")))
             if method == "GET" and len(ep) == 4 and ep[0] == "batch" and ep[2] == "rows":
                 it = [x for x in B.status(Q.store, Q.results, int(ep[1]))["items"] if x["id"] == ep[3]]
                 if not it or it[0]["state"] != "accepted": raise HTTPError(404, "no finished candidate of that id")
@@ -705,6 +728,10 @@ def main():
                     help="fraction of each donor's accepted jobs re-run on a verifier (spot checks)")
     ap.add_argument("--spot-first", type=int, default=env("SPOT_FIRST", 1, int),
                     help="always re-run a donor's first N accepted jobs of each type")
+    ap.add_argument("--eval-spot-rate", type=float, default=env("EVAL_SPOT_RATE", 0.08, float),
+                    help="fraction of each donor's eval_mix results spot-checked (a few random documents re-scored on a verifier)")
+    ap.add_argument("--eval-spot-docs", type=int, default=env("EVAL_SPOT_DOCS", 3, int),
+                    help="documents an eval_mix spot check re-scores (0: the whole golden)")
     ap.add_argument("--search-token-file", default=env("SEARCH_TOKEN_FILE"),
                     help="enables /api/v0/search/... (eval_mix batches of the search) for this bearer token")
     ap.add_argument("--chunk-max-mb", type=float, default=env("CHUNK_MAX_MB", CHUNK_MAX >> 20, float), help="largest upload PUT")
@@ -769,7 +796,7 @@ def main():
     signal.signal(signal.SIGTERM, on_term); signal.signal(signal.SIGINT, on_term)
     print(f"rad-quant-at-home queue on http://{a.bind}:{srv.server_address[1]}  db={a.db}  data={a.data}  results={a.results}  "
           f"admin summary {'on' if a.admin_token_file else 'off'}, search API {'on' if a.search_token_file else 'off'}, "
-          f"spot checks {a.spot_rate:.0%} + first {a.spot_first}, scorer {'on' if a.score_threads > 0 else 'off'}, status page "
+          f"spot checks {a.spot_rate:.0%} (eval {a.eval_spot_rate:.0%}, {a.eval_spot_docs} docs) + first {a.spot_first}, scorer {'on' if a.score_threads > 0 else 'off'}, status page "
           f"{f'every {a.status_interval:g}s' + (' -> ' + a.status_dir if a.status_dir else '') if a.status_interval > 0 else 'off'}", flush=True)
     srv.serve_forever()
     srv.server_close()

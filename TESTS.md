@@ -46,6 +46,12 @@ Request overhead: a 1 s noop job takes 1.01 s lease-to-complete on localhost.
 
 Security fix round (issue #1, the three Content-Length cases above): macOS dev box, 2026-11-06, **111/111** (plain process).
 Security fix round (issue #2, the three lease-id cases above): macOS dev box, 2026-11-06, **110/110** (plain process).
+Review round 2 (issues #4, #7, #8, #11, #12, #15; branch issues-2, 0.5): VM, 2026-11-07, **132/132** (plain process),
+**139/139** (`E2E_SERVER=docker`, image built with `docker/server/build.sh --worktree`). #4 adds 12 checks: the
+plausibility band (refused far-worse, two donors' refusals route the job to verifiers, suspect far-better paid only
+after its full re-run), a spot check of 3 of 6 documents (`sub_golden`: a document scores the same alone), adoption,
+a faker inside the band caught on its documents, stale rows dropped by collect, `exclude-donor`. Unit suites on the
+same tree: score 40, sched 40, checker_nan 12, statuspage 19, setup 125, bandwidth_e2e 22.
 
 ## 2. Server throughput (the queue host, loopback, niced)
 

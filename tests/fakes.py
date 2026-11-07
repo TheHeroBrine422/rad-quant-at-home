@@ -194,15 +194,20 @@ def score(model, golden, out, bias=0.0, noise=0.0):
     seed = h.hexdigest()
     g = json.load(open(f"{golden}/kld.json")); n = g["rows"]
     gr = open(f"{golden}/rows.f32", "rb").read()
+    tok = open(f"{golden}/tokens.i32", "rb").read()
     w = 3 if "top" in g else 2
+    keys, t0 = [], 0                 # a row's numbers depend on its document and position, as with a real model: a golden
+    for d in g["docs"]:              # of a few of the documents (a spot check) scores them the same
+        dh = hashlib.sha256(tok[4 * t0:4 * (t0 + d["tokens"])]).hexdigest()[:16]
+        keys += [(dh, d["score_from"] + i) for i in range(d["tokens"] - 1 - d["score_from"])]; t0 += d["tokens"]
     rng = random.Random()
     out_rows, kls, t1 = [], [], 0
     for r in range(n):
         nll_p = struct.unpack_from("<f", gr, r * w * 4)[0]
-        kl = 0.002 + 0.05 * _u(seed, r) ** 3 + bias
+        kl = 0.002 + 0.05 * _u(seed, *keys[r]) ** 3 + bias
         if noise: kl *= 1 + noise * (2 * rng.random() - 1)
         kl = struct.unpack("<f", struct.pack("<f", kl))[0]
-        top1 = 1.0 if _u(seed, "t", r) < 0.93 else 0.0
+        top1 = 1.0 if _u(seed, "t", *keys[r]) < 0.93 else 0.0
         out_rows.append(struct.pack("<ffff", kl, nll_p + kl, nll_p, top1)); kls.append(kl); t1 += top1
     open(out + ".rows", "wb").write(b"".join(out_rows))
     mean = math.fsum(kls) / n

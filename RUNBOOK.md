@@ -72,7 +72,10 @@ $A manifest --jobs 8                                                            
 - **Search candidates** (eval_mix): from the search box, `client/searchq.py --server https://<queue> --token-file
   search-token submit SPEC.json`, then `wait ID` and `collect ID OUT` (rows per candidate in radiance's FILE.rows
   layout). Or on the queue host: `$A batch-submit SPEC.json`, `batch-status ID`, `batch-collect ID OUT`. The spec is in
-  `server/batch.py`. Repeated candidates reuse their earlier result.
+  `server/batch.py`. Repeated candidates reuse their earlier result. Give every candidate the knapsack's prediction
+  (`"pred_kld"`): far-worse results are refused, far-better ones re-run in full before they count (#4). Before the
+  search adopts a candidate: `searchq.py adopt ID CAND... --wait` (or `$A batch-adopt ID CAND...`) queues its full
+  trusted re-run; use it only once its `trust` is `confirmed`.
 - **Reference goldens** (trusted big boxes): `$A enqueue-golden --model qwen38-27b --rev <rev> --corpus xcorp-m2
   --method tp2|staged --top 512 --max-model-len 32768`.
 - Priorities (docs/SCHED.md): higher first, strictly by class. Ladder levels default by K's granularity: integer K 40,
@@ -115,11 +118,16 @@ $A manifest --jobs 8                                                            
   recorded as `check_state='error'`, quarantines nobody, and is retried by a later `$A check --level L --recheck`.
 - **Spot checks** run by themselves: 4% of every donor's accepted results plus its first of each type are re-run on a
   verifier and compared (`spot_draw`, `spot_pass`, `spot_fail` events; `verify_state` in `$A list`). `$A spot JOB`
-  draws one by hand.
+  draws one by hand. eval_mix: 8% (`RQAH_EVAL_SPOT_RATE`), each re-scoring 3 random documents; suspect (far better
+  than predicted) and adopted candidates get a full re-run (`trust_draw`, `trust_pass`, `trust_fail` events). Keep a
+  verifier running while the search works. `suspect` events list results far better than predicted;
+  `implausible_to_verifier` a job two donors returned far worse than predicted (check the prediction).
 - **On a `spot_fail`:** the donor is already quarantined and its unconfirmed results requeued. Read the comparison
   (`verify_detail` of the job: worst tensor / rows out of tolerance / container hashes). A hardware fault or a
   tolerance that is too tight (eval rows: calibrate on the first R9700 pairs) is lifted with `$A unquarantine ID`; a
-  cheat stays, and `$A disable-worker ID` revokes the token.
+  cheat stays, and `$A disable-worker ID` revokes the token. A donor caught faking (any of its workers): `$A
+  exclude-donor DONOR --reason ...` quarantines all its workers and invalidates every result of theirs that nothing
+  confirmed (the search's batches show those candidates as invalidated). Nothing does this donor-wide by itself.
 - **Export** only verified work: `$A export --level L OUT --checked` (ourq layout: knap4 and the search read it; of
   best-of-N copies the passed one with the lowest error, `quant_tensor` groups merged into one shard per layer).
 

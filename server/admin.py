@@ -576,6 +576,19 @@ def cmd_donor(a, S):
     print(f"donor {a.id}: " + ", ".join(f"{k.split('=')[0]} = {v}" for k, v in zip(sets, args)))
 
 
+def cmd_exclude_donor(a, S):
+    """#4: every worker of the donor quarantined (no more leases), and every accepted result of theirs that is not
+    confirmed independently (score-verified codes, a passed re-run; eval_mix: a full trusted re-run) invalidated:
+    lumens revoked, the job queued again for anyone else, the search's batches show it as invalidated"""
+    ws = S.q("SELECT id FROM workers WHERE donor_id=?", (a.donor,))
+    if not ws: sys.exit(f"no donor {a.donor} (or no workers)")
+    n = 0
+    with S.tx() as db:
+        for w in ws: n += V.quarantine(S, db, a.results, w["id"], f"donor {a.donor} excluded: {a.reason}")
+        S.event(db, "exclude_donor", detail={"donor": a.donor, "workers": [w["id"] for w in ws], "invalidated": n, "reason": a.reason[:300]})
+    print(f"donor {a.donor}: {len(ws)} workers quarantined, {n} results invalidated")
+
+
 def cmd_link(a, S):
     with S.tx() as db:
         if not db.execute("SELECT 1 FROM donors WHERE id=?", (a.donor,)).fetchone(): sys.exit(f"no donor {a.donor}")
@@ -629,6 +642,10 @@ def main():
     x = sp.add_parser("batch-submit"); x.add_argument("spec")
     x = sp.add_parser("batch-status"); x.add_argument("id", type=int)
     x = sp.add_parser("batch-collect"); x.add_argument("id", type=int); x.add_argument("out")
+    x = sp.add_parser("batch-adopt"); x.add_argument("id", type=int); x.add_argument("cands", nargs="+")
+    x = sp.add_parser("exclude-donor", help="a donor caught faking: quarantine all its workers, drop every result of theirs "
+                      "nothing confirmed (#4; per worker this happens on its own, donor-wide only by this command)")
+    x.add_argument("donor", type=int); x.add_argument("--reason", required=True)
     x = sp.add_parser("points"); x.add_argument("--json", action="store_true")
     x = sp.add_parser("enqueue-level")
     for k in ("model", "rev", "K", "codebook", "level"): x.add_argument(f"--{k}", required=True)
@@ -728,6 +745,10 @@ def main():
         except B.BatchError as e: sys.exit(f"batch refused: {e}")
     elif a.cmd == "batch-status": print(json.dumps(B.status(S, a.results, a.id), indent=1))
     elif a.cmd == "batch-collect": print(json.dumps(B.collect(S, a.results, a.id, a.out)))
+    elif a.cmd == "batch-adopt":
+        try: print(json.dumps(B.adopt(S, a.id, a.cands)))
+        except B.BatchError as e: sys.exit(str(e))
+    elif a.cmd == "exclude-donor": cmd_exclude_donor(a, S)
     elif a.cmd == "points": cmd_points(a, S)
 
 

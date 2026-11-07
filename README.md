@@ -129,8 +129,9 @@ declare and the GPU name.
 **Points.** Lumens are R9700 card-minutes of verified work (+10% for a result back within twice the reference time).
 Quantization results are verified by their score: the server decodes your codes and checks their error (docs/VERIFY.md),
 so any GPU and any driver is fine. Other results: a random 3-5% of every donor's results (and your first of each kind)
-are re-run on our own hardware. A result that fails its check puts the worker in quarantine and voids its unconfirmed
-points.
+are re-run on our own hardware (evaluations: ~8%, a few of their documents). An evaluation far off what we predicted for
+that mix is refused, or re-run in full before it earns. A result that fails its check puts the worker in quarantine
+and voids its unconfirmed points.
 
 **Check on it.** `docker exec rad-quant-at-home rqah status` shows your workers, their running jobs, your lumens and
 the queue; `rqah jobs` lists recent jobs and whether each is verified yet, `rqah points` the ledger, `rqah logs -f`
@@ -195,7 +196,7 @@ itself: [research-kit/](research-kit/README.md).
 - **Admin** (`server/admin.py`): data (`datapack`, `ladder-add`, `golden-add`, `corpus-add`, `manifest`), jobs
   (`enqueue-level`, `enqueue-golden`, `batch-submit` / `-status` / `-collect`, `list`, `queue`, `reprioritize`, `events`,
   `requeue`, `cancel`),
-  verification (`check`, `spot`, `quarantine`, `unquarantine`), workers (`invite`, `add-worker`, `workers`, `trust`,
+  verification (`check`, `spot`, `quarantine`, `unquarantine`, `exclude-donor`, `batch-adopt`), workers (`invite`, `add-worker`, `workers`, `trust`,
   `verifier`, `disable-worker`), donors (`invite --personal`, `donors`, `donor ID --hide`, `link`), `points`,
   `status-page`, `export` (the accepted shards of a level in `quantize/ourq.py`'s layout, so knap4 and the search read
   them unchanged). RUNBOOK.md walks through them.
@@ -262,7 +263,7 @@ versions it runs, the server leases only matching jobs, and dedupe keys include 
 first, then the new image. 0.2: `noop` 2 (requirement parameters), `eval_mix` 1 (implemented), `golden_record` 1 (new);
 the quant types stay at 2 (only their declared requirements changed, which the server computes). 0.3: `quant_layer` and
 `quant_head` 3 (the `verify` parameter; score mode uploads no `rowerr.npz`; ourq runs with the CPU refit fallback),
-`quant_tensor` 1 (new).
+`quant_tensor` 1 (new). 0.5: `eval_mix` 2 (`docs` / `sub_rows`: a spot check of a few documents).
 
 ### eval_mix: the search's candidates, assembled on the donor
 
@@ -287,12 +288,30 @@ the quant types stay at 2 (only their declared requirements changed, which the s
   column 0).
 - **The server's check at completion** (stdlib, < 1 s per 1M rows): column `nll_p` equals the golden's own
   `rows.f32[:, 0]` bit for bit (radiance copies it), so the right golden was scored, every row present and in order;
-  every KL finite and ≥ 0 (to rounding), top1 ∈ {0, 1}, the report's mean equal to the rows'.
+  every KL finite and ≥ 0 (to rounding), top1 ∈ {0, 1}, the report's mean and the result's `kld_mean` /
+  `container_sha256` equal to the rows' / `job.json`'s.
+- **Plausibility** (0.5, #4): a donor can write rows that pass those checks without running the model, so they do
+  not make a result true. The search sends its knapsack's predicted mean KL with each candidate (`pred_kld`; it stays
+  on the server, workers never see it). A result above 3× the prediction (+0.001) is refused at completion (after two
+  donors' refusals the job goes to our verifiers: the prediction was off, not both donors); one below 0.5× is
+  accepted as **suspect**, earns nothing yet and is re-run in full on a verifier. The search hunts mixes that beat
+  the prediction by a few to ~20%, not by half. A batch may set `"band": {"worse", "better"}` within 1.5–10× /
+  0.1–0.9×.
+- **Spot checks of a few documents**: `--eval-spot-rate` (8%) of each donor's evaluations, and its first one, are
+  re-scored on a verifier on `--eval-spot-docs` (3) random documents of the golden: the verifier cuts a golden of
+  just those documents (`golden_common.sub_golden`; a document scores the same alone) and its rows must match the
+  donor's rows of those documents (per row as below, and each document's mean KL within 0.5%). A faker who did not
+  run the model is caught on whichever documents are drawn.
+- **Adoption** (0.5, #4): anything the search acts on gets a full trusted re-run first: `POST .../batch/ID/adopt
+  {"candidates": [...]}` (`searchq.py adopt ID C... [--wait]`, `admin.py batch-adopt`). Status reports each
+  candidate's `trust`: `confirmed` (a verifier ran or fully re-ran it and it matched), `rerun-pending`, `spot-pending`
+  / `spot-pass`, `unverified`; act on an adopted candidate only once it is `confirmed`.
 - **Batches** (`server/batch.py`): the search posts ~100 candidates at once (`POST /api/v0/search/batch` with the
   search token, `client/searchq.py`, or `admin.py batch-submit SPEC.json`), polls `GET .../batch/ID` and fetches each
   candidate's rows (`GET .../batch/ID/rows/CAND`, `searchq.py collect`). The server checks the golden is public,
   every piece exists, computes each candidate's exact assembled size (so its card class) and enqueues one job per
   candidate; a candidate identical to an earlier one (same base, mix, act, golden, settings) reuses that job's result.
+  A result invalidated after a quarantine shows as `invalidated` in the status, and `collect` deletes its stale rows.
 
 ### golden_record: the big-box tier (trusted donors only)
 
@@ -382,7 +401,9 @@ extension loader takes a lock file), signed images.
   - quant: each tensor's proxy error within 1.5% of the re-run's (seed spread ~0.5%: TESTS.md v0 §4); the checker
     has already tied each log to its codes, so this compares the codes' quality;
   - eval_mix: the same container sha256; per position |ΔKL| ≤ 1e-3 + 5% on ≥ 99.5% of rows, the mean KL within 0.2%,
-    top-1 flips ≤ 1% (cross-GPU spread: to calibrate on the first R9700 pairs);
+    top-1 flips ≤ 1% (cross-GPU spread: to calibrate on the first R9700 pairs). 0.5: the draw re-scores 3 random
+    documents (`--eval-spot-rate` 8%), each document's mean within 0.5%; a full re-run (`trust_state`) for suspect and
+    adopted candidates (above);
   - golden_record: identical tokens, per-row nll and argmax as above;
   - noop: identical bytes.
   The original's `verify_state` becomes `pass` or `fail`; `admin.py spot JOB` draws one by hand.
@@ -390,7 +411,10 @@ extension loader takes a lock file), signed images.
   gets no more leases (it is told so) and cannot complete anything; its active leases are cancelled; every accepted
   result of it that no re-run (or, score mode, no score) confirmed is invalidated: its lumens revoked, its files moved to
   `results/<job>.invalid-<time>`, the job queued again for anyone but that worker (batches see it as pending again).
-  `admin.py unquarantine ID` lifts it (invalidated results stay requeued).
+  An evaluation counts as confirmed only after a full trusted re-run (a spot check of a few documents does not).
+  `admin.py unquarantine ID` lifts it (invalidated results stay requeued). Quarantine is per worker; a donor caught
+  faking is dropped as a whole by the operator: `admin.py exclude-donor DONOR --reason ...` quarantines all its workers
+  and invalidates all their unconfirmed results.
 - **Lumens** (`admin.py points [--json]`, the leaderboard): a job's reference cost in R9700 card-minutes
   (`lumens(p)` per type: 27B layer 3, head 15, eval ~2.5 per 100k positions × cards, golden ~20 per 1M positions ×
   cards; `quant_tensor` 0.5, its down_proj group 1.5), +10% if the result came back within twice that. Granted to the
@@ -637,6 +661,8 @@ Settings (`.env`; defaults in brackets):
 | `RQAH_SPOOL_MAX_GB` [0 = off] | uploads get 507 (the worker backs off and resumes) while the spool holds this much |
 | `RQAH_SEARCH_TOKEN_FILE` [off] | enables the search's batch API (`/api/v0/search/...`: eval_mix on public goldens only) for that bearer token (≥ 32 characters, a file in `RQAH_SECRETS_DIR`) |
 | `RQAH_SPOT_RATE` [0.04], `RQAH_SPOT_FIRST` [1] | spot checks: the fraction of each donor's accepted jobs re-run on a verifier, and every donor's first N per type |
+| `RQAH_EVAL_SPOT_RATE` [0.08], `RQAH_EVAL_SPOT_DOCS` [3] | eval_mix spot checks: the fraction drawn, and how many random documents of the golden the verifier re-scores (0: all) |
+| `RQAH_LEASE_CAP_X` [3], `RQAH_LEASE_CAP_MIN_S` [7200] | a lease's deadline: this many times its job type's reference runtime, at least this many seconds (0.5, #7) |
 | `RQAH_GANG_WAIT_S` [0], `RQAH_RESERVE_MAX_S` [21600] | gang jobs: how long one waits before a busy multi-card worker drains for it; when a drain is given up |
 | `RQAH_CLASS_WAIT_S` [900], `RQAH_CLASS_SCAN` [5000] | 0.4 (docs/SCHED.md): how long a job a busy worker could run waits before that worker is drained for it instead of getting lower-priority work; queued jobs looked at per priority class and lease |
 | `RQAH_ADMIN_TOKEN_FILE` [off] | enables the read-only `GET /api/v0/admin/summary` (counts per level, workers, last events) for that bearer token (≥ 32 characters, a file in `RQAH_SECRETS_DIR`, readable by uid 10001) |
@@ -764,10 +790,11 @@ exercised yet.
 Every push to main and every pull request runs the no-GPU suites below on GitHub Actions
 (`.github/workflows/tests.yml`, Python 3.12 and the latest 3.x); the GPU tests stay manual.
 
-- `tests/e2e_noop.py`: no GPU, ~5 min, 119 checks (126 with the container). Runs the server as a subprocess, or
+- `tests/e2e_noop.py`: no GPU, ~5 min, 132 checks (139 with the container). Runs the server as a subprocess, or
   `E2E_SERVER=docker` for the container; the workers always run on the host. The GPU side is faked on the CPU (`tests/fakes.py`,
   `fake_radiance.py`, `fake_mkgold27.py`): requirements, multi-card and gang scheduling, eval_mix batches end to end,
-  privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record; w25: the donor CLI (every
+  privacy refusals, spot checks with cheating donors, quarantine, lumens, golden_record, the eval plausibility band,
+  spot checks of a few documents, adoption and `exclude-donor` (#4); w25: the donor CLI (every
   command, `--json`, exit codes, isolation, link, personal invites) and the served status page.
 - `tests/sched_test.py` (0.4): the scheduling rules in process, a few seconds (docs/SCHED.md): K-granularity
   priorities, `reprioritize`, class order, level-first, cache affinity, the budget filter (incl. a randomized

@@ -28,7 +28,10 @@ longer exclude it, #5).
 reserve_lapsed (#8: a gang / class-wait reservation that timed out without the worker draining; that worker may not
 reserve the job again for one more reserve_max_s); jobs.grp (#11: the copies of one best-of-N job share it; a donor
 holds at most one of them), scores.tiles (#11: fingerprints of sampled trellis tiles, for near-duplicate codes),
-meta (server-local secrets, e.g. which tiles are sampled)."""
+meta (server-local secrets, e.g. which tiles are sampled). #4 (eval_mix): jobs.pred (the search's predicted KL and
+plausibility band; server side only, never sent to a worker), jobs.trust_state (a full re-run on a verifier: NULL,
+pending, pass, fail, error; jobs.verify_state is the spot check of a few documents), batch_items.adopted (when the
+search adopted the candidate)."""
 import hashlib, json, os, secrets, sqlite3, threading, time
 
 SCHEMA = """
@@ -74,7 +77,8 @@ MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "ve
            ("jobs", "needs", "TEXT"), ("jobs", "verify_of", "INTEGER"), ("jobs", "verify_state", "TEXT"),
            ("jobs", "verify_detail", "TEXT"), ("jobs", "exclude_worker", "INTEGER"),
            ("workers", "donor_id", "INTEGER"), ("invites", "personal", "INTEGER NOT NULL DEFAULT 0"), ("invites", "donor_id", "INTEGER"),
-           ("jobs", "requeued", "REAL"), ("leases", "deadline", "REAL"), ("jobs", "grp", "TEXT"), ("scores", "tiles", "BLOB")]
+           ("jobs", "requeued", "REAL"), ("leases", "deadline", "REAL"), ("jobs", "grp", "TEXT"), ("scores", "tiles", "BLOB"),
+           ("jobs", "pred", "TEXT"), ("jobs", "trust_state", "TEXT"), ("batch_items", "adopted", "REAL")]
 
 
 def h(s): return hashlib.sha256(s.encode()).hexdigest()

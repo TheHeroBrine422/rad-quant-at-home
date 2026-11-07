@@ -41,6 +41,8 @@ services:
       RQAH_SEARCH_TOKEN_FILE: ${RQAH_SEARCH_TOKEN_FILE:-}
       RQAH_SPOT_RATE: ${RQAH_SPOT_RATE:-0.04}
       RQAH_SPOT_FIRST: ${RQAH_SPOT_FIRST:-1}
+      RQAH_EVAL_SPOT_RATE: ${RQAH_EVAL_SPOT_RATE:-0.08}
+      RQAH_EVAL_SPOT_DOCS: ${RQAH_EVAL_SPOT_DOCS:-3}
       RQAH_SCORE_THREADS: ${RQAH_SCORE_THREADS:-0}         # 1: score score-mode quant results in the server (raise RQAH_MEM_LIMIT to 4g)
       RQAH_GANG_WAIT_S: ${RQAH_GANG_WAIT_S:-0}
       # the public status page (served at /); STATUS_DIR also writes it for a static host, e.g. /srv/rqah/out/status;
@@ -49,6 +51,8 @@ services:
       RQAH_STATUS_DIR: ${RQAH_STATUS_DIR:-}
       RQAH_CAMPAIGN: ${RQAH_CAMPAIGN:-}
       RQAH_RESERVE_MAX_S: ${RQAH_RESERVE_MAX_S:-21600}
+      RQAH_LEASE_CAP_X: ${RQAH_LEASE_CAP_X:-3}
+      RQAH_LEASE_CAP_MIN_S: ${RQAH_LEASE_CAP_MIN_S:-7200}
       RQAH_VERBOSE: ${RQAH_VERBOSE:-${RADQUANT_VERBOSE:-0}}
     ports:
       - "${RQAH_PUBLISH:-${RADQUANT_PUBLISH:-127.0.0.1:8740}}:8740"
