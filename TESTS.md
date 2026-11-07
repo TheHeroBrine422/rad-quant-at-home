@@ -36,6 +36,10 @@ see section 7.
 | graceful stop | SIGTERM → finishes the current job, exits 0; `--on-stop abandon` → job handed back within 5 s, attempt not counted | pass |
 | time windows | window arithmetic incl. across midnight; a worker outside its window leases nothing | pass |
 
+Security fix round (issue #5, one attempt per worker per job; verifiers exempt): a worker that failed a job is not
+offered it again until `admin requeue`, and a verifier that failed one is offered it again. macOS dev box, 2026-11-06,
+**110/110** (plain process).
+
 Request overhead: a 1 s noop job takes 1.01 s lease-to-complete on localhost.
 
 Security fix round (issue #1, the three Content-Length cases above): macOS dev box, 2026-11-06, **111/111** (plain process).

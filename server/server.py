@@ -174,7 +174,11 @@ class Queue:
             used = [norm_req(json.loads(r["requires"])) for r in act]
             free_cards = cards - sum(r["cards"] for r in used); free_ram = caps.get("ram_gb", 0) - sum(r["ram_gb"] for r in used)
 
-            eligible = job_filter(wr, caps)
+            # verifiers are never excluded: a re-run every verifier failed once would stay queued forever (verify_state='pending')
+            failed = frozenset() if wr["verifier"] else {r["job_id"] for r in db.execute(  # one attempt per worker per job until requeued (#5)
+                "SELECT DISTINCT l.job_id FROM leases l JOIN jobs j ON j.id=l.job_id WHERE l.worker_id=? AND j.state='queued' "
+                "AND l.state IN ('failed','rejected','expired') AND l.issued > COALESCE(j.requeued, 0)", (w["id"],))}
+            eligible = job_filter(wr, caps, failed)
             tr = SCH.Transfers(self.manifest(), self.up_memo)
 
             def fits_now(r): return r["cards"] <= free_cards and r["ram_gb"] <= free_ram

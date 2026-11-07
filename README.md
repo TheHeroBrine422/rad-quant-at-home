@@ -177,7 +177,9 @@ itself: [research-kit/](research-kit/README.md).
   order, whole levels first inside a class, then the jobs whose inputs the worker caches (it reports its cache when
   leasing). It filters by the worker's declared data budget (each job type declares its expected upload,
   `upload_bytes`), and a higher-class job that a busy worker keeps passing over drains that worker after
-  `--class-wait-s`.
+  `--class-wait-s`. A worker that failed, rejected or let expire a lease on a job is not offered that job again until
+  the operator requeues it (`admin.py requeue` also gives a still-queued job this fresh chance; verifier workers are
+  never excluded).
 - **Admin** (`server/admin.py`): data (`datapack`, `ladder-add`, `golden-add`, `corpus-add`, `manifest`), jobs
   (`enqueue-level`, `enqueue-golden`, `batch-submit` / `-status` / `-collect`, `list`, `queue`, `reprioritize`, `events`,
   `requeue`, `cancel`),

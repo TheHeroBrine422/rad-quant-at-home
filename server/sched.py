@@ -29,9 +29,10 @@ def norm_req(r):
     return r
 
 
-def job_filter(wr, caps):
+def job_filter(wr, caps, failed=frozenset()):
     """f(job row) -> its normalised requirements if worker row wr with declared caps may ever run it, else None (the
-    free-cards / free-RAM part is the caller's)"""
+    free-cards / free-RAM part is the caller's). failed: ids of queued jobs this worker already failed, rejected or let
+    expire since their last requeue (one attempt per worker per job)"""
     types = set(caps.get("job_types") or ()) & {n for n, m in jobs.REGISTRY.items() if m.IMPLEMENTED}
     vers = caps.get("versions", {})
     disk = caps.get("disk_gb", 0) * 1e9
@@ -40,6 +41,7 @@ def job_filter(wr, caps):
     def eligible(j):
         if j["type"] not in types or vers.get(j["type"], j["version"]) != j["version"]: return None
         if j["exclude_worker"] == wr["id"]: return None
+        if j["id"] in failed: return None
         if j["needs"] == "verifier" and not wr["verifier"]: return None
         if j["needs"] == "trusted" and not (wr["trusted"] or wr["verifier"]): return None
         r = norm_req(json.loads(j["requires"]))

@@ -17,7 +17,7 @@ the 0.2 names $RADQUANT_* are still read in 0.3)
   enqueue-noop N [--seconds S] [--size B] [--inputs a,b] [--tag T]
   list [--state S] [--level L] [--type T]   jobs
   events [JOB]                           the audit log
-  requeue IDS|--level L|--state S [--force]   back to the queue (accepted ones only with --force)
+  requeue IDS|--level L|--state S [--force]   back to the queue (accepted ones only with --force); a queued job: attempts and per-worker exclusions reset
   cancel IDS|--level L
   export --level L OUT [--partial]       accepted shards of a level in ourq.py's layout (q-LNN.safetensors + index)
   check --level L [--rows-frac F]        run checker/check.py on the level's accepted results, store the verdict
@@ -307,7 +307,10 @@ def cmd_requeue(a, S):
     with S.tx() as db:
         for i in ids:
             j = db.execute("SELECT * FROM jobs WHERE id=?", (i,)).fetchone()
-            if j is None or j["state"] == "queued": continue
+            if j is None: continue
+            if j["state"] == "queued":                  # still queued: a fresh chance for the workers that failed it
+                db.execute("UPDATE jobs SET attempts=0, requeued=?, updated=? WHERE id=?", (time.time(), time.time(), i))
+                S.event(db, "requeue", i); n += 1; continue
             if j["state"] == "accepted" and not a.force: print(f"{i}: accepted (use --force)"); continue
             if j["state"] == "accepted" and a.results:
                 d = os.path.join(a.results, str(i))
@@ -316,7 +319,8 @@ def cmd_requeue(a, S):
                 db.execute("UPDATE scores SET state='void' WHERE job_id=? AND state<>'fail'", (i,))
             if j["lease_id"]: db.execute("UPDATE leases SET state='cancelled', ended=? WHERE id=?", (time.time(), j["lease_id"]))
             db.execute("UPDATE jobs SET state='queued', attempts=0, lease_id=NULL, lease_owner=NULL, lease_expires=NULL, "
-                       "accepted_lease=NULL, accepted_by=NULL, accepted_at=NULL, check_state=NULL, updated=? WHERE id=?", (time.time(), i))
+                       "accepted_lease=NULL, accepted_by=NULL, accepted_at=NULL, check_state=NULL, requeued=?, updated=? WHERE id=?",
+                       (time.time(), time.time(), i))
             S.event(db, "requeue", i); n += 1
     print(f"requeued {n}")
 
