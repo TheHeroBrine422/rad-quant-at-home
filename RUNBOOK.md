@@ -104,7 +104,8 @@ $A manifest --jobs 8                                                            
   that box.
 - **Quant levels, replicate mode:** `$A check --level L --rows-frac 0.25` (CPU checker: ~15 s per 27B layer sampled,
   ~1 min full; `RQAH_ADMIN_CPUS` / `_MEM_LIMIT` bound it). A FAIL quarantines the donor and requeues its unconfirmed
-  results; `--no-quarantine` to look first.
+  results; `--no-quarantine` to look first. An `ERROR` (the checker's own failure: a missing Hessian, an I/O error) is
+  recorded as `check_state='error'`, quarantines nobody, and is retried by a later `$A check --level L --recheck`.
 - **Spot checks** run by themselves: 4% of every donor's accepted results plus its first of each type are re-run on a
   verifier and compared (`spot_draw`, `spot_pass`, `spot_fail` events; `verify_state` in `$A list`). `$A spot JOB`
   draws one by hand.

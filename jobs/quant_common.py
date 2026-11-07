@@ -6,7 +6,7 @@ verify (0.3, VERSION 3): "replicate" (default: the 0.2 path, ourq --save-wq + th
 checker, spot-check re-runs) or "score" (docs/VERIFY.md: the server scores the codes themselves; no --save-wq, no
 rowerr step, so less time, VRAM and host RAM). Not part of the settings stamp: it changes what is uploaded, not the
 quantization."""
-import json, os, re, shutil, time
+import ast, json, os, re, shutil, struct, time, zipfile
 from common.util import stamp, st_header, write_json_atomic
 from . import qwen
 
@@ -263,3 +263,35 @@ def check_log(p, plan, proxy_path, job_path):
     meta = json.load(open(job_path))
     if meta.get("settings_stamp") != p["stamp"]: raise ValueError("job.json: settings stamp differs")
     return rows, meta
+
+def check_claims(plan, hdr, path):
+    """the per-row claim (rowerr.npz) is an uncompressed zip (np.savez) of float arrays <key>.err / <key>.ref, one pair
+    per tensor of the plan, each as long as the tensor has output rows. Checked from the zip directory and the .npy
+    headers with the stdlib before any array is loaded: each member must be stored, exactly its declared size, and
+    pass zipfile's CRC check (read through once), so nothing malformed reaches np.load in admin.py check"""
+    keys = qwen.keys(plan)
+    n = {f"{k}.{x}.npy": hdr[f"{k}.svh"]["shape"][0] for k in keys for x in ("err", "ref")}
+    try:
+        with zipfile.ZipFile(path) as zf:
+            infos = zf.infolist(); names = {i.filename for i in infos}
+            if len(names) != len(infos) or names != set(n):
+                raise ValueError(f"rowerr.npz: members differ from the plan (missing {sorted(set(n) - names)[:3]}, extra {sorted(names - set(n))[:3]})")
+            for i in infos:
+                m = n[i.filename]
+                if i.compress_type != zipfile.ZIP_STORED: raise ValueError(f"rowerr.npz {i.filename}: compressed, want stored")
+                if i.file_size > 128 + 8 * m + 64: raise ValueError(f"rowerr.npz {i.filename}: {i.file_size} bytes, too large for {m} rows")
+                with zf.open(i) as fh:
+                    head = fh.read(10)
+                    if head[:6] != b"\x93NUMPY" or head[6] not in (1, 2, 3): raise ValueError(f"rowerr.npz {i.filename}: not a .npy")
+                    if head[6] == 1: hl = struct.unpack("<H", head[8:10])[0]
+                    else: hl = struct.unpack("<I", head[8:10] + fh.read(2))[0]
+                    if hl > 4096: raise ValueError(f"rowerr.npz {i.filename}: header too long")
+                    d = ast.literal_eval(fh.read(hl).decode("latin1"))
+                    if not isinstance(d, dict) or set(d) != {"descr", "fortran_order", "shape"} or d["descr"] not in ("<f8", "<f4") or d["fortran_order"] is not False or d["shape"] != (m,) or type(d["shape"][0]) is not int:
+                        raise ValueError(f"rowerr.npz {i.filename}: header {d!r:.120}, want shape ({m},) <f8/<f4")
+                    want = (10 if head[6] == 1 else 12) + hl + (8 if d["descr"] == "<f8" else 4) * m
+                    if i.file_size != want or i.compress_size != i.file_size: raise ValueError(f"rowerr.npz {i.filename}: {i.file_size} bytes, want {want} stored")
+                    while fh.read(1 << 20): pass  # to the end, so zipfile checks the CRC
+    except ValueError: raise
+    except Exception as e:
+        raise ValueError(f"rowerr.npz: not a valid npz ({type(e).__name__})")

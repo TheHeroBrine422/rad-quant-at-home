@@ -403,7 +403,13 @@ def cmd_check(a, S):
             and not is_score(json.loads(r["params"]))]                     # score-mode results: admin.py score
     for r in rows:
         p = json.loads(r["params"]); res = os.path.join(a.results, str(r["id"]))
-        rep = check.check_job(r["type"], p, res, lambda rel: os.path.join(a.data, rel), rows_frac=a.rows_frac, tol=a.tol)
+        try: rep = check.check_job(r["type"], p, res, lambda rel: os.path.join(a.data, rel), rows_frac=a.rows_frac, tol=a.tol)
+        except Exception as e:                                 # the checker's fault or the server's, not the donor's: no fail, no quarantine
+            rep = {"pass": False, "summary": f"error: {e!r}"[:300]}
+            with S.tx() as db:
+                db.execute("UPDATE jobs SET check_state='error', check_detail=? WHERE id=?", (json.dumps(rep), r["id"]))
+                S.event(db, "check_error", r["id"], detail={"error": f"{e!r}"[:300]})
+            print(f"{r['id']:5d} ERROR {rep['summary']}"); continue
         with S.tx() as db:
             db.execute("UPDATE jobs SET check_state=?, check_detail=? WHERE id=?", ("pass" if rep["pass"] else "fail", json.dumps(rep), r["id"]))
             S.event(db, "check", r["id"], detail={"pass": rep["pass"]})
