@@ -309,6 +309,7 @@ Runs (2026-11-05, CST):
 | `/` content: no token / IPv4 / path / URL pattern, none of the run's tokens (admin, search, every worker), no worker name, port or work directory; well-formed; search evals = the accepted eval_mix jobs | pass |
 | `--status-dir`: the same bytes as served, 0644, no temp files left; `admin.py status-page` and `donors` | pass |
 | `link`: e16 + e32 → `status` from either shows both workers with summed lumens; linking to itself moves nothing; a token not of this server → 403 | pass |
+| `link` of a hidden donor (hid1) into a fresh donor (hid2): the merged donor stays hidden and keeps the name `hid2`, the old row is gone, the `link` event names both donors (`from_donor`, `donor`; issue #10) | pass |
 | personal invite (`--uses 2 --personal`): both registrations are one donor; registering with `"leaderboard": true` opts in under the worker name | pass |
 | exit codes: bad token 3, unreachable server 4, no token 2 (JSON error objects); `/api/v0/me` without a token → 401 | pass |
 

@@ -1073,6 +1073,19 @@ def run_w25(procs, srv):
        rc == 0 and lk["moved"] == 1 and rc2 == rc3 == 0 and sorted(w["name"] for w in s16["workers"]) == ["e16", "e32"] and
        s16["donor"]["id"] == s32["donor"]["id"] and abs(s16["lumens"] - pts["e16"]["lumens"] - pts["e32"]["lumens"]) < 1e-6 and
        rcb == 0 and bl["moved"] == 0 and rcj == 1 and jl["http"] == 403, f"{lk} / {jl}")
+    # a hidden donor cannot un-hide itself by linking into a fresh donor (issue #10)
+    hv = [req("POST", "/api/v0/register", {"invite": admin("invite").strip(), "name": n})[1]["token"] for n in ("hid1", "hid2")]
+    d1 = db().execute("SELECT donor_id FROM workers WHERE name='hid1'").fetchone()[0]
+    admin("donor", str(d1), "--hide")
+    rc, lk2, _ = cli(hv[0], "link", "--other-token-file", tokfile(hv[1]), "--json")
+    d2 = db().execute("SELECT donor_id FROM workers WHERE name='hid2'").fetchone()[0]
+    row = db().execute("SELECT hidden, display_name FROM donors WHERE id=?", (d2,)).fetchone()
+    gone = db().execute("SELECT 1 FROM donors WHERE id=?", (d1,)).fetchone() is None
+    ev = [e for e in events(kind="link") if e["worker_id"] == wid("hid1")]
+    det = json.loads(ev[-1]["detail"]) if ev else {}
+    ok("link: a hidden donor merged into a fresh donor stays hidden, old row gone, event names both donors",
+       rc == 0 and lk2["moved"] == 1 and tuple(row) == (1, "hid2") and gone and det.get("from_donor") == d1 and det.get("donor") == d2,
+       f"{lk2} {tuple(row) if row else row} {det}")
     inv = admin("invite", "--uses", "2", "--personal").strip()
     reg = [req("POST", "/api/v0/register", {"invite": inv, "name": n})[1] for n in ("pa", "pb")]
     rc, pa, _ = cli(reg[0]["token"], "status", "--json")

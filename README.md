@@ -431,7 +431,8 @@ python3 client/rqah.py --server https://<queue-url> --token-file ~/.rqah-token s
 - **Donors and workers.** Every worker belongs to one donor; status, jobs, points and logs cover all workers of the
   donor of the token used, and nothing else. A donor's boxes are grouped by a personal invite (`admin.py invite
   --uses 3 --personal`: all registrations with it are one donor), by `rqah link` (holding both tokens proves both
-  workers are yours; whole donors merge), or by the operator (`admin.py link WORKER DONOR`).
+  workers are yours; whole donors merge; a merged donor stays hidden if either was hidden), or by the operator
+  (`admin.py link WORKER DONOR`).
 - **Verification state per job** (`jobs`): `running`; `verified` (lumens granted); `accepted` (no further check
   due); `awaiting check` (quant results until the checker runs); `spot-check pending` (re-running on our hardware);
   `failed check` / `failed spot check`; `voided` (invalidated after a quarantine); `superseded` (another worker
