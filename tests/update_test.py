@@ -27,7 +27,7 @@ Checks:
   restart policy off during the drain, never a volume removal, the pin and the invite kept; --release, the drain
   timeout (second SIGTERM), --dry-run, a failed pull changes nothing, an unreachable queue, a malformed or older
   advertised release, an image override, up to date; --start drains a running worker first"""
-import argparse, contextlib, io, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request
+import argparse, contextlib, hashlib, io, json, os, re, shutil, sqlite3, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request
 from http.server import ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +37,7 @@ from server.store import Store, SchemaTooNew
 from server.server import Queue, Handler
 from common.util import VERSION, VERSION_HEADER, vtuple, vstr, write_json_atomic
 from client import rqah as CLI, setup as WZ
+from common import release as RL
 import jobs
 from jobs import noop
 
@@ -386,12 +387,13 @@ def glob_one(pat):
 
 # ================================================================ the wizard's --update (a simulated Docker)
 class FakeDocker:
-    """docker for WZ.Host.run: one container, a clock that only moves when the wizard sleeps. finish_s: how long the
-    worker takes to finish its jobs after the first SIGTERM (None: never); a second SIGTERM stops it within 3 s"""
-    def __init__(self, cfgdir, image, running=True, finish_s=20, pull_ok=True):
+    """docker for WZ.Host.run: one container, a registry {tag: digest}, a clock that only moves when the wizard sleeps.
+    finish_s: how long the worker takes to finish its jobs after the first SIGTERM (None: never); a second SIGTERM
+    stops it within 3 s"""
+    def __init__(self, cfgdir, image, running=True, finish_s=20, pull_ok=True, registry=None):
         self.cfgdir, self.t, self.cmds, self.finish_s, self.pull_ok = cfgdir, 0.0, [], finish_s, pull_ok
         self.c = {"image": image, "running": running, "restart": "unless-stopped", "terms": 0, "stop_at": None} if image else None
-        self.images = set()
+        self.registry, self.local = dict(registry or {}), {}
 
     def clock(self): return self.t
     def sleep(self, s): self.t += s
@@ -401,13 +403,17 @@ class FakeDocker:
 
     def run(self, argv, timeout=15):
         self.cmds.append(list(argv)); self._tick(); c = self.c
+        if argv[0] == "systemctl": return 0, "", ""
         a = argv[1:] if argv[0] == "docker" else argv
         if argv[0] == "sh": return self._create()
+        if a[:3] == ["image", "inspect", "--format"]:
+            d = self.local.get(a[4])
+            return (0, json.dumps([f"{a[4].rsplit(':', 1)[0]}@{d}"]), "") if d else (1, "", "No such image")
         if a[:1] == ["inspect"]:
             return (0, f"{'true' if c['running'] else 'false'} {c['image']}\n", "") if c else (1, "", "No such object")
         if a[:1] == ["pull"]:
-            if not self.pull_ok: return 1, "", "manifest unknown"
-            self.images.add(a[1]); return 0, "pulled", ""
+            if not self.pull_ok or a[1] not in self.registry: return 1, "", "manifest unknown"
+            self.local[a[1]] = self.registry[a[1]]; return 0, "pulled", ""
         if a[:2] == ["update", "--restart"]: c["restart"] = a[2]; return 0, "", ""
         if a[:3] == ["kill", "--signal", "TERM"]:
             c["terms"] += 1
@@ -435,24 +441,38 @@ def hw_fake(compose=True):
 
 
 def wz_args(**kw):
-    return argparse.Namespace(**{"to": None, "yes": True, "release": False, "drain_timeout": 60.0, "dry_run": False, **kw})
+    return argparse.Namespace(**{"to": None, "yes": True, "release": False, "drain_timeout": None, "dry_run": False, "digest": None,
+                                 "no_digest_check": False, "auto": False, **kw})
 
 
-def wz_setup(tag, version=""):
+def wz_setup(tag, version="", **cfgkw):
     cfgdir = f"{W}/wz/{tag}"; shutil.rmtree(cfgdir, ignore_errors=True)
     cfg = dict(WZ.DEFAULTS, server="https://queue.example.org", vendor="nvidia", gpus=[0], gpu_name="rtx4070", vram_gb=11,
-               ram_gb=24, mem_limit_gb=31, cache_gb=50, version=version)
+               ram_gb=24, mem_limit_gb=31, cache_gb=50, version=version, **cfgkw)
     WZ.write_all(cfgdir, cfg, hw_fake(), "riINVITECODE123")
     return cfgdir, cfg
 
 
-def run_update(tag, adv=NEXT, running=True, finish_s=20, pull_ok=True, version="", fetch=None, **kw):
-    cfgdir, cfg = wz_setup(tag, version)
-    fd = FakeDocker(cfgdir, WZ.image_for(cfg), running=running, finish_s=finish_s, pull_ok=pull_ok)
+DG = {v: "sha256:" + hashlib.sha256(v.encode()).hexdigest() for v in (PREV, VERSION, NEXT)}
+TAGREF = lambda v: f"{WZ.IMAGE_REPO}:{v}-cu128"
+
+
+def adv(v, published="2026-01-01T00:00:00Z", digest=None, image=None, **extra):
+    return {"api": "v0", "server": v, "worker": {"current": v, "min": PREV, "notes": f"{WZ.RELEASES}/tag/v{v}", "published": published,
+                                                 "images": {"cu128": {"image": image or TAGREF(v), "digest": digest or DG[v]}}, **extra}}
+
+
+def run_update(tag, advert=None, running=True, finish_s=20, pull_ok=True, version="", fetch=None, fetch_rel=None, registry=None,
+               cfgkw=None, now=None, **kw):
+    cfgdir, cfg = wz_setup(tag, version, **(cfgkw or {}))
+    fd = FakeDocker(cfgdir, WZ.image_for(cfg), running=running, finish_s=finish_s, pull_ok=pull_ok,
+                    registry=registry if registry is not None else {TAGREF(v): d for v, d in DG.items()})
+    if now is not None: fd.t = now
     said = []
-    fetch = fetch or (lambda url: {"api": "v0", "server": adv, "worker": {"current": adv, "min": PREV}})
-    host = WZ.Host("/", {"docker": fd.run, "sh": fd.run})
-    rc = WZ.update(host, hw_fake(), cfg, cfgdir, "riINVITECODE123", wz_args(**kw), say=said.append, fetch=fetch,
+    advert = advert or adv(NEXT)
+    host = WZ.Host("/", {"docker": fd.run, "sh": fd.run, "systemctl": fd.run})
+    rc = WZ.update(host, hw_fake(), cfg, cfgdir, "riINVITECODE123", wz_args(**kw), say=said.append, fetch=fetch or (lambda url: advert),
+                   fetch_rel=fetch_rel or (lambda v: (_ for _ in ()).throw(urllib.error.URLError("no network in tests"))),
                    sleep=fd.sleep, clock=fd.clock)
     return rc, fd, said, cfgdir
 
@@ -462,29 +482,48 @@ def verbs(fd):
     for c in fd.cmds:
         a = c[1:] if c[0] == "docker" else c
         if a[0] == "inspect": continue
-        out.append(" ".join(a[:3]) if a[0] in ("kill", "update") else "compose up" if a[0] == "compose" else a[0])
+        out.append(" ".join(a[:3]) if a[0] in ("kill", "update") else "compose up" if a[0] == "compose" else
+                   "digest" if a[:2] == ["image", "inspect"] else a[0])
     return out
 
 
 def t_wizard():
+    new_img = f"{TAGREF(NEXT)}@{DG[NEXT]}"
     rc, fd, said, cfgdir = run_update("plain")
-    new_img = f"{WZ.IMAGE_REPO}:{NEXT}-cu128"
-    ok("update: pull, then drain (restart policy off, SIGTERM, wait for the jobs), then rm, then compose up",
-       rc == 0 and verbs(fd) == ["pull", "update --restart no", "kill --signal TERM", "rm", "compose up"]
-       and fd.c["image"] == new_img and fd.c["running"] and fd.t >= 20, f"{rc} {verbs(fd)} {said[-2:]}")
+    ok("update: pull the tag, check its digest, drain (restart policy off, SIGTERM, wait for the jobs), rm, compose up",
+       rc == 0 and verbs(fd) == ["pull", "digest", "update --restart no", "kill --signal TERM", "rm", "compose up"]
+       and fd.c["image"] == new_img and fd.c["running"] and fd.t >= 20 and any("digest checked" in x for x in said),
+       f"{rc} {verbs(fd)} {said[-2:]}")
     allc = [" ".join(c) for c in fd.cmds]
     ok("never a volume removal or compose down", not any(x in c for c in allc for x in ("volume", " -v", "down", "--volumes")))
     comp, env = open(f"{cfgdir}/compose.yaml").read(), open(f"{cfgdir}/worker.env").read()
     sj = json.load(open(f"{cfgdir}/setup.json"))
-    ok("the files name the new release (setup.json pins it), the invite and the state volume stay, *.prev kept",
-       f'image: "{new_img}"' in comp and "rqah-state:/var/lib/rqah" in comp and sj["settings"]["version"] in (NEXT, "")
-       and "RQAH_INVITE=riINVITECODE123" in env and os.path.exists(f"{cfgdir}/compose.yaml.prev") and NEXT in open(f"{cfgdir}/docker-run.sh").read())
+    ok("the files pin TAG@DIGEST (setup.json: version and digest), the invite and the state volume stay, *.prev kept",
+       f'image: "{new_img}"' in comp and "rqah-state:/var/lib/rqah" in comp and sj["settings"]["digest"] == DG[NEXT]
+       and sj["settings"]["version"] in (NEXT, "") and "RQAH_INVITE=riINVITECODE123" in env
+       and os.path.exists(f"{cfgdir}/compose.yaml.prev") and new_img in open(f"{cfgdir}/docker-run.sh").read())
+    ok("the release notes link is shown", any(f"releases/tag/v{NEXT}" in x for x in said))
+    moved = {TAGREF(NEXT): "sha256:" + "e" * 64}
+    rc, fd, said, cfgdir = run_update("moved", registry=moved)
+    ok("a moved / tampered tag (other digest on the registry): REFUSED after the pull, before any drain; files untouched",
+       rc == 1 and verbs(fd) == ["pull", "digest"] and fd.c["running"] and any("REFUSED" in x for x in said)
+       and NEXT not in open(f"{cfgdir}/compose.yaml").read(), said[-1])
+    rc, fd, said, _ = run_update("nodigest", advert={"worker": {"current": NEXT, "min": PREV}})
+    ok("no digest advertised (and no release.json): refused, nothing done", rc == 1 and verbs(fd) == [] and "digest" in said[-1], said[-1])
+    rc, fd, said, _ = run_update("otherrepo", advert=adv(NEXT, image=f"ghcr.io/evil/worker:{NEXT}-cu128"))
+    ok("an advertised image outside our repository: refused", rc == 1 and verbs(fd) == [] and "not" in said[-1], said[-1])
+    rc, fd, said, _ = run_update("nocheck", advert={"worker": {"current": NEXT, "min": PREV}}, no_digest_check=True)
+    ok("--no-digest-check: pulls and runs the bare tag", rc == 0 and fd.c["image"] == TAGREF(NEXT) and "digest" not in verbs(fd), str(verbs(fd)))
+    rel = {"version": PREV, "notes_url": f"{WZ.RELEASES}/tag/v{PREV}", "created": "2026-01-01T00:00:00Z",
+           "images": {"cu128": {"repo": WZ.IMAGE_REPO, "tag": f"{PREV}-cu128", "digest": DG[PREV]}}}
+    rc, fd, said, _ = run_update("downto", to=PREV, version=VERSION, fetch_rel=lambda v: rel if v == PREV else {})
+    ok("--to another release: its digest from that release's release.json", rc == 0 and fd.c["image"] == f"{TAGREF(PREV)}@{DG[PREV]}", str(rc))
     rc, fd, said, _ = run_update("release", release=True)
     ok("--release: two SIGTERMs at once (the jobs go back to the queue), no waiting for them",
-       rc == 0 and verbs(fd)[:4] == ["pull", "update --restart no", "kill --signal TERM", "kill --signal TERM"] and fd.t < 20, f"{verbs(fd)} {fd.t}")
+       rc == 0 and verbs(fd)[2:6] == ["update --restart no", "kill --signal TERM", "kill --signal TERM", "rm"] and fd.t < 20, f"{verbs(fd)} {fd.t}")
     rc, fd, said, _ = run_update("timeout", finish_s=None, drain_timeout=1.0)
     ok("drain timeout: after it, a second SIGTERM hands the jobs back; then the update goes on",
-       rc == 0 and verbs(fd)[:4] == ["pull", "update --restart no", "kill --signal TERM", "kill --signal TERM"]
+       rc == 0 and verbs(fd)[2:5] == ["update --restart no", "kill --signal TERM", "kill --signal TERM"]
        and 60 <= fd.t < 200 and any("handing its jobs back" in x for x in said), f"{verbs(fd)} {fd.t}")
     rc, fd, said, cfgdir = run_update("dry", dry_run=True)
     ok("--dry-run: says what it would do, runs nothing", rc == 0 and verbs(fd) == [] and any("dry run" in x for x in said)
@@ -496,20 +535,56 @@ def t_wizard():
     def down(url): raise urllib.error.URLError("connection refused")
     rc, fd, said, _ = run_update("unreach", fetch=down)
     ok("queue unreachable: a clear message, nothing done", rc == 1 and verbs(fd) == [] and "--to" in said[-1], said[-1])
-    rc, fd, said, _ = run_update("badver", adv="latest; rm -rf /")
+    rc, fd, said, _ = run_update("badver", advert={"worker": {"current": "latest; rm -rf /", "min": PREV}})
     ok("a malformed advertised release is not used", rc == 1 and verbs(fd) == [], said[-1])
-    rc, fd, said, _ = run_update("older", adv=PREV, version=VERSION)
+    rc, fd, said, _ = run_update("older", advert=adv(PREV), version=VERSION)
     ok("an older advertised release is not a downgrade unless --to", rc == 2 and verbs(fd) == [] and "--to" in said[-1], said[-1])
-    rc, fd, said, _ = run_update("downto", to=PREV, version=VERSION)
-    ok("--to an older release goes ahead", rc == 0 and fd.c["image"].endswith(f":{PREV}-cu128"), str(rc))
-    rc, fd, said, _ = run_update("current", adv=VERSION)
-    ok("up to date: nothing done", rc == 0 and verbs(fd) == [] and "up to date" in said[-1], said[-1])
+    rc, fd, said, _ = run_update("setupmin", advert=adv(NEXT, setup_min="9.0.0"))
+    ok("a release that needs a newer setup.py (setup_min): refused with the way out", rc == 2 and verbs(fd) == [] and "git pull" in said[-1], said[-1])
     cfgdir, cfg = wz_setup("override"); cfg["image"] = "registry.example/mine:1"
-    r = WZ.update(WZ.Host("/", {"docker": lambda a: (1, "", "")}), hw_fake(), cfg, cfgdir, None, wz_args(), say=lambda x: None)
+    r = WZ.update(WZ.Host("/", {"docker": lambda a: (1, "", "")}), hw_fake(), cfg, cfgdir, None, wz_args(), say=lambda x: None,
+                  fetch=lambda u: adv(NEXT))
     ok("an image override is left alone (refused with the way to change it)", r == 2)
     rc, fd, said, _ = run_update("stopped", running=False)
-    ok("a stopped worker: no drain, removed and recreated on the new release", rc == 0 and verbs(fd) == ["pull", "rm", "compose up"]
+    ok("a stopped worker: no drain, removed and recreated on the new release", rc == 0 and verbs(fd) == ["pull", "digest", "rm", "compose up"]
        and fd.c["image"] == new_img)
+    # up to date: pinned to NEXT@digest and running it
+    cfgdir, cfg = wz_setup("current", version=NEXT, digest=DG[NEXT])
+    fd = FakeDocker(cfgdir, WZ.image_for(cfg)); said = []
+    r = WZ.update(WZ.Host("/", {"docker": fd.run}), hw_fake(), cfg, cfgdir, None, wz_args(), say=said.append, fetch=lambda u: adv(NEXT))
+    ok("up to date: nothing done", r == 0 and verbs(fd) == [] and "up to date" in said[-1], said[-1])
+
+    # --auto (the timer)
+    pub = WZ.datetime.datetime(2026, 11, 1, tzinfo=WZ.datetime.timezone.utc).timestamp()
+    stamp = "2026-11-01T00:00:00Z"
+    rc, fd, said, _ = run_update("auto-off", advert=adv(NEXT, stamp), auto=True, now=pub + 86400 * 3)
+    ok("--auto with auto_update off in setup.json: does nothing", rc == 0 and verbs(fd) == [] and "off" in said[-1], said[-1])
+    rc, fd, said, _ = run_update("auto-young", advert=adv(NEXT, stamp), auto=True, cfgkw={"auto_update": True}, now=pub + 3600)
+    ok("--auto: a release younger than a day waits", rc == 0 and verbs(fd) == [] and "24 h old" in said[-1], said[-1])
+    rc, fd, said, _ = run_update("auto-go", advert=adv(NEXT, stamp), auto=True, cfgkw={"auto_update": True}, now=pub + 86400 * 2,
+                                 finish_s=5000)
+    ok("--auto: a day-old release, digest-checked, drained at a job boundary (the jobs finish, up to 6 h), recreated",
+       rc == 0 and verbs(fd) == ["pull", "digest", "update --restart no", "kill --signal TERM", "rm", "compose up"]
+       and fd.c["image"] == new_img and fd.t - (pub + 86400 * 2) >= 5000, f"{verbs(fd)} {said[-1]}")
+    rc, fd, said, _ = run_update("auto-old", advert=adv(PREV, stamp), auto=True, version=VERSION, cfgkw={"auto_update": True}, now=pub + 86400 * 2)
+    ok("--auto never downgrades", rc == 2 and verbs(fd) == [], said[-1])
+    rc, fd, said, _ = run_update("auto-nodig", advert={"worker": {"current": NEXT, "min": PREV, "published": stamp}}, auto=True,
+                                 cfgkw={"auto_update": True}, now=pub + 86400 * 2, no_digest_check=True)
+    ok("--auto never runs without a digest (even with --no-digest-check)", rc == 2 and verbs(fd) == [], said[-1])
+    # the timer
+    u = WZ.render_units("/home/ada/.config/rad-quant-at-home", "/usr/bin/python3", "/home/ada/rqah/client/setup.py")
+    svc, tmr = u["rqah-update.service"], u["rqah-update.timer"]
+    ok("timer units: a oneshot running setup.py --update --auto on this config, hourly with jitter, persistent",
+       "ExecStart=/usr/bin/python3 -I /home/ada/rqah/client/setup.py --update --auto --config-dir /home/ada/.config/rad-quant-at-home" in svc
+       and "Type=oneshot" in svc and "OnUnitInactiveSec=1h" in tmr and "Persistent=true" in tmr and "RandomizedDelaySec" in tmr)
+    calls = []
+    host = WZ.Host("/", {"systemctl": lambda a: (calls.append(a) or (0, "", ""))})
+    host.which = lambda n: "/usr/bin/" + n
+    on = WZ.install_timer(host, "/cfg", True, say=lambda x: None); off = WZ.install_timer(host, "/cfg", False, say=lambda x: None)
+    ok("install_timer: links the service, enables the timer; off disables it", on and off and [c[1:4] for c in calls] == [
+        ["--user", "link", "/cfg/rqah-update.service"], ["--user", "enable", "--now"], ["--user", "disable", "--now"]], str(calls))
+    host2 = WZ.Host("/", {}); host2.which = lambda n: None; said = []
+    ok("no systemctl: says to run it from cron", not WZ.install_timer(host2, "/cfg", True, say=said.append) and "cron" in said[-1])
     # --start (setup --pull --start) on a running worker drains it first
     cfgdir, cfg = wz_setup("start")
     fd = FakeDocker(cfgdir, WZ.image_for(cfg)); said = []
@@ -519,9 +594,73 @@ def t_wizard():
        "kill --signal TERM", "rm"] and fd.cmds[-1][0] == "sh", str(verbs(fd)))
 
 
+# ================================================================ releases: the manifest, tools/release.py, the server, admin, the CLI
+def t_release():
+    d = fresh("release")
+    m = RL.make(NEXT, "a" * 40, {"cu128": DG[NEXT], "rocm7.14-gfx1201": DG[VERSION]}, {"rad_exl3_mix": "x@y"}, "2026-11-08T12:00:00Z")
+    bad = []
+    for mut in (lambda x: x.update(tag="v9.9.9"), lambda x: x["images"]["cu128"].update(repo="ghcr.io/evil/w"),
+                lambda x: x["images"]["cu128"].update(tag=f"{NEXT}-rocm"), lambda x: x["images"]["cu128"].update(digest="sha256:12"),
+                lambda x: x.update(notes_url="https://evil.example/x"), lambda x: x.update(extra=1), lambda x: x.update(images={})):
+        y = json.loads(json.dumps(m)); mut(y)
+        try: RL.check(y); bad.append(False)
+        except ValueError: bad.append(True)
+    ok("release manifest: a good one passes; wrong tag, repo, image tag, digest, notes page, unknown key, no images refused",
+       RL.check(m) is m and all(bad), str(bad))
+    tr = lambda *a: subprocess.run([sys.executable, "-I", f"{HERE}/tools/release.py", *a], capture_output=True, text=True, cwd=HERE)
+    r1, r2 = tr("check-tag", f"v{VERSION}"), tr("check-tag", "v0.0.1")
+    ok("release.py check-tag: v<VERSION> only", r1.returncode == 0 and r2.returncode == 1 and "not v" in r2.stderr, r2.stderr)
+    r3, r4 = tr("pins"), tr("pins", "--need-radiance")
+    pinned = dict(l.split("=", 1) for l in r3.stdout.splitlines())
+    ok("release.py pins: the pin file is well-formed; the ROCm build stops while RADIANCE_IMAGE is empty",
+       r3.returncode == 0 and len(pinned["RXM_COMMIT"]) == 40 and (r4.returncode == 0) == bool(pinned["RADIANCE_IMAGE"]), r4.stderr[-120:])
+    open(f"{d}/pins.env", "w").write(open(f"{HERE}/docker/pins.env").read().replace("RXM_COMMIT=", "RXM_COMMIT=zz"))
+    ok("release.py pins: a malformed pin is refused", tr("pins", "--file", f"{d}/pins.env").returncode == 1)
+    r5 = tr("manifest", "--digest", f"cu128={DG[VERSION]}", "--digest", f"rocm7.14-gfx1201={DG[PREV]}", "--commit", "b" * 40)
+    mf = f"{d}/built.json"; open(mf, "w").write(r5.stdout)
+    r6 = tr("notes", "--manifest", mf)
+    ok("release.py manifest + notes: a checkable release.json; notes with the tags, digests, rqah update, the changes",
+       r5.returncode == 0 and RL.loads(r5.stdout)["images"]["cu128"]["digest"] == DG[VERSION] and r6.returncode == 0
+       and f"`{RL.IMAGE_REPO}:{VERSION}-cu128` | `{DG[VERSION]}`" in r6.stdout and "rqah update" in r6.stdout and "Changes" in r6.stdout,
+       (r5.stderr + r6.stderr)[-300:])
+    # the server: current and digests from the manifest
+    s = Srv(args(d, worker_min=PREV)); S = s.Q.store
+    ok("no manifest: current = this server's release, no images", s.Q.update_info() == {"current": VERSION, "min": PREV})
+    rcf = subprocess.run([sys.executable, "-I", f"{HERE}/server/admin.py", "--db", f"{d}/q.sqlite", "release-fetch", "--file", mf],
+                         capture_output=True, text=True)
+    st, v = s.req("GET", "/api/v0/version")
+    ok("admin release-fetch --file installs it; the server advertises that release with its digests and notes",
+       rcf.returncode == 0 and st == 200 and v["worker"]["current"] == VERSION and v["worker"]["images"]["cu128"] ==
+       {"image": f"{RL.IMAGE_REPO}:{VERSION}-cu128", "digest": DG[VERSION]} and v["worker"]["notes"].endswith(f"/tag/v{VERSION}"),
+       rcf.stdout + rcf.stderr)
+    m2 = RL.make(NEXT, "c" * 40, {"cu128": DG[NEXT]}, created="2026-11-08T12:00:00Z")
+    open(f"{d}/next.json", "w").write(json.dumps(m2))
+    subprocess.run([sys.executable, "-I", f"{HERE}/server/admin.py", "--db", f"{d}/q.sqlite", "release-fetch", "--file", f"{d}/next.json"],
+                   capture_output=True)
+    wid, tok = S.add_worker("w")
+    st, r = s.req("POST", "/api/v0/lease", {"caps": caps()}, tok, wv(VERSION))
+    s.Q.sync_meta()
+    ok("a new manifest is picked up without a restart: lease answers advertise it, meta follows (status page)",
+       r["update"]["current"] == NEXT and r["update"]["available"] and r["update"]["images"]["cu128"]["digest"] == DG[NEXT]
+       and S.meta_get("worker_current") == NEXT, str(r["update"]))
+    open(f"{d}/evil.json", "w").write(json.dumps(dict(m2, images={"cu128": {"repo": "ghcr.io/evil/w", "tag": f"{NEXT}-cu128", "digest": DG[NEXT]}})))
+    rce = subprocess.run([sys.executable, "-I", f"{HERE}/server/admin.py", "--db", f"{d}/q.sqlite", "release-fetch", "--file", f"{d}/evil.json"],
+                         capture_output=True, text=True)
+    open(f"{d}/release.json", "w").write('{"format": 1, "torn')            # a broken file in place: the last good one stays
+    time.sleep(0.05)
+    ok("release-fetch refuses a manifest of another repository; a broken file in place: the server keeps the last good one",
+       rce.returncode == 1 and "refused" in rce.stderr and s.Q.update_info()["current"] == NEXT, rce.stderr[-200:])
+    os.environ["RQAH_IMAGE_ID"] = f"{RL.IMAGE_REPO}:{VERSION}-cu128+abc1234"
+    rc, out = capture(CLI.main, ["--server", s.url, "--token", tok, "status"])
+    del os.environ["RQAH_IMAGE_ID"]
+    ok("rqah status: the exact image by digest and the release notes link", f"docker pull {RL.IMAGE_REPO}:{NEXT}-cu128@{DG[NEXT]}" in out
+       and f"release notes: {RL.notes_url(NEXT)}" in out, out[-600:])
+    s.close()
+
+
 def main():
     os.makedirs(W, exist_ok=True)
-    for t in (t_versions, t_job_versions, t_schema, t_restart, t_worker, t_wizard):
+    for t in (t_versions, t_job_versions, t_schema, t_restart, t_worker, t_wizard, t_release):
         print(f"--- {t.__name__}", flush=True)
         try: t()
         except Exception:
