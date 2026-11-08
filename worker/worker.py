@@ -24,7 +24,7 @@ Bandwidth (0.4, worker/bandwidth.py): --max-down-mbps / --max-up-mbps cap the tr
 (minus what its running jobs still have to move) and which inputs it caches when it leases; the server offers only
 jobs that fit. A spent budget: the running jobs finish, nothing new is leased until the day / month resets.
 
-Updates (0.5, README "Updating"): every request carries the worker's release (X-RQAH-Version); the server's lease
+Updates (0.5, README "Updates and versions"): every request carries the worker's release (X-RQAH-Version); the server's lease
 answers say which release is current and which is the oldest it still serves. The worker logs an available update
 once (and keeps working) and writes it to STATE/update.json for `rqah status`. Below the minimum the server answers
 426: the worker logs how to update, finishes the jobs it holds and leases nothing new (it asks again hourly). It

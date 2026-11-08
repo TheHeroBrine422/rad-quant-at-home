@@ -52,7 +52,7 @@ or, when the peer is one of --trusted-proxy, the rightmost X-Forwarded-For entry
 Nothing else that changes the queue goes over HTTP: admin.py works on the database and the data root directly, on
 this host (or in the server container: `rqah admin ...`).
 
-Versions (0.5, README "Updating", RUNBOOK.md "Upgrades"): a worker sends its release in X-RQAH-Version (before 0.5:
+Versions (0.5, README "Updates and versions", RUNBOOK.md "Upgrades"): a worker sends its release in X-RQAH-Version (before 0.5:
 only in its user agent, rad-quant-at-home-worker/0.4; 0.3 said 0.2). The server records it (workers.version), and
 every lease answer, /status and /me carry {"update": {current, min, images, notes, published}}: current is the
 release in the release manifest (--release-manifest, default release.json next to the database: common/release.py,
@@ -80,7 +80,7 @@ from server.sched import norm_req, job_filter
 CHUNK_MAX = 64 << 20
 WORKER_MIN = "0.4.0"                   # the oldest worker release this server leases to by default (one release back)
 UPDATE_HOW = ("on the host: `rqah update` (python3 client/setup.py --update), or pull the new image tag and recreate the "
-              "container with the same state volume (README \"Updating\")")
+              "container with the same state volume (README \"Updates and versions\")")
 IMPLAUSIBLE_TO_VERIFIER = 2            # #4: after this many donors' implausible results a job goes to our verifiers
 JSON_MAX = 1 << 20
 BATCH_MAX = 32 << 20

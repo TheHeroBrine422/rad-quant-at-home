@@ -1525,7 +1525,7 @@ def main(argv=None):
     ap.add_argument("--pull", action="store_true", help="after writing: docker pull the image (network, several GB)")
     ap.add_argument("--start", action="store_true", help="after writing: start the worker (it registers with the queue); a "
                     "running worker of that name is drained first (its jobs finish)")
-    u = ap.add_argument_group("updating (--update, alias `rqah update`; README \"Updating\")")
+    u = ap.add_argument_group("updating (--update, alias `rqah update`; README \"Updates and versions\")")
     u.add_argument("--update", action="store_true", help="move the worker to the release the queue advertises: pull, drain, "
                    "rewrite the pin, recreate on the same state volume")
     u.add_argument("--to", metavar="X.Y.Z", help="--update to this release instead (also a downgrade)")
@@ -1584,7 +1584,7 @@ def main(argv=None):
     if a.update:
         if cfg is None:
             print(f"rqah update: no configuration in {cfgdir}: it updates a worker set up with `rqah setup` (else README "
-                  "\"Updating\" has the docker commands)"); return 2
+                  "\"Updates and versions\" has the docker commands)"); return 2
         if a.auto:                                   # one at a time (the timer and a person may overlap)
             import fcntl
             lk = open(os.path.join(cfgdir, ".update.lock"), "a")

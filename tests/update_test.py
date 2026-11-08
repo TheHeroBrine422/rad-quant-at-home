@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
-"""update_test.py [WORKDIR] -- updates in process, no GPU, no network beyond loopback, ~30 s (README "Updating",
+"""update_test.py [WORKDIR] -- updates in process, no GPU, no network beyond loopback, ~40 s (README "Updates and versions",
 RUNBOOK.md "Upgrades"; tests/upgrade_e2e.py runs the whole path with real processes and the 0.4.0 worker).
 
 Checks:
@@ -186,7 +186,7 @@ def t_versions():
     ok("rqah status below the minimum says it gets no new jobs", "below the minimum" in out and "NO new jobs" in out, out[-400:])
     s.Q.worker_min = PREV
     rc, out = capture(CLI.main, ["update", "--config-dir", f"{d}/no-such-config", "--yes"])
-    ok("rqah update without a setup config refuses and points at the docs", rc == 2 and "no configuration" in out and "Updating" in out, out)
+    ok("rqah update without a setup config refuses and points at the docs", rc == 2 and "no configuration" in out and "Updates and versions" in out, out)
     del os.environ["RQAH_IMAGE_ID"]
     # status page: shares by release (verifiers and stale workers do not count)
     page = SP.render(SP.collect(S))
