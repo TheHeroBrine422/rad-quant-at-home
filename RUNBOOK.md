@@ -163,9 +163,12 @@ The order for a release (README "Updates and versions" has the rules):
    of the old version (e.g. a parameter added with a default), list it in `ACCEPTS`: queued and running old jobs then
    keep going to old workers. If not, the old version's queued jobs will wait after the deploy (step 5). A release
    bumps `VERSION`.
-2. **Images first:** build and push the worker images of the new release (README "Publishing images"). The server
-   advertises its own release as current (`RQAH_WORKER_CURRENT` overrides it), so donors see "update available" as
-   soon as it runs: the tag must exist by then.
+2. **Images first:** pin the sources in `docker/pins.env` (rad-exl3-mix commit; the radiance image digest from
+   `radiance-image.yml` when radiance changed), commit, then tag `vX.Y.Z` (= VERSION) and push the tag: the release
+   workflow builds and pushes both images and creates the GitHub Release with `release.json` (README "Releases").
+   Then `$A release-fetch X.Y.Z` on the queue host: from its next request the server advertises that release and its
+   digests (`rqah update` refuses an image whose digest differs). Do this when you want donors to move: auto-updating
+   workers follow a day after the release was published.
 3. **Server:** `sqlite3 queue.sqlite ".backup q.bak"`; `$A versions` (what is queued per job version). Then replace the
    server (`docker compose pull && docker compose up -d`, or restart the process). At start it migrates the database
    if needed (after a copy, `queue.sqlite.schemaN.bak`; the log says `database migrated to schema N`), extends the

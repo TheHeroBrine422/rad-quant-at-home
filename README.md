@@ -29,10 +29,13 @@ What is new on this branch (after 0.4.0):
   name on every machine. `rqah link` is gone.
 - **Open registration:** an invite is optional. Without one a worker starts on probation (server-scored quantization
   jobs only, one at a time until a few pass; evaluations later), rate-limited per address.
-- **Updates** ("Updates and versions" below): workers report their release, the queue advertises the current and the
-  oldest supported one (`rqah status`: "update available: X -> Y" and the command; the status page: the share of
-  workers on old releases; below the minimum a 426 that says how to update). `rqah update` (the setup wizard's
-  `--update`) pulls the new image, lets the running jobs finish, and recreates the container on the same state volume.
+- **Updates** ("Updates and versions" below): workers report their release, the queue advertises the current one
+  with its image digests (from the release manifest) and the oldest supported one (`rqah status`: "update available:
+  X -> Y", the command and the release notes; the status page: the share of workers on old releases; below the
+  minimum a 426 that says how to update). `rqah update` (the setup wizard's `--update`) pulls the new tag, refuses it
+  unless its digest is the advertised one, lets the running jobs finish, and recreates the container on the same state
+  volume; an opt-in hourly timer does the same automatically. **Releases** are built by a tag workflow that pushes the
+  images to GHCR and creates the GitHub Release with the digests and `release.json`.
   Job versions coexist (`ACCEPTS`, `admin.py versions` / `retire`), the database migrates in versioned steps with a
   backup, a server restart no longer expires the leases of workers that were waiting for it, and the worker's state
   directory is versioned.
@@ -60,7 +63,8 @@ What is new in 0.3:
 mixes of it against reference outputs. The results become openly published models; donors get points ("lumens") and,
 opt-in, credit in the model cards.
 
-**What you need.** Linux, Docker, and one of:
+**What you need.** Linux, Docker, and one of (Docker is the only supported way to run a donor worker: the images are
+the tested environment, and updates replace them whole):
 - **AMD** (all job types): the amdgpu kernel driver (no ROCm install), a Radeon AI PRO R9700 (32 GB) or another gfx1201
   card. 16 GB cards also get the smaller evaluation jobs.
 - **NVIDIA** (quantization jobs): an RTX 30xx / 40xx / 50xx or newer data-center card (compute capability 8.0+), the
@@ -123,12 +127,13 @@ so leave your ISP's cap some margin. Typical sizes are in "Data per job": a 27B 
 first time and uploads 50-300 MB.
 
 **Update it.** When we publish a new release, the worker logs `update available: X -> Y` once and `rqah status` shows
-the command; it keeps working on the old one until the queue stops supporting it (then it takes no new jobs and says
-so). Nothing updates by itself. On the host: `rqah update` (`python3 client/setup.py --update`, for a worker set up with
-the wizard) pulls the new image, lets the running jobs finish, and recreates the container on the same state volume:
-your token, input cache and data budget counters stay. By hand: `docker pull` the new tag, `docker stop
-rad-quant-at-home` (finishes the running jobs), `docker rm rad-quant-at-home`, and the same `docker run` line with the
-new tag. Details: "Updates and versions" below.
+the command and the release notes; it keeps working on the old one until the queue stops supporting it (then it takes
+no new jobs and says so). On the host: `rqah update` (`python3 client/setup.py --update`, for a worker set up with the
+wizard) pulls the new image, checks its digest, lets the running jobs finish, and recreates the container on the same
+state volume: your token, input cache and data budget counters stay. If you said yes to "Update automatically" in the
+wizard, an hourly timer does that for you a day after a release (off by default). By hand: `docker pull` the image
+`rqah status` prints (`REPO:TAG@sha256:...`), `docker stop rad-quant-at-home` (finishes the running jobs), `docker rm
+rad-quant-at-home`, and the same `docker run` line with that image. Details: "Updates and versions" below.
 
 **Stop it.** `docker stop rad-quant-at-home` finishes the running jobs (up to 15 min) and exits; `docker kill -s TERM
 rad-quant-at-home` while that waits hands them back at once. `docker start rad-quant-at-home` resumes. To leave for
@@ -498,11 +503,15 @@ Batch checks should go layer by layer: the Hessian load and tr(W H Wᵀ) are the
 
 **How donors learn.** A worker sends its release with every request (`X-RQAH-Version`; 0.4 workers only in their
 user agent, which the server reads as 0.4.0). Every lease answer, `/api/v0/status` and `/api/v0/me` carry `{"update":
-{"current", "min"}}`; `GET /api/v0/version` (no token) has the same. The worker logs `update available: X -> Y` once and
-keeps it in `STATE/update.json`; `rqah status` shows a VERSION column and, when there is a newer release, `update
-available: X -> Y` with `rqah update` and the exact image to pull (its own tag with the new version). The status page
-shows the share of recent workers on the current release and on older ones. `--worker-current` (default: the server's
-own release) and `--worker-min` (default 0.4.0, one release back) set what is advertised.
+{"current", "min", "images", "notes", "published"}}`; `GET /api/v0/version` (no token) has the same. `current` and
+`images` (per stack: `REPO:X.Y.Z-STACK` and its `sha256` digest) come from the **release manifest** (`release.json`,
+`common/release.py`) that the release workflow attaches to the GitHub Release and the operator installs with
+`admin.py release-fetch X.Y.Z` (the server re-reads it when it changes; without one, `current` is `--worker-current`
+or the server's own release, with no digests). The worker logs `update available: X -> Y` (with the notes link) once
+and keeps it in `STATE/update.json`; `rqah status` shows a VERSION column and, when there is a newer release, `update
+available: X -> Y` with `rqah update`, the exact image by digest and the release notes link. The status page shows
+the share of recent workers on the current release and on older ones. `--worker-min` (default 0.4.0, one release
+back) is the oldest release still served.
 
 **Below the minimum.** `/lease` answers **426** with the reason, the update command and `retry_s`: the worker logs
 `UPDATE NEEDED: ...` once, finishes and uploads the jobs it holds (heartbeat, upload and complete are never refused for
@@ -518,10 +527,12 @@ rqah update --yes --release # no question; hand the running jobs back instead of
 rqah update --to 0.5.0      # a given release (also the way back to an older one)
 ```
 
-It pulls the new tag first (a failed pull changes nothing), then drains the container: the restart policy goes to
+It pulls the new tag first and checks that the registry gave it the digest the queue advertises (a tag that was
+moved or tampered with is refused before anything else happens; `--to` another release takes the digest from that
+release's `release.json` on GitHub, `--digest` gives it by hand), then drains the container: the restart policy goes to
 `no`, SIGTERM lets the running jobs finish (up to `--drain-timeout`, 60 min; then a second SIGTERM hands them back to
 the queue, not counted against them), then rewrites `compose.yaml` / `docker-run.sh` / `setup.json` with the new pin
-(`*.prev` keep the old ones), removes the stopped container (never the volume) and starts the new one. `rqah setup
+`REPO:TAG@DIGEST` (`*.prev` keep the old ones; Docker then runs exactly that image), removes the stopped container (never the volume) and starts the new one. `rqah setup
 --pull --start` drains a running worker the same way. A job that was still running when a container was killed is
 resumed by the new one while its lease lives; if the new release runs another version of that job type, the worker
 hands it back (abandoned, not counted) so a worker of the old version takes it. The state directory is versioned
@@ -529,11 +540,30 @@ hands it back (abandoned, not counted) so a worker of the old version takes it. 
 fetched again) and the budget counters; an older one (a downgrade) keeps the token and the cache and sets the job
 records aside.
 
-**No auto-update by default, and none offered for now.** Donors run our code with their GPUs; an update should be a
-decision they make. An opt-in later would be a host-side timer (systemd) running `rqah update --yes` for patch
-releases only, once the images are signed (cosign) and pulled by digest, never something inside the container (that
-needs the Docker socket, i.e. root on the host) and never Watchtower-style "latest". The value is small while releases
-are rare and the old release keeps working for a whole window.
+**Who restarts the container.** The worker runs inside the container and cannot replace it (that needs the Docker
+socket, i.e. root on the host, which we never ask for). The restart is driven from the host by `rqah update`, the same
+command a person runs and the timer runs: `docker pull` + digest check, drain, `docker rm`, `docker compose up -d` (or
+the run line). Chosen over a long-running host helper or a Watchtower-style container because it needs no daemon of
+ours, no socket mount and nothing that runs as root, and it is one code path for manual and automatic updates.
+
+**Automatic updates (opt-in).** The wizard asks "Update automatically" (`--auto-update on|off`; **off** by default).
+On, it writes a systemd *user* timer (`rqah-update.timer`, hourly with jitter; installed with `systemctl --user` after
+you agree; `loginctl enable-linger` keeps it running while you are logged out) that runs `setup.py --update --auto`.
+That does something only when setup.json still says `auto_update`, the queue advertises a *newer* release with a digest
+for your image, and that release was published at least 24 h ago (time for us to withdraw a bad one: the queue stops
+advertising it). It then pulls, checks the digest, waits for the running jobs to finish (a job boundary, up to 6 h, then
+hands them back) and recreates the container. It never downgrades and never runs without a digest. Without systemd it
+prints the line for cron. `docker/run-local.sh` (our own boxes, no Docker, updated by git) is outside this path; the
+version check and the 426 apply to it like to any worker.
+
+*The default (for the user to decide).* **On** gets the fleet onto a fix within a day and keeps the share of old
+workers (and 426s at the end of a window) small, at no effort for donors. Its cost is trust: whoever can publish a
+release (our GitHub repository and its workflow, which write both the image and the digest the queue advertises)
+reaches every opted-in machine within a day, without the donor looking. The digest check stops a tampered registry,
+not a compromised repository; the container stays locked down (no capabilities, no host paths but its volume and the
+GPU devices). **Off** keeps every update a donor's decision, at the cost of slower convergence. We propose **off**
+until the images are signed (cosign keyless, verified by `rqah update`), then **on**: the switch is
+`AUTO_UPDATE_DEFAULT` in client/setup.py.
 
 **Compatibility rules.** API v0 changes are additive (new keys, new endpoints); nothing is removed without a release
 in which it still works. The server leases to workers from `--worker-min` up (one release back by default), so a
@@ -830,6 +860,9 @@ docker compose up -d && docker compose logs -f
 
 ### Worker on our own boxes (no Docker)
 
+For our own machines only (verifiers, tests); donors run the images. It runs this checkout, so it is updated with
+git, not by `rqah update`; it still sends its release and gets a 426 below `--worker-min` like any worker.
+
 ```bash
 RXM=/path/to/rad-exl3-mix STATE=... EXL3_SRC=... EXL3_PATH=... TORCH_EXT=... GPU_LOCK='/var/lock/gpu-card{card}.lock' \
   RADIANCE=... RADIANCE_HOME=... docker/run-local.sh --server ... --token-file ... --gpus 0 --gpu-env ROCR_VISIBLE_DEVICES
@@ -838,7 +871,39 @@ RXM=/path/to/rad-exl3-mix STATE=... EXL3_SRC=... EXL3_PATH=... TORCH_EXT=... GPU
 A verifier (spot-check re-runs) is such a worker registered with `admin.py add-worker` and flagged
 `admin.py verifier ID`.
 
-### Publishing images (maintainer; a host with Docker and ~40 GB free)
+### Releases (maintainer)
+
+A release is a tag: `git tag v0.5.0 && git push origin v0.5.0` (the tag must equal `VERSION`). The workflow
+`.github/workflows/release.yml` then, with GITHUB_TOKEN only:
+
+1. checks the tag against `VERSION` and the pins in `docker/pins.env` (the rad-exl3-mix commit the quantizer comes
+   from, the radiance image by digest), and runs `tests/update_test.py`;
+2. builds both worker images with `docker/build.sh` (rad-exl3-mix fetched anonymously at the pinned commit), on
+   GitHub's runner after freeing disk and moving Docker's data to `/mnt`, or on a self-hosted runner named by the
+   repository variable `RQAH_BUILD_RUNNER` (the ROCm image is large: if the hosted runner runs out of disk or time,
+   use one), and pushes `X.Y.Z-<stack>` plus the moving tags to GHCR;
+3. writes `release.json` (`tools/release.py manifest`: version, commit, the digests `docker push` reported, the
+   sources, the changes since the previous tag) and creates the GitHub Release with notes (changes, image tags and
+   digests, how donors update) and `release.json` attached. A version whose Release exists is never rebuilt.
+
+`workflow_dispatch` on the same workflow is a dry run: it builds and leaves the would-be manifest and notes as
+artifacts, without logging in, pushing or creating anything. Then, on the queue host: `$A release-fetch 0.5.0`
+(downloads and checks `release.json` into the DB directory); the server advertises the release and its digests from
+its next request on (RUNBOOK.md "Upgrades").
+
+**The radiance image** (what the ROCm image runs for eval_mix / golden_record) is published on its own:
+`.github/workflows/radiance-image.yml`, run by hand, clones our fork (codeberg.org/Hero422/radiance, `qc-exl3-v3`) at
+`RADIANCE_COMMIT`, builds it with the fork's `docker/build.sh` and pushes
+`ghcr.io/theherobrine422/rad-quant-at-home-radiance:<commit>`; pin the printed digest as `RADIANCE_IMAGE` in
+`docker/pins.env`. Separate because that build compiles a patched LLVM on a ROCm base (hours, tens of GB: GitHub's
+standard runners hit their disk and the 6 h limit; set `RQAH_RADIANCE_RUNNER` to a self-hosted runner) and changes far
+less often than the worker; a pinned digest also makes every worker release reproducible. Until it is pinned, the ROCm
+part of a release stops with that message.
+
+Not tested yet: both workflows have only been checked locally (YAML, the `docker/build.sh` command line, `tools/release.py`
+in `tests/update_test.py`); the first dry run on GitHub is the real test.
+
+### Publishing images by hand (fallback; a host with Docker and ~40 GB free)
 
 The images live on GHCR under `ghcr.io/theherobrine422/` as public packages, so donors pull them without a login.
 Pushing needs a classic GitHub token with `write:packages` (never stored in this repo or on a donor box):
@@ -918,6 +983,9 @@ Every push to main and every pull request runs the no-GPU suites below on GitHub
   the minimum is raised mid-job, and a simulated next release adds a job type and bumps noop's version while workers
   of three releases share the queue (retire, `--migrate`).
 - `tests/update_docker_test.py` (0.5, manual: needs Docker): the drain of `rqah update` against a real container.
+  `tests/update_test.py` also covers the release manifest, `tools/release.py`, `admin.py release-fetch`, the digest
+  check (a moved tag refused), `--auto` (off, too young, a day old, never a downgrade, never without a digest) and the
+  timer units.
 - `tests/setup_test.py`: the setup wizard (docs/SETUP.md) on fake machines (fake sysfs and command output), ~20 s, no
   GPU, no network: a 4 / 8 / 12 / 16 / 32 GB card matrix, multi-card with an iGPU, unsupported cards, no Docker,
   the files and their modes, re-runs, `--check`, the plain prompts and the curses form on a pseudo-terminal.
