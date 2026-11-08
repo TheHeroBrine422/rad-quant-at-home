@@ -8,7 +8,8 @@ below.
 
 A queued job is a candidate for a worker only if:
 
-1. **Static fit.** The worker runs the job's type and version. Its declared cards, VRAM per card, host RAM and disk
+1. **Static fit.** The worker runs the job's type and version (0.5: a version this server's code still accepts,
+   `VERSION` or `ACCEPTS`, and not retired; README "Updates and versions"). Its declared cards, VRAM per card, host RAM and disk
    (`--cache-gb`) cover the job's `requires`. Trusted-only types go to trusted workers, spot-check re-runs to
    verifiers (never to the original donor), and quarantined workers get nothing (all as in 0.2).
 2. **Data budget (0.4).** The worker may declare the bytes left in its data budget (`budget.down`, `budget.up`; see

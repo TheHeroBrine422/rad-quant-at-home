@@ -227,6 +227,7 @@ def me(S, w):
                         "gpu_name": scrub(caps.get("gpu_name", ""), 64), "cards": caps.get("cards"), "vram_gb": caps.get("vram_gb"),
                         "ram_gb": caps.get("ram_gb"), "disk_gb": caps.get("disk_gb"), "job_types": caps.get("job_types", []),
                         "image": scrub(caps.get("image", ""), 128), "budget": budget_view(caps),
+                        "version": x["version"] if "version" in x.keys() else None,
                         "cached_inputs": (caps.get("cache") or {}).get("n") if isinstance(caps.get("cache"), dict) else None,
                         "trusted": bool(x["trusted"]), "verifier": bool(x["verifier"]), "quarantined": bool(x["quarantined"]),
                         "disabled": bool(x["disabled"]),

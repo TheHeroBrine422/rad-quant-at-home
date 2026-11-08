@@ -1,0 +1,54 @@
+# The radiance runtime image the ROCm worker image copies (Dockerfile.rocm: FROM ${RADIANCE_IMAGE}), built from our
+# fork (codeberg.org/Hero422/radiance, branch qc-exl3-v3) at RADIANCE_COMMIT in docker/pins.env with the fork's own
+# docker/build.sh, and published as ghcr.io/theherobrine422/rad-quant-at-home-radiance:<commit>. Then pin its digest
+# (the summary prints the line) as RADIANCE_IMAGE in docker/pins.env, in a commit, before tagging a release.
+#
+# Its own workflow, run by hand, because the build compiles a patched LLVM on a ROCm base image: hours and tens of GB,
+# too much to repeat for every worker release, and it changes far less often. It needs a big runner: set the
+# repository variable RQAH_RADIANCE_RUNNER to a self-hosted runner's label (GitHub's 4-vCPU runners would hit the
+# 6 h job limit). push=false is a dry run (build only). Secrets: none beyond GITHUB_TOKEN.
+name: radiance-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "push to GHCR (false: build only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ vars.RQAH_RADIANCE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 720
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/theherobrine422/rad-quant-at-home-radiance
+    steps:
+      - uses: actions/checkout@v4
+      - name: pins
+        run: python3 -I tools/release.py pins >> "$GITHUB_ENV"
+      - name: radiance at the pinned commit
+        run: |
+          set -eu
+          # a whole clone, then the commit (not every forge serves a fetch by commit id)
+          git clone -q "$RADIANCE_REPO_URL" "$RUNNER_TEMP/radiance"
+          git -C "$RUNNER_TEMP/radiance" checkout -q "$RADIANCE_COMMIT"
+      - name: "build (the fork's docker/build.sh, git archive of the commit into docker buildx)"
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/radiance" && sh docker/build.sh -r HEAD -t gfx1201
+          docker tag "radiance:$(git rev-parse --short=12 HEAD)" "$IMAGE:$RADIANCE_COMMIT"
+      - name: push, print the pin
+        if: inputs.push
+        run: |
+          set -eu
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:$RADIANCE_COMMIT"
+          D=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE:$RADIANCE_COMMIT" | sed -n "s|^$IMAGE@||p" | head -1)
+          echo "docker/pins.env: RADIANCE_IMAGE=$IMAGE@$D" | tee -a "$GITHUB_STEP_SUMMARY"

@@ -64,17 +64,31 @@ w25 (donors, status page):
   reprioritize PATTERN [--priority P | --by-granularity] [--priority-boost B] [--dry-run]
                                          set the priority of the queued / leased jobs of every level matching the shell
                                          pattern (e.g. 'q27-k2.*'): P, or K's granularity default (+ B); heads +1
-  queue [--limit N]                      queued jobs in scheduling order: priority classes, levels, sizes"""
-import argparse, concurrent.futures as cf, json, os, shutil, sys, time
+  queue [--limit N]                      queued jobs in scheduling order: priority classes, levels, sizes
+0.5 (updates, RUNBOOK.md "Upgrades"):
+  versions [--days D] [--json]           per job type and version: queued / running / accepted jobs, whether this
+                                         server's code still accepts it, the workers seen in D days (7) that declare
+                                         it; worker releases seen, and what raising --worker-min would refuse
+  retire TYPE VERSION [--migrate] [--dry-run] [--undo]
+                                         take an old job version out of service (nothing of it is leased or accepted
+                                         any more). Refused while jobs of it run; refused while some are queued unless
+                                         --migrate, which re-stamps them at the type's current version after checking
+                                         their parameters and inputs against it (running jobs are never touched)
+  release-fetch [X.Y.Z | latest] [--file F] [--out PATH]
+                                         the release manifest (common/release.py: the release's image digests) from its
+                                         GitHub Release (or a local file), checked, written next to the database (or
+                                         --out); the running server picks it up and advertises that release
+  release-show [--out PATH]              the installed manifest"""
+import argparse, concurrent.futures as cf, json, os, re, shutil, sys, time
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.util import read_json, write_json_atomic, sha256_file, st_header, safe_relpath, fmt_bytes, env
+from common.util import read_json, write_json_atomic, sha256_file, st_header, safe_relpath, fmt_bytes, env, vtuple
 from common.st import copy_tensors
-from common import radfile
+from common import radfile, release as RL
 import jobs
 from jobs import qwen, quant_common as QC, golden_common as G
-from server.store import Store
+from server.store import Store, SchemaTooNew
 from server import verify as V, batch as B, donor as D, statuspage as SP, sched as SCH
 
 
@@ -234,6 +248,143 @@ def cmd_enqueue_level(a, S):
                              priority=prio + 1, grp=grp("head")) is not None
     print(f"level {a.level} (stamp {', '.join(sorted(stamps))}{', verify by score' if a.verify == 'score' else ''}): {n} new jobs, "
           f"priority {prio}")
+
+
+def version_table(S, days=7, now=None):
+    """-> (rows per job type and version, Counter of the worker releases seen in `days`, recent worker rows)"""
+    now = now or time.time(); ret = S.retired()
+    have = {}
+    for r in S.q("SELECT type, version, state, COUNT(*) n FROM jobs GROUP BY type, version, state"):
+        have.setdefault((r["type"], r["version"]), Counter())[r["state"]] += r["n"]
+    recent = S.q("SELECT id, caps, version FROM workers WHERE disabled=0 AND last_seen>=?", (now - days * 86400,))
+    decl, soft = Counter(), Counter()
+    for w in recent:
+        caps = json.loads(w["caps"] or "{}")
+        for t in caps.get("job_types") or []:
+            v = (caps.get("versions") or {}).get(t)
+            if isinstance(v, int): decl[(t, v)] += 1
+        soft[w["version"] or "unknown"] += 1
+    rows = []
+    for t in sorted(set(jobs.REGISTRY) | {t for t, _ in have}):
+        m = jobs.REGISTRY.get(t)
+        for v in sorted({v for tt, v in list(have) + list(decl) if tt == t} | ({m.VERSION} if m else set())):
+            st = have.get((t, v), Counter())
+            served = m is not None and v in jobs.served(m) and v not in ret.get(t, ())
+            rows.append({"type": t, "version": v, "current": bool(m and v == m.VERSION), "served": served,
+                         "retired": v in ret.get(t, ()), "queued": st["queued"], "leased": st["leased"],
+                         "accepted": st["accepted"], "workers": decl[(t, v)],
+                         "stuck": st["queued"] > 0 and (not served or decl[(t, v)] == 0)})
+    return rows, soft, recent
+
+
+def cmd_versions(a, S):
+    rows, soft, _ = version_table(S, a.days)
+    cur, mn = S.meta_get("worker_current"), S.meta_get("worker_min")
+    if a.json:
+        print(json.dumps({"worker_current": cur, "worker_min": mn, "jobs": rows, "workers": dict(soft)}, indent=1)); return
+    print(f"workers: current {cur or '?'}, minimum {mn or '?'} (what the server last advertised)")
+    print(f"{'type':14s} {'ver':>3s}  {'':9s} {'queued':>6s} {'running':>7s} {'accepted':>8s} {'workers':>7s}")
+    for r in rows:
+        tag = "current" if r["current"] else "retired" if r["retired"] else "accepted" if r["served"] else "NOT SERVED"
+        print(f"{r['type']:14s} {r['version']:>3d}  {tag:9s} {r['queued']:6d} {r['leased']:7d} {r['accepted']:8d} {r['workers']:7d}"
+              + ("   <- stuck" if r["stuck"] else ""))
+    print(f"\nworker releases seen in the last {a.days:g} days: "
+          + (", ".join(f"{v}: {n}" for v, n in sorted(soft.items(), key=lambda kv: vtuple(kv[0]) or (-1,))) or "none"))
+    for r in rows:
+        if not r["stuck"]: continue
+        m = jobs.REGISTRY.get(r["type"])
+        print(f"STUCK {r['type']} v{r['version']}: {r['queued']} queued, " +
+              ("this server does not accept it" + (f": `retire {r['type']} {r['version']} --migrate` moves them to v{m.VERSION}" if m else "")
+               if not r["served"] else f"no worker seen in {a.days:g} days declares it (wait for one, or `retire --migrate`)"))
+    if mn and cur:
+        old = sum(n for v, n in soft.items() if v != "unknown" and vtuple(v) < vtuple(cur))
+        if old: print(f"raising --worker-min to {cur} would refuse {old} of the workers seen (they finish what they hold)")
+
+
+def cmd_retire(a, S):
+    t, v = a.type, a.version
+    m = jobs.get(t)
+    ret = S.retired()
+    if a.undo:
+        ret.get(t, set()).discard(v)
+        S.meta_set("retired", json.dumps({k: sorted(x) for k, x in ret.items() if x}))
+        with S.tx() as db: S.event(db, "unretire", detail={"type": t, "version": v})
+        print(f"{t} v{v}: back in service" + ("" if v in jobs.served(m) else f" (but this server's code does not accept it)")); return
+    if v == m.VERSION: sys.exit(f"{t} v{v} is the current version of {t}: bump the type first")
+    with S.tx() as db:
+        leased = [r[0] for r in db.execute("SELECT id FROM jobs WHERE type=? AND version=? AND state='leased'", (t, v))]
+        queued = db.execute("SELECT * FROM jobs WHERE type=? AND version=? AND state='queued' ORDER BY id", (t, v)).fetchall()
+        if leased:
+            sys.exit(f"{len(leased)} {t} v{v} jobs are running ({', '.join(map(str, leased[:10]))}): retire never touches running "
+                     f"jobs. Wait for them (admin.py list --type {t} --state leased), or cancel them, then retire")
+        if queued and not a.migrate:
+            sys.exit(f"{len(queued)} queued {t} v{v} jobs still need it ({', '.join(str(r['id']) for r in queued[:10])}): "
+                     f"--migrate re-stamps them at v{m.VERSION} after checking them against it, or cancel them")
+        if queued and not a.data: sys.exit("--migrate needs --data (the manifest) to re-check the jobs' inputs")
+        bad, moved = [], []
+        man = man_files(a.data) if queued else {}
+        for j in queued:
+            p = json.loads(j["params"])
+            try:
+                jobs.check_params(t, p); jobs.check_inputs(t, p, json.loads(j["inputs"]))
+                miss = [n for n in json.loads(j["inputs"]) if n not in man]
+                if miss: raise jobs.Rejected(f"inputs not in the manifest: {miss[:3]}")
+            except jobs.Rejected as e:
+                bad.append(f"job {j['id']}: {e}"); continue
+            info = read_json(os.path.join(a.data, "models", f"{p['model']}@{p['revision']}", "model.json")) if "model" in p else None
+            uk = j["ukey"]
+            if uk and uk.startswith(f"{t}/v{v}:"):
+                uk = f"{t}/v{m.VERSION}:" + uk[len(f"{t}/v{v}:"):]
+                if db.execute("SELECT 1 FROM jobs WHERE ukey=? AND id<>?", (uk, j["id"])).fetchone():
+                    bad.append(f"job {j['id']}: the same unit is queued at v{m.VERSION} already ({uk}): cancel this one"); continue
+            moved.append((j["id"], json.dumps(jobs.requirements(m, p, info)), uk))
+        if bad:
+            sys.exit(f"not retired: {len(bad)} queued jobs cannot move to v{m.VERSION}:\n  " + "\n  ".join(bad[:20]))
+        if a.dry_run:
+            print(f"dry run: {t} v{v} can be retired; {len(moved)} queued jobs would move to v{m.VERSION}"); return
+        now = time.time()
+        for jid, req, uk in moved:
+            db.execute("UPDATE jobs SET version=?, requires=?, ukey=?, updated=? WHERE id=?", (m.VERSION, req, uk, now, jid))
+            S.event(db, "migrate", jid, detail={"type": t, "from": v, "to": m.VERSION})
+        ret.setdefault(t, set()).add(v)
+        db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('retired', ?)", (json.dumps({k: sorted(x) for k, x in ret.items() if x}),))
+        S.event(db, "retire", detail={"type": t, "version": v, "migrated": len(moved)})
+    print(f"{t} v{v} retired" + (f"; {len(moved)} queued jobs moved to v{m.VERSION}" if moved else ""))
+
+
+def release_path(a):
+    return a.out or os.path.join(os.path.dirname(os.path.abspath(a.db)), "release.json")
+
+
+def cmd_release_fetch(a):
+    """a release manifest from GitHub (or --file), checked, installed atomically"""
+    if a.file:
+        b = open(a.file, "rb").read(1 << 20); src = a.file
+    else:
+        import urllib.request
+        v = None if a.version in (None, "latest") else a.version
+        if v is not None and not re.fullmatch(RL.VERSION_PAT, v): sys.exit("release-fetch: X.Y.Z or latest")
+        src = RL.asset_url(v)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(src, headers={"User-Agent": "rqah-admin"}), timeout=60) as r: b = r.read(1 << 20)
+        except OSError as e: sys.exit(f"release-fetch: {src}: {e}")
+    try: m = RL.loads(b)
+    except ValueError as e: sys.exit(f"release-fetch: {src}: refused: {e}")
+    if a.version not in (None, "latest") and m["version"] != a.version: sys.exit(f"release-fetch: {src} is {m['version']}, not {a.version}")
+    p = release_path(a)
+    old = read_json(p) if os.path.exists(p) else None
+    write_json_atomic(p, m)
+    print(f"{p}: release {m['version']} (was {old.get('version') if isinstance(old, dict) else 'none'}), published {m['created']}")
+    for s, im in sorted(m["images"].items()): print(f"  {s:18s} {im['repo']}:{im['tag']}@{im['digest']}")
+    print("the server advertises it at its next request (current = this release unless RQAH_WORKER_CURRENT is set)")
+
+
+def cmd_release_show(a):
+    p = release_path(a)
+    if not os.path.exists(p): sys.exit(f"no release manifest at {p} (admin.py release-fetch)")
+    try: m = RL.loads(open(p, "rb").read())
+    except ValueError as e: sys.exit(f"{p}: {e}")
+    print(json.dumps(m, indent=1, sort_keys=True))
 
 
 def cmd_reprioritize(a, S):
@@ -677,11 +828,19 @@ def main():
     x.add_argument("--published", metavar="NOTE", help="a released model's codes: replay guard, not a reference")
     x.add_argument("--note")
     x = sp.add_parser("scores"); x.add_argument("--level"); x.add_argument("--job", type=int)
+    x = sp.add_parser("versions"); x.add_argument("--days", type=float, default=7); x.add_argument("--json", action="store_true")
+    x = sp.add_parser("retire"); x.add_argument("type"); x.add_argument("version", type=int)
+    x.add_argument("--migrate", action="store_true"); x.add_argument("--dry-run", action="store_true"); x.add_argument("--undo", action="store_true")
+    x = sp.add_parser("release-fetch"); x.add_argument("version", nargs="?", default="latest"); x.add_argument("--file"); x.add_argument("--out")
+    x = sp.add_parser("release-show"); x.add_argument("--out")
     a = ap.parse_args()
+    if a.cmd in ("release-fetch", "release-show") and (a.out or a.db):      # no database access
+        return cmd_release_fetch(a) if a.cmd == "release-fetch" else cmd_release_show(a)
     if not a.db: ap.error("--db (or RQAH_DB) is required")
     global DATA
     DATA = a.data
-    S = Store(a.db)
+    try: S = Store(a.db)
+    except SchemaTooNew as e: sys.exit(str(e))
     if a.cmd == "invite": print(S.add_invite(a.uses, a.note, a.personal))
     elif a.cmd == "donors": cmd_donors(a, S)
     elif a.cmd == "donor": cmd_donor(a, S)
@@ -749,6 +908,8 @@ def main():
         except B.BatchError as e: sys.exit(str(e))
     elif a.cmd == "exclude-donor": cmd_exclude_donor(a, S)
     elif a.cmd == "points": cmd_points(a, S)
+    elif a.cmd == "versions": cmd_versions(a, S)
+    elif a.cmd == "retire": cmd_retire(a, S)
 
 
 if __name__ == "__main__":

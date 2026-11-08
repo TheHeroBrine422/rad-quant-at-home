@@ -5,6 +5,10 @@ the type's schema exactly, and input files outside what the type allows for thos
 
 Every job module defines
     NAME, VERSION, SCHEMA       the type, its version (bumped on any change of meaning), its parameter schema
+    ACCEPTS                     (optional, 0.5) older job versions whose results this code still accepts and checks
+                                (e.g. (2,) when version 3 only added a parameter with a default): queued and running
+                                jobs of those versions keep going to the workers that declare them. Default: none, so
+                                after a bump the old version's queued jobs wait (admin.py versions, retire --migrate)
     IMPLEMENTED                 False: the interface exists, the worker refuses to run it
     TRUSTED_ONLY                True: leased only to workers the operator flagged trusted (big-box jobs)
     requires(p, info)           what one job needs: {"gpu", "cards", "vram_gb" (per card), "ram_gb" (host)}; info is
@@ -31,6 +35,11 @@ REGISTRY = {m.NAME: m for m in (noop, quant_layer, quant_tensor, quant_head, eva
 
 class Rejected(ValueError):
     """a job this worker / server will not run: unknown type, bad parameters, bad inputs"""
+
+
+def served(m):
+    """the job versions of type m whose results this server code accepts: its VERSION and ACCEPTS"""
+    return {m.VERSION, *getattr(m, "ACCEPTS", ())}
 
 
 def get(jtype):

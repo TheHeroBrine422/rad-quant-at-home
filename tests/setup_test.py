@@ -261,7 +261,7 @@ ok("display (1 GB off), leaderboard, windows, budgets in worker.env",
                             "RQAH_MAX_DOWN_GB_MONTH=300\n", "RQAH_MAX_UP_MBPS=10\n", "RQAH_BUDGET_RESET_DAY=15\n")), envt)
 ok("env lines parse the same in docker --env-file and compose (no quotes, $, #)",
    all(re.fullmatch(r"[A-Z_][A-Z0-9_]*=[^\"'$#\\]*", l) for l in envt.splitlines() if l and not l.startswith("#")))
-run = open(os.path.join(cfgdir, "docker-run.sh")).read()
+run = open(os.path.join(cfgdir, "docker-run.sh")).read().replace(" \\\n  ", " ")    # one line (the wrap depends on the path length)
 ok("docker-run.sh: env-file, devices, volume, localtime; no secret on the line",
    all(x in run for x in ("--env-file", "--device /dev/kfd", "--group-add 39", "rqah-state:/var/lib/rqah", "/etc/localtime:/etc/localtime:ro",
                           "--cap-drop ALL", "--memory 56g", "--stop-timeout 900")) and "RQAH_INVITE" not in run, run)
@@ -370,7 +370,7 @@ answers = iter(["n",                          # advanced? no
                 "0", "",                      # cards, vram (default 11)
                 "20", "", "0", "8",           # ram, cache, down Mbps, up Mbps
                 "0", "50", "3",               # down month, up month, reset day (asked: an up budget is set)
-                "23:00-07:00"])
+                "23:00-07:00", "n"])          # windows, update automatically (0.5)
 asked, pw_asked, outl = [], [], []
 
 
@@ -386,7 +386,8 @@ res = S.plain_ui(cfg, None, hw, "/tmp/x", False, inp=inp, getpw=getpw, out=outl.
 c, sec, ss = res
 ok("plain: answers land", (c["server"], c["name"], c["leaderboard"], c["ram_gb"], c["max_up_mbps"], c["max_up_gb_month"],
                           c["budget_reset_day"], c["windows"], c["vram_gb"]) == ("https://queue.example.org", "Grace", True, 20, 8, 50, 3,
-                                                                                  ["23:00-07:00"], 11), str(c))
+                                                                                  ["23:00-07:00"], 11) and c["auto_update"] is False
+   and any(p.startswith("Update automatically") for p in asked), str(c))
 ok("plain: ram change moved the container limit", c["mem_limit_gb"] == 28, str(c["mem_limit_gb"]))
 ok("plain: the invite through getpass only", sec == INVITE and ss == "new" and len(pw_asked) == 1
    and not any(INVITE in p for p in asked) and not any(INVITE in l for l in outl))
@@ -417,8 +418,9 @@ f.mode = "form"
 ok("form: a tiny terminal gets a message, not a crash", "too small" in "".join(t for t, _ in f.lines(40, 10)))
 
 
-def pty_run(args, keys, cfgdir, env_extra=None, timeout=20):
-    """run setup.py on a pseudo-terminal, typing `keys` (list of (delay, bytes)); returns (rc, all output)"""
+def pty_run(args, keys, cfgdir, env_extra=None, timeout=20, wait_for=b""):
+    """run setup.py on a pseudo-terminal, typing `keys` (list of (delay, bytes)), the first once it has printed
+    (and printed wait_for); returns (rc, all output)"""
     pid, fd = pty.fork()
     if pid == 0:
         os.environ.update({"TERM": "xterm-256color", "LINES": "34", "COLUMNS": "100", **(env_extra or {})})
@@ -430,7 +432,7 @@ def pty_run(args, keys, cfgdir, env_extra=None, timeout=20):
     buf, t0, ki = b"", time.time(), 0
     nxt = time.time() + 1.0
     while time.time() - t0 < timeout:
-        if ki < len(keys) and time.time() >= nxt:
+        if ki < len(keys) and time.time() >= nxt and (ki or (buf and wait_for in buf)):
             os.write(fd, keys[ki][1]); nxt = time.time() + keys[ki][0]; ki += 1
         r, _, _ = select.select([fd], [], [], 0.05)
         if r:
@@ -465,13 +467,14 @@ ok("pty curses: the typed invite is stored and never echoed", os.path.exists(os.
    and INVITE[:8] not in outp)
 rc, outp = pty_run(["--curses"], [(0.5, b"q")], os.path.join(W, "cfg", "pty-quit"))
 ok("pty curses: q quits without writing", rc == 1 and not os.path.exists(os.path.join(W, "cfg", "pty-quit")), f"rc={rc}")
-rc, outp = pty_run(["--plain"], [(0.3, b"\x03")], os.path.join(W, "cfg", "pty-plain"))
-ok("pty plain: Ctrl-C quits without writing", rc == 1 and "nothing written" in outp and not os.path.exists(os.path.join(W, "cfg", "pty-plain")))
+rc, outp = pty_run(["--plain"], [(0.3, b"\x03")], os.path.join(W, "cfg", "pty-plain"), wait_for=b"[y/N]")
+ok("pty plain: Ctrl-C quits without writing", rc == 1 and "nothing written" in outp and not os.path.exists(os.path.join(W, "cfg", "pty-plain")),
+   f"rc={rc} {outp[-300:]!r}")
 # the plain prompts on a real terminal: a 4070 that drives the display, all defaults but the account and a window
 root4, spec4 = machine("plain-pty", nvidia=[("NVIDIA GeForce RTX 4070", 12282, "8.9", True)], ram_gb=32)
 root_save, spec_save = root, spec
 root, spec = root4, spec4
-typed = ["n", "https://queue.example.org", INVITE, "Grace", "y", "", "", "", "", "", "", "", "", "22:00-08:00", "y", "n", "n", "n"]
+typed = ["n", "https://queue.example.org", INVITE, "Grace", "y", "", "", "", "", "", "", "", "", "22:00-08:00", "", "y", "n", "n", "n"]
 rc, outp = pty_run(["--plain"], [(0.35, (t + "\r").encode()) for t in typed], os.path.join(W, "cfg", "pty-plain-ok"), timeout=30)
 envp = os.path.join(W, "cfg", "pty-plain-ok", "worker.env")
 ok("pty plain: written; the invite stored, never echoed", rc == 0 and os.path.exists(envp) and f"RQAH_INVITE={INVITE}\n" in open(envp).read()
@@ -518,9 +521,10 @@ except SyntaxError as x:
     ok("Python 3.10 grammar", False, str(x))
 nested = [l for l in src.splitlines() if re.search(r'f"[^"]*\{[^}]*"[^"]*"[^}]*\}', l)]
 ok("no 3.12-only nested same-quote f-strings", not nested, str(nested[:3]))
-imports = set(re.findall(r"^import (.+)$", src, re.M)[0].replace(" ", "").split(","))
+imports = {x for l in re.findall(r"^import (.+)$", src, re.M) for x in l.replace(" ", "").split(",")}
 ok("stdlib only", imports <= {"argparse", "datetime", "getpass", "glob", "json", "os", "re", "shlex", "shutil", "stat",
-                              "subprocess", "sys", "tempfile", "textwrap", "unicodedata"}, str(imports))
+                              "subprocess", "sys", "tempfile", "textwrap", "time", "unicodedata", "urllib.error",
+                              "urllib.request"} and not re.search(r"^from ", src, re.M), str(imports))
 
 n_fail = sum(1 for _, c in RESULTS if not c)
 print(f"\n{len(RESULTS) - n_fail}/{len(RESULTS)} passed; screens in {SCREENS}")

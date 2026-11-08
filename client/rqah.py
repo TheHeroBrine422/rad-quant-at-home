@@ -18,6 +18,12 @@ from the queue server with your worker's own token (server/donor.py). Inside the
   setup [--check | --yes ...]    on the host, not in the container: detect the GPUs, RAM, disk and Docker, ask what
                                  to donate, write worker.env / compose.yaml / docker-run.sh (client/setup.py,
                                  docs/SETUP.md; its own flags: rqah setup --help)
+  update [--to X.Y.Z] [--yes] [--release] [--dry-run]   (0.5) on the host: move a worker set up with `rqah setup` to
+                                 the release the queue advertises: pull the new image, let the running jobs finish
+                                 (--release: hand them back), recreate the container on the same state volume
+                                 (= rqah setup --update; docs/SETUP.md "Updating")
+
+`status` also says when the queue advertises a newer worker release ("update available: X -> Y") and how to update.
 
 --json on every command (before or after it): one JSON object on stdout (logs --follow: one per line), keys as in
 the server's answer plus "ok"; errors as {"ok": false, "error", "http"}. Exit codes: 0 ok, 1 server error, 2 usage /
@@ -26,12 +32,12 @@ configuration, 3 token refused, 4 server unreachable.
 Settings (flags win): --server / $RQAH_SERVER; the token from --token-file, $RQAH_TOKEN_FILE, $RQAH_TOKEN,
 else STATE/token; --state / $RQAH_STATE (the worker image sets these). The token is never printed: config shows a
 fingerprint (the first 12 hex digits of its sha256)."""
-import argparse, glob, hashlib, json, os, sys, time, urllib.error, urllib.request
+import argparse, glob, hashlib, json, os, re, sys, time, urllib.error, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.util import API, env
+from common.util import API, VERSION, env, vtuple
 
-UA = "rqah-cli/0.4"
+UA = f"rqah-cli/{VERSION}"
 LOCAL_ENV = ("GPU_NAME", "GPUS", "CARDS", "VRAM_GB", "RAM_GB", "CACHE_GB", "WINDOWS", "ON_STOP", "JOB_TYPES", "NAME",
              "IMAGE_ID", "LEADERBOARD", "MAX_DOWN_MBPS", "MAX_UP_MBPS", "MAX_DOWN_GB_DAY", "MAX_DOWN_GB_MONTH", "MAX_UP_GB_DAY",
              "MAX_UP_GB_MONTH", "BUDGET_RESET_DAY")
@@ -128,9 +134,56 @@ def local_budget(a):
             "spent": sorted({k.split("_")[0] for k, v in lim.items() if v is not None and v - b.get(k, 0) < (1 << 20)})}
 
 
+def stack_of(image_id):
+    """(repo, stack) of this image (RQAH_IMAGE_ID: REPO:X.Y.Z-STACK+COMMIT), or (None, None)"""
+    ref = (image_id or "").split("+", 1)[0]
+    if ":" not in ref or "/" not in ref: return None, None
+    repo, tag = ref.rsplit(":", 1)
+    m = re.match(r"\d{1,4}\.\d{1,4}\.\d{1,4}-", tag)
+    return (repo, tag[m.end():]) if m else (None, None)
+
+
+def new_image(image_id, ver, images=None):
+    """the image this worker's image (image_id) is at release ver: REPO:VER-STACK, pinned @digest when the queue
+    advertises one for that stack (the release manifest), else None"""
+    repo, stack = stack_of(image_id)
+    if not stack or not vtuple(ver): return None
+    im = (images or {}).get(stack) if isinstance(images, dict) else None
+    if isinstance(im, dict) and re.fullmatch(r"[a-z0-9][a-z0-9./:-]{0,200}", str(im.get("image", ""))) \
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", str(im.get("digest", ""))):
+        return f"{im['image']}@{im['digest']}"
+    return f"{repo}:{ver}-{stack}"
+
+
+def update_lines(m):
+    """the update notice of `status` (none when the server predates 0.5 or this worker is current)"""
+    u = m.get("update") or {}
+    cur, mn = u.get("current"), u.get("min")
+    if vtuple(cur) is None or vtuple(mn) is None: return []
+    me_w = [w for w in m.get("workers", []) if w.get("id") == (m.get("worker") or {}).get("id")]
+    mine = (me_w[0].get("version") if me_w else None) or VERSION
+    L = []
+    if vtuple(mine) and vtuple(mine) < vtuple(cur):
+        L.append(f"update available: {mine} -> {cur}" + (f" (this worker keeps getting jobs while the queue accepts {mn} and newer)"
+                 if vtuple(mine) >= vtuple(mn) else f": this worker is below the minimum {mn} and gets NO new jobs until updated"))
+        img = new_image(e("IMAGE_ID"), cur, u.get("images"))
+        L.append("  on the host:  rqah update     (= python3 client/setup.py --update, for a worker set up with rqah setup)")
+        L.append(f"  or by hand:   docker pull {img or '<the worker image>:' + cur + '-<rocm7.14-gfx1201|cu128>'}, then recreate "
+                 "the container with that image and the same state volume (README \"Updates and versions\")")
+        if isinstance(u.get("notes"), str) and u["notes"].startswith("https://github.com/"):
+            L.append(f"  release notes: {u['notes']}")
+    for w in m.get("workers", []):
+        v = w.get("version")
+        if w.get("id") != (m.get("worker") or {}).get("id") and v and vtuple(v) and vtuple(v) < vtuple(cur):
+            L.append(f"worker {w['id']} ({w['name']}) runs {v}" + ("" if vtuple(v) >= vtuple(mn) else f", below the minimum {mn}: no new jobs")
+                     + f"; update it on its host (rqah update)")
+    return L
+
+
 # ---------------------------------------------------------------- commands
 def cmd_status(a):
     m = call(a, "GET", "me"); m["local"] = local_jobs(a); m["local_budget"] = local_budget(a)
+    m["cli_version"] = VERSION; m["update_notice"] = update_lines(m)
     if a.json: return m
     d = m["donor"]
     board = (f"on the leaderboard: #{d['rank']} of {d['on_board']}, {d['board_lumens']:.2f} lumens under this name"
@@ -146,6 +199,7 @@ def cmd_status(a):
                                ("VRAM", lambda w: f"{w['vram_gb']:g}" if w["vram_gb"] is not None else "-"),
                                ("RAM", lambda w: f"{w['ram_gb']:g}" if w["ram_gb"] is not None else "-"),
                                ("LAST SEEN", lambda w: ago(w["last_seen"])),
+                               ("VERSION", lambda w: w.get("version") or "-"),
                                ("RUNNING", lambda w: ",".join(f"{r['job']}:{r['type']}" for r in w["running"]) or "-"),
                                ("COULD RUN", lambda w: w["could_run"] if w["could_run"] is not None else "-"),
                                ("LUMENS", lambda w: f"{w['lumens']:.2f}"),
@@ -170,6 +224,7 @@ def cmd_status(a):
     print("\nqueue: " + ("; ".join(f"{t} {v['queued']} queued, {v['running']} running" for t, v in sorted(q.items())) or "empty"))
     if m["local"]:
         print("this machine: " + "; ".join(f"job {j['job']} ({j['type']}) {j['phase']} since {lt(j['since'])}" for j in m["local"]))
+    if m["update_notice"]: print("\n" + "\n".join(m["update_notice"]))
     lb = m["local_budget"]
     if lb and lb["limited"]:
         parts = [f"{'download' if k.startswith('down') else 'upload'} {gb(lb['used'][k])} of {gb(v)} "
@@ -296,6 +351,13 @@ def main(argv=None):
     if argv[:1] == ["setup"]:                         # the host-side wizard has its own flags and no server or token
         from client import setup as wizard
         return wizard.main(argv[1:])
+    if argv[:1] == ["update"]:                        # the wizard's --update: on the host only (it drives docker)
+        if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+            print("rqah update runs on the host, not in the worker container (it pulls the new image and recreates this "
+                  "container): run `rqah update` (python3 client/setup.py --update) there", file=sys.stderr)
+            return 2
+        from client import setup as wizard
+        return wizard.main(["--update"] + argv[1:])
     common = argparse.ArgumentParser(add_help=False)
     S = argparse.SUPPRESS                             # sub-command copies must not reset what was given before the command
     common.add_argument("--json", action="store_true", default=S, help="machine-readable output")

@@ -62,19 +62,23 @@ def norm_req(r):
     return r
 
 
-def job_filter(wr, caps, failed=frozenset(), groups=frozenset(), tier_="full"):
+def job_filter(wr, caps, failed=frozenset(), groups=frozenset(), tier_="full", retired=None):
     """f(job row) -> its normalised requirements if worker row wr with declared caps may ever run it, else None (the
     free-cards / free-RAM part is the caller's). failed: ids of queued jobs this worker already failed, rejected or let
     expire since their last requeue (one attempt per worker per job). groups: best-of-N groups (jobs.grp) of which the
     worker's donor already holds or delivered a copy (#11: one copy of a group per donor). tier_: tier() of the
-    worker; below "full" only score-mode quant jobs"""
+    worker; below "full" only score-mode quant jobs. 0.5: a job's version must be one the worker declares (exactly)
+    and one this server's code still accepts (jobs.served), and not retired ({type: versions}, admin.py retire)"""
     types = set(caps.get("job_types") or ()) & {n for n, m in jobs.REGISTRY.items() if m.IMPLEMENTED}
     vers = caps.get("versions", {})
     disk = caps.get("disk_gb", 0) * 1e9
     cards = caps.get("cards", 1 if caps.get("gpu") else 0)
 
+    retired = retired or {}
+
     def eligible(j):
         if j["type"] not in types or vers.get(j["type"], j["version"]) != j["version"]: return None
+        if j["version"] not in jobs.served(jobs.REGISTRY[j["type"]]) or j["version"] in retired.get(j["type"], ()): return None
         if j["exclude_worker"] == wr["id"]: return None
         if j["id"] in failed: return None
         if tier_ != "full" and not score_quant(j): return None

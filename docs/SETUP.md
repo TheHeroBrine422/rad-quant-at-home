@@ -65,6 +65,7 @@ AMD gets `/dev/kfd`, `/dev/dri`, the host's numeric video / render gids and `sec
 | speed caps, day / month budgets, reset day | 0 = unlimited, day 1 | day budgets are advanced; the reset day is asked only when there is a monthly budget |
 | time windows | always | `HH:MM-HH:MM`, comma-separated, local time |
 | on stop, container name, image | finish, `rad-quant-at-home`, default | advanced |
+| update automatically | no | the hourly timer (above, "Updating"); the summary says which way updates happen |
 
 The summary lists the jobs the declared caps will get (the README job table and docs/SMALL-CARDS.md: below 6 GB
 nothing, 6-7 GB small Hessian groups, 8-11 GB layers up to K6 ("small-card mode"), 12 GB everything trunk, AMD 16 GB
@@ -82,7 +83,45 @@ RAM for all cards at once, a cache without reflinks for evaluations, running as 
    to print the cards torch sees, and the result is compared with the selection.
 2. **Pull** the image (opt-in, several GB).
 3. **Start** the worker (opt-in): `docker compose up -d` (or `docker-run.sh`). On its first start the worker registers
-   with the invite. Otherwise setup prints the command.
+   with the invite. Otherwise setup prints the command. A worker container of that name that is running is **drained**
+   first (its jobs finish, or `--release` hands them back; below), then removed (never its volume) and created anew.
+
+## Updating (`--update`, alias `rqah update`; 0.5)
+
+```bash
+python3 client/setup.py --update [--to X.Y.Z] [--yes] [--release] [--drain-timeout MIN] [--dry-run] [--config-dir DIR]
+```
+
+1. **Which release and digest:** `GET <queue>/api/v0/version` (no token; the queue in `setup.json`): the current
+   release and, per stack, its image and `sha256` digest. Or `--to X.Y.Z`: the digest then comes from that release's
+   `release.json` on GitHub (or `--digest`). The release must be `X.Y.Z` and the image
+   `ghcr.io/theherobrine422/rad-quant-at-home-worker:X.Y.Z-<your stack>` (the repository is fixed in setup.py), so a
+   queue can only point at releases we published. No digest: refused (`--no-digest-check` for an image you built
+   yourself). An advertised release older than the pinned one is refused (a downgrade needs `--to`). A release whose
+   manifest says `setup_min` newer than this setup.py asks for a `git pull` first. A config that overrides `image` is
+   left alone.
+2. **The plan**, then a confirmation (`--yes` skips it; without a terminal it needs `--yes`); `--dry-run` stops here.
+3. `docker pull` the new tag, then `docker image inspect` its RepoDigests: the advertised digest must be there, else
+   **refused** (the tag was moved or tampered with) and nothing else happens. A failed pull changes nothing either.
+4. **Drain** the running container: `docker update --restart no` (its exit must not bring it back), `docker kill
+   --signal TERM` (the worker finishes its running jobs and exits; with `on_stop` abandon it hands them back at once),
+   wait up to `--drain-timeout` minutes (60), then a second SIGTERM (it hands the jobs back to the queue, not
+   counted against them) and at last `docker stop`. `--release` sends both signals at once.
+5. Rewrite `compose.yaml`, `docker-run.sh` and `setup.json` with the new pin `REPO:TAG@DIGEST` (`settings.version`,
+   `settings.digest`; the previous files as `*.prev`); `worker.env` and the invite are unchanged.
+6. `docker rm` the stopped container (the `rqah-state` volume or state directory stays: token, input cache, data
+   budget counters, running-job records) and start it again from the new files, then check that it runs the new tag.
+
+`rqah status` inside the container shows when an update is available, this command and the release notes. `rqah
+update` inside the container refuses (it has to run on the host, where Docker is).
+
+**Automatically** (the question "Update automatically", `--auto-update on|off`, default off; README "Updates and
+versions" has the trade-off): on writes `rqah-update.service` and `rqah-update.timer` into the config directory and,
+after you agree (`--yes` agrees), links them into your systemd user manager (`systemctl --user link`, `enable --now`:
+the only files setup ever puts outside its directory, and only then). The timer runs `setup.py --update --auto` hourly:
+it acts only while `auto_update` is on, only for a newer release with a digest, published at least 24 h ago, and lets
+the running jobs finish (up to 6 h) before the restart; a lock keeps two runs apart. Off disables the timer. Without
+systemd it prints the cron line instead. The units name this setup.py's path: move the checkout, run setup again.
 
 ## Re-running and `--check`
 
@@ -114,7 +153,7 @@ toggle, `a` advanced, `s` summary, `w` write, `q` quit. Over SSH either one work
 The form (2 × R9700, 128 GB):
 
 ```
- rad-quant-at-home setup 0.4.0 · editing ~/.config/rad-quant-at-home
+ rad-quant-at-home setup 0.5.0 · editing ~/.config/rad-quant-at-home
  CPU     Fake CPU 9000 (16 threads)   RAM 128 GB (100 GB available now)
  GPU AMD    #0  AMD Radeon AI PRO R9700             32 GB  gfx1201          ok
  GPU AMD    #1  AMD Radeon AI PRO R9700             32 GB  gfx1201          ok
@@ -148,7 +187,7 @@ The summary of the plain prompts (RTX 4070 driving the display, 32 GB):
 ```
 What will be written (in ~/.config/rad-quant-at-home):
   worker.env      the settings below + your invite  (mode 0600)
-  compose.yaml    image ghcr.io/theherobrine422/rad-quant-at-home-worker:0.4.0-cu128
+  compose.yaml    image ghcr.io/theherobrine422/rad-quant-at-home-worker:0.5.0-cu128
   docker-run.sh   the same as one docker run line
   setup.json      these answers (no invite), for the next run
 
@@ -183,5 +222,9 @@ the plain prompts (scripted and on a pseudo-terminal), the curses form (rendered
 with a hidden invite), the smoke step's commands, nothing written outside the config dir, Python 3.10 grammar,
 stdlib only.
 
+`tests/update_test.py` runs `--update` and `--start` against a simulated Docker (the order of the steps, the drain and
+its timeout, `--release`, `--dry-run`, refusals); `tests/update_docker_test.py` runs the drain against a real container.
+
 Not tested: real AMD hardware (the kfd / drm layout is the documented one), the smoke step against a real image (none
-is published yet), `--start`.
+is published yet), `--update` / `--start` with a real worker image and GPU (the drain is tested with a real container
+running the worker on noop jobs).

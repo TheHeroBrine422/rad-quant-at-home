@@ -155,6 +155,24 @@ are not re-checked.
 - Binding codes to the seed (checking that `sign(suh)` / `sign(svh)` follow the job's seed) would stop copying across
   best-of-N copies. It needs the quantizer's device RNG on the server, so it is left out.
 
+### Updates (0.5)
+
+The update path adds no way for the queue to run code on a donor's machine:
+
+- The queue only *advertises* releases (`current`, `min`). The worker never updates itself, and a 426 only stops it from
+  leasing; it keeps running the image the donor chose.
+- `rqah update` takes the release and its digest from the queue but uses the release only as a tag (`X.Y.Z`) in the
+  fixed repository `ghcr.io/theherobrine422/rad-quant-at-home-worker`, refuses an older one without `--to`, and runs
+  the pulled tag only if the registry served the advertised digest (then pins `TAG@DIGEST`). A tampered or moved tag
+  on the registry is refused. A spoofed or compromised *queue* can at most pick another release we published.
+- What the digest check does not cover: the release pipeline itself. Our repository's workflow writes both the image
+  and the digest in `release.json`; whoever controls it can publish a release that checks out. A person running
+  `rqah update` sees the release notes first; the opt-in automatic update waits 24 h after publication (time to
+  withdraw a release: the queue stops advertising it) and is off by default. Signing the images (cosign keyless, with
+  the workflow's identity) and verifying that in `rqah update` is the next step (README "Next").
+- Version claims are not trusted for anything but compatibility: a worker that lies about its release gains nothing (it
+  still declares job versions, and every result is verified as before).
+
 ### Identity: trust is per worker, not per donor (#9, won't fix)
 
 Quarantine, the spot-check draw (a worker's first result of each type, then a random share) and the exclusion of a
