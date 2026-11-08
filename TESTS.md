@@ -4,7 +4,7 @@ Times are US Central (CST). Sections 1-7: v0 (w13 / w13b, 2026-11-04; they use t
 `RXMW_*`, `rxmq`). Section 8: v0.2 (w24, 2026-11-05). Section 9: the donor CLI and the public status page (w25,
 2026-11-05). Sections 10-12: 0.3 (w47, 2026-11-06): verification by score, small cards, the CUDA image, the rename.
 Section 13: 0.4 (w57, 2026-11-06): bandwidth limits and the scheduling rules. Section 14: the setup wizard (w69,
-2026-11-07).
+2026-11-07). Section 17: updates and releases (0.5, w85, 2026-11-08).
 Older sections describe the code and names of their time (the project lived in rad-exl3-mix's `volunteer/` and was
 called `radquant` until 0.3; the environment names in them were updated to `RQAH_*`). Machines: the VM (noop
 end-to-end, the server container, image builds), an RTX 4070 test box (the real quantizer runs, CPU checks), the
@@ -663,3 +663,84 @@ writes its token file 0600, and the queued noop job is not leased to it.
 
 Not tested: a real reverse proxy in front of the container (the trusted-proxy logic is tested in process with
 `X-Forwarded-For` from loopback); Python 3.12 (CI runs it).
+
+
+## 17. Updates and releases (0.5, w85, 2026-11-08)
+
+Branch `updates`: versions on the wire and the 426, the release manifest with image digests, `rqah update` (digest
+check, drain, re-pin, recreate) and its opt-in timer, served / retired job versions, versioned schema migrations, the
+restart grace, the versioned worker state, the release workflows (README "Updates and versions", "Releases"). Run on
+the VM, Python 3.12.16 (a venv with numpy 2.5.4; the VM's own 3.12 has no numpy) and 3.14.3, Docker 29.8.2, one suite
+at a time, CST:
+
+| suite | 3.12 | 3.14 |
+|---|---|---|
+| `tests/update_test.py` (new, in process, ~40 s) | **81/81** (7:43 AM) | **81/81** (7:52 AM) |
+| `tests/upgrade_e2e.py` (new, real processes, ~2 min) | **23/23** (7:51 AM) | **23/23** (8:00 AM) |
+| `tests/update_docker_test.py` (new, manual, real Docker) | - | **4/4** (8:03 AM) |
+| `tests/e2e_noop.py` (server as a process) | **135/135** | **135/135** |
+| `tests/bandwidth_e2e.py` | **22/22** | **22/22** |
+| `tests/setup_test.py` | **126/126** ×3 (8:00-8:02 AM, after the two test fixes below) | **126/126** ×3 |
+| `score_test`, `sched_test`, `checker_nan_test`, `statuspage_test`, `probation_test` | **40, 40, 12, 26, 16** | **40, 40, 12, 26, 16** |
+
+`setup_test.py` failed twice in the first matrix (7:42 / 7:51 AM), both fragilities of the test, now fixed: the
+`docker-run.sh` check looked for `--memory 56g` on one line, but the run line wraps at 110 characters and a long
+WORKDIR moved the wrap between flag and value (the check now joins the continuation lines); and the pty Ctrl-C check
+typed Ctrl-C at a fixed time, sometimes before the first prompt (it now waits for `[y/N]` on the screen).
+
+`tests/upgrade_e2e.py` (trees: OLD = `git archive f179831` = 0.4.0, NEW = this tree, NEXT = a copy posing as 0.6.0 with
+noop version 3, `ACCEPTS = (2,)`, and a new type `noop_next`; lease 8 s):
+
+| phase | check | result |
+|---|---|---|
+| A | the 0.4.0 server and two 0.4.0 workers run jobs; one worker's cache is at its cap (2 × 300 kB of 700 kB) | pass |
+| B | migration on a copy of that database: every table's row count kept, `workers.version` added, `queue.sqlite.schema0.bak` equal to the original | pass |
+| B | the 0.4.0 `admin.py` and server open the migrated database (rollback) | pass |
+| B | server 0.4.0 → NEW with 20 s down (2.5 leases) while a 0.4.0 worker runs a 40 s job: it finishes on its one lease, no expiry; a `server_start` event | pass |
+| B | the 0.4.0 workers keep working with the new server, recorded as 0.4.0 (user agent) | pass |
+| B | the 0.4.0 CLI works against the new server; the new CLI shows `update available: 0.4.0 -> 0.5.0` and the image | pass |
+| B | the status page: `worker release 0.5.0 (current): 0% of the 2 workers ... 0.4.0: 100%` | pass |
+| C | worker update on the same state: one drained (SIGTERM, exit 0), one killed mid-job and restarted with the new code: it resumes its lease (one lease, no expiry), downloads nothing (the input was cached) | pass |
+| C | same tokens (no new registration), the full cache kept, `state.json` written, "state from worker before 0.5" logged; a new input evicts and runs; the server records 0.5.0 | pass |
+| D | `--worker-min 0.5.0` set (server restart) while a 0.4.0 worker runs a 12 s job: it finishes it, then gets 426 (logged with `rqah update`), stays up and leases nothing; a 0.5.0 worker takes the queue | pass |
+| E | `retire noop 2` refused while v2 jobs run | pass |
+| E | server NEW → NEXT while two NEW workers run noop v2 jobs; one killed and restarted as a NEXT worker (noop v3) hands its v2 job back: abandoned, attempts 0 | pass |
+| E | the other v2 job, left running across the server bump, is accepted; no expire, requeue or abandon | pass |
+| E | `retire noop 2` refused while v2 jobs are queued (no `--migrate`) | pass |
+| E | old (0.4.0) and new (0.5.0) workers only ever lease noop v2; the NEXT worker gets noop v3 and `noop_next`, and its only v2 lease is the one it handed back | pass |
+| E | `retire noop 2 --migrate`: the two leftover v2 jobs move to v3 and the NEXT worker runs them; `admin.py versions` shows v2 retired, v3 and `noop_next` current | pass |
+
+`tests/update_test.py` covers, in process: the version header / user agents; `GET /api/v0/version` without a token;
+the update block in lease answers, `/status`, `/me`; 426 with the command and `retry_s`, while heartbeat, upload and
+complete of a held job still work; no refusal without a version; `rqah status` (VERSION column, `update available`,
+`rqah update`, the image by digest, release notes, below the minimum); the status page share; served / retired job
+versions, the startup report, `admin.py versions` / `retire` (running, queued, `--migrate`, `--dry-run`, `--undo`) and
+the 409 for a version the server stopped accepting; the schema (new database, a pre-0.5 one backed up and migrated,
+no-op reopen, newer schema refused by Store, server.py and admin.py); the restart grace (an hour down: fresh lease,
+deadline moved, no expiry; a dead worker's lease expires one lease later); the worker (state.json, the update notice
+once, UPDATE NEEDED once with no lease and no crash, a resumed lease of another job version handed back, a cache blob of
+the wrong size and an unknown file dropped, a torn index rebuilt, a newer state's job records set aside, no
+re-registration); the release manifest (a good one; wrong tag, repository, image tag, digest, notes page, an unknown key,
+no images refused), `tools/release.py` (check-tag, pins incl. the missing radiance digest, manifest, notes),
+`admin.py release-fetch` (installs, refuses another repository), the server picking up a new manifest without a
+restart and keeping the last good one when the file breaks; and the wizard's `--update` against a simulated Docker:
+pull → digest → drain → rm → up, never a volume removal, the `TAG@DIGEST` pin, a moved tag REFUSED before any drain, no
+digest / another repository refused, `--no-digest-check`, `--to` with that release's `release.json`, `--release`, the
+drain timeout, `--dry-run`, a failed pull, an unreachable queue, a malformed or older release, `setup_min`, an image
+override, up to date, a stopped worker, `--auto` (off, younger than a day, a day old with the jobs finishing first,
+never a downgrade, never without a digest), the timer units and `systemctl --user` link / enable / disable, the cron
+hint, and `--start` draining a running worker.
+
+`tests/update_docker_test.py` (the drain of `rqah update` against a real container running the worker from this tree
+on noop jobs; the local server image as the Python base): the running job finishes, the container exits 0 and stays
+stopped (restart policy `no`, 0 restarts); `docker rm` + a new container reuse the token; `--release` hands the job back
+at once (queued, attempts 0, 7 s). Observed: Docker 29.8 did not restart an `unless-stopped` container after `docker
+kill --signal TERM` either; `drain()` turns the policy off first anyway (older Docker, Podman).
+
+Not tested: the workflows on GitHub (checked here only as YAML, the `docker/build.sh` command line with `DOCKER=echo`
+against the pinned rad-exl3-mix commit, and `tools/release.py`; the first `workflow_dispatch` dry run is the real
+test, and whether the ROCm build fits a hosted runner's disk and 6 h is open); a real registry (digests are simulated;
+that Docker records `TAG@DIGEST` as the container's image is assumed, and `rqah update` also accepts `REPO@DIGEST`);
+the timer under a real systemd user manager; `--update` with a real worker image and GPU; `E2E_SERVER=docker` (the server
+container was not rebuilt for this branch).
+

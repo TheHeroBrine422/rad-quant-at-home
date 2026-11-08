@@ -1,7 +1,9 @@
 #!/bin/bash
 # Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
 # run-local.sh [worker flags...] -- the rad-quant-at-home worker without docker, on a box that already has the quantizer stack (our own
-# GPU machines). Same flags as the image's entrypoint; paths from the environment:
+# GPU machines; donors run the images: Docker is the only supported donor deploy). It runs this checkout, so it is updated
+# with git, not by `rqah update`; its release (VERSION) still goes to the server, which refuses it below --worker-min.
+# Same flags as the image's entrypoint; paths from the environment:
 #   STATE       state + cache dir                        EXL3_SRC   the fork's exllamav3_ext sources (--frac-ext)
 #   EXL3_PATH   PYTHONPATH of the built exllamav3        TORCH_EXT  TORCH_EXTENSIONS_DIR for the side extensions
 #   PYTHON      the python with torch (default python3)  GPU_LOCK   optional: flock this file around GPU jobs

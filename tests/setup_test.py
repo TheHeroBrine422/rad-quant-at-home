@@ -261,7 +261,7 @@ ok("display (1 GB off), leaderboard, windows, budgets in worker.env",
                             "RQAH_MAX_DOWN_GB_MONTH=300\n", "RQAH_MAX_UP_MBPS=10\n", "RQAH_BUDGET_RESET_DAY=15\n")), envt)
 ok("env lines parse the same in docker --env-file and compose (no quotes, $, #)",
    all(re.fullmatch(r"[A-Z_][A-Z0-9_]*=[^\"'$#\\]*", l) for l in envt.splitlines() if l and not l.startswith("#")))
-run = open(os.path.join(cfgdir, "docker-run.sh")).read()
+run = open(os.path.join(cfgdir, "docker-run.sh")).read().replace(" \\\n  ", " ")    # one line (the wrap depends on the path length)
 ok("docker-run.sh: env-file, devices, volume, localtime; no secret on the line",
    all(x in run for x in ("--env-file", "--device /dev/kfd", "--group-add 39", "rqah-state:/var/lib/rqah", "/etc/localtime:/etc/localtime:ro",
                           "--cap-drop ALL", "--memory 56g", "--stop-timeout 900")) and "RQAH_INVITE" not in run, run)
@@ -418,8 +418,9 @@ f.mode = "form"
 ok("form: a tiny terminal gets a message, not a crash", "too small" in "".join(t for t, _ in f.lines(40, 10)))
 
 
-def pty_run(args, keys, cfgdir, env_extra=None, timeout=20):
-    """run setup.py on a pseudo-terminal, typing `keys` (list of (delay, bytes)); returns (rc, all output)"""
+def pty_run(args, keys, cfgdir, env_extra=None, timeout=20, wait_for=b""):
+    """run setup.py on a pseudo-terminal, typing `keys` (list of (delay, bytes)), the first once it has printed
+    (and printed wait_for); returns (rc, all output)"""
     pid, fd = pty.fork()
     if pid == 0:
         os.environ.update({"TERM": "xterm-256color", "LINES": "34", "COLUMNS": "100", **(env_extra or {})})
@@ -431,7 +432,7 @@ def pty_run(args, keys, cfgdir, env_extra=None, timeout=20):
     buf, t0, ki = b"", time.time(), 0
     nxt = time.time() + 1.0
     while time.time() - t0 < timeout:
-        if ki < len(keys) and time.time() >= nxt:
+        if ki < len(keys) and time.time() >= nxt and (ki or (buf and wait_for in buf)):
             os.write(fd, keys[ki][1]); nxt = time.time() + keys[ki][0]; ki += 1
         r, _, _ = select.select([fd], [], [], 0.05)
         if r:
@@ -466,8 +467,9 @@ ok("pty curses: the typed invite is stored and never echoed", os.path.exists(os.
    and INVITE[:8] not in outp)
 rc, outp = pty_run(["--curses"], [(0.5, b"q")], os.path.join(W, "cfg", "pty-quit"))
 ok("pty curses: q quits without writing", rc == 1 and not os.path.exists(os.path.join(W, "cfg", "pty-quit")), f"rc={rc}")
-rc, outp = pty_run(["--plain"], [(0.3, b"\x03")], os.path.join(W, "cfg", "pty-plain"))
-ok("pty plain: Ctrl-C quits without writing", rc == 1 and "nothing written" in outp and not os.path.exists(os.path.join(W, "cfg", "pty-plain")))
+rc, outp = pty_run(["--plain"], [(0.3, b"\x03")], os.path.join(W, "cfg", "pty-plain"), wait_for=b"[y/N]")
+ok("pty plain: Ctrl-C quits without writing", rc == 1 and "nothing written" in outp and not os.path.exists(os.path.join(W, "cfg", "pty-plain")),
+   f"rc={rc} {outp[-300:]!r}")
 # the plain prompts on a real terminal: a 4070 that drives the display, all defaults but the account and a window
 root4, spec4 = machine("plain-pty", nvidia=[("NVIDIA GeForce RTX 4070", 12282, "8.9", True)], ram_gb=32)
 root_save, spec_save = root, spec
