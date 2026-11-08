@@ -776,7 +776,10 @@ quarantine for an honest result. The rule now allows up to 1% exact zeros (zeroe
 The suites after the change: sched_test 40/40, score_test 40/40, statuspage_test 26/26, probation_test 16/16,
 checker_nan_test 12/12, e2e_noop 135/135, upgrade_e2e 23/23, update_test 81/81, bandwidth_e2e 22/22 (VM, 11-08).
 
-Real 27B tensors (colo, layers 2 + 3, K0.5 i4 / K2.5 i8 / K6.5 mul1, CPU stand-in, w86's dry run): see rad-exl3-mix
-`local/workers/w86/` (LOG 2026-11-08). Not tested: a GPU worker running rxq_quant (the job runs `python -m rxq job`, which
+Real 27B tensors (colo, w86's dry run, rad-exl3-mix `local/workers/w86/dryrun/`, LOG 2026-11-08 11:15 AM CST): layers 2
+(GDN) + 3 (attention), K0.5 i4 / K2.5 i8 / K6.5 mul1, the 11-08 settings (blocks H_out, #117 block order), CPU stand-in:
+18 jobs (ffn_down left out: its CPU run passes the 8 GB RSS rule) all accepted and scored (18 pass after the format-rule
+fix above), exported with rxq assemble; every tensor and C9 file (13 per level) bit-identical to direct `rxq quant`
+runs, exported levels == direct assemblies. Not tested: a GPU worker running rxq_quant (the job runs `python -m rxq job`, which
 the lead's gpucheck27 checks on card 0 against ourq), the worker images with rxq inside (the CUDA / ROCm Dockerfiles
 still stage ourq only: add rad-exl3-mix pipeline/ and set `--rxq`).
