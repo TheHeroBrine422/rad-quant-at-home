@@ -1,0 +1,183 @@
+# A release: a pushed tag vX.Y.Z (= VERSION) builds both worker images, pushes them to GHCR, and creates the GitHub
+# Release (notes with the image tags and digests, release.json attached: common/release.py). Only the user pushes tags,
+# so only the user publishes. workflow_dispatch: a dry run that builds the images and the would-be manifest / notes
+# (as artifacts) without logging in, pushing or creating anything.
+#
+# Secrets: none beyond GITHUB_TOKEN (packages: write to push, contents: write for the Release). Sources: this repo at
+# the tag, rad-exl3-mix and the radiance image at the commits / digest pinned in docker/pins.env (public; fetched
+# anonymously). Runner: GitHub's ubuntu-latest after freeing disk (the images need ~40-60 GB while building: the
+# Docker data root moves to /mnt), or a self-hosted runner: set the repository variable RQAH_BUILD_RUNNER to its label.
+# Third-party actions: none (only GitHub's checkout / upload-artifact / download-artifact).
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: "which images to build (dry run: nothing is pushed)"
+        type: choice
+        options: [both, cuda, rocm]
+        default: both
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_REPO: ghcr.io/theherobrine422/rad-quant-at-home-worker
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+      variants: ${{ steps.v.outputs.variants }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: v
+        name: tag = VERSION, pins well-formed
+        run: |
+          set -eu
+          V=$(cat VERSION); echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            python -I tools/release.py check-tag "$GITHUB_REF_NAME"
+            python -I tools/release.py pins --need-radiance >/dev/null    # both images, before anything is pushed
+            echo "publish=true" >> "$GITHUB_OUTPUT"; echo 'variants=["cuda","rocm"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            case "${{ inputs.variants }}" in
+              both) echo 'variants=["cuda","rocm"]' >> "$GITHUB_OUTPUT" ;;
+              *) echo "variants=[\"${{ inputs.variants }}\"]" >> "$GITHUB_OUTPUT" ;;
+            esac
+          fi
+          python -I tools/release.py pins
+      - name: the update tests (a release must not break updating)
+        run: |
+          python -m pip install --quiet numpy
+          python -I tests/update_test.py
+
+  build:
+    needs: check
+    runs-on: ${{ vars.RQAH_BUILD_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 340
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.check.outputs.variants) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: disk (GitHub-hosted runners only)
+        if: ${{ !vars.RQAH_BUILD_RUNNER }}
+        run: |
+          set -eu
+          df -h / /mnt || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          sudo docker image prune -af >/dev/null
+          # the Docker data root on /mnt (the runner's second disk)
+          sudo systemctl stop docker docker.socket
+          sudo mkdir -p /mnt/docker
+          echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          df -h / /mnt
+      - name: pins
+        run: python3 -I tools/release.py pins ${{ matrix.variant == 'rocm' && '--need-radiance' || '' }} >> "$GITHUB_ENV"
+      - name: rad-exl3-mix at the pinned commit
+        run: |
+          set -eu
+          git init -q "$RUNNER_TEMP/rxm"
+          git -C "$RUNNER_TEMP/rxm" fetch -q --depth 1 "$RXM_REPO_URL" "$RXM_COMMIT"
+          git -C "$RUNNER_TEMP/rxm" checkout -q FETCH_HEAD
+      - name: log in to GHCR
+        if: needs.check.outputs.publish == 'true'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: a released version is immutable
+        if: needs.check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # the X.Y.Z-<stack> tags never move once their GitHub Release exists (donors pin them by digest); a re-run
+          # after a failed run may push them again: nothing advertises a release before its release.json is installed
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists already: its image tags are immutable (bump VERSION for a new release)"; exit 1
+          fi
+      - name: build
+        run: |
+          set -eu
+          RXM_REPO="$RUNNER_TEMP/rxm" RXM_COMMIT="$RXM_COMMIT" IMAGE_REPO="$IMAGE_REPO" \
+            RADIANCE_IMAGE="${RADIANCE_IMAGE:-}" BUILD_ARGS="--build-arg MAX_JOBS=4" \
+            docker/build.sh "${{ matrix.variant }}" "$GITHUB_SHA"
+          docker image ls "$IMAGE_REPO"
+      - name: push, record the digest
+        if: needs.check.outputs.publish == 'true'
+        run: |
+          set -eu
+          STACK=$([ "${{ matrix.variant }}" = rocm ] && echo rocm7.14-gfx1201 || echo cu128)
+          TAG="$IMAGE_REPO:${{ needs.check.outputs.version }}-$STACK"
+          docker push --all-tags "$IMAGE_REPO"
+          D=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$TAG" | sed -n "s|^$IMAGE_REPO@||p" | head -1)
+          echo "$D" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "no digest for $TAG"; exit 1; }
+          mkdir -p digests && echo "$STACK=$D" > "digests/$STACK"
+          echo "$TAG@$D" >> "$GITHUB_STEP_SUMMARY"
+      - name: dry run record
+        if: needs.check.outputs.publish != 'true'
+        run: |
+          mkdir -p digests
+          docker image inspect --format '{{.Id}} {{.Size}}' "$IMAGE_REPO:${{ matrix.variant }}" > "digests/dry-${{ matrix.variant }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.variant }}
+          path: digests/
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - name: manifest and notes
+        run: |
+          set -eu
+          ls -l digests
+          if [ "${{ needs.check.outputs.publish }}" = true ]; then
+            ARGS=$(for f in digests/rocm7.14-gfx1201 digests/cu128; do printf -- '--digest %s ' "$(cat "$f")"; done)
+          else   # dry run: placeholder digests, so the files can be read
+            ARGS="--digest cu128=sha256:$(printf '0%.0s' $(seq 64)) --digest rocm7.14-gfx1201=sha256:$(printf '0%.0s' $(seq 64))"
+          fi
+          python3 -I tools/release.py manifest $ARGS --commit "$GITHUB_SHA" > release.json
+          python3 -I tools/release.py notes --manifest release.json > notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+      - name: create the GitHub Release
+        if: needs.check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "rad-quant-at-home ${{ needs.check.outputs.version }}" --notes-file notes.md release.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.check.outputs.version }}
+          path: |
+            release.json
+            notes.md
