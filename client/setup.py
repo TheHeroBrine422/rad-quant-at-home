@@ -16,9 +16,13 @@ and writes the worker's configuration into one directory (default ~/.config/rad-
   rqah setup --show                print the hardware it detects and the defaults it would offer
   rqah setup --update [--to X.Y.Z] [--yes] [--release] [--drain-timeout MIN] [--dry-run]     (alias `rqah update`)
                                    move the worker to the release the queue advertises (or --to): pull the new
-                                   image, drain the running container (its jobs finish; --release hands them back),
-                                   rewrite the files with the new pin, recreate the container on the same state
-                                   volume (token, input cache, budget counters stay)
+                                   image's tag and check its digest (a moved or tampered tag is refused), drain the
+                                   running container (its jobs finish; --release hands them back), rewrite the files
+                                   with the new pin (TAG@DIGEST), recreate the container on the same state volume
+                                   (token, input cache, budget counters stay)
+  rqah setup --auto-update on|off  the hourly timer (systemd --user, asked before it is installed) that runs
+                                   `--update --auto`: newer releases only, digest-checked, a day after publication,
+                                   once the running jobs are done
 
 What it does on its own: reads /proc, /sys, /dev and /etc, and runs `nvidia-smi`, `rocminfo` and `docker info` /
 `docker compose version` / `docker image inspect` if they are installed (all read-only, all local). It writes only
@@ -30,6 +34,7 @@ import urllib.error, urllib.request
 
 SETUP_FORMAT = 1
 IMAGE_REPO = "ghcr.io/theherobrine422/rad-quant-at-home-worker"
+RELEASES = "https://github.com/TheHeroBrine422/rad-quant-at-home/releases"
 ROCM_TAG, CUDA_TAG = "rocm7.14-gfx1201", "cu128"
 ROCM_ARCHS = ("gfx1201",)                     # the arch the ROCm image is built for (Dockerfile.rocm GPU_ARCH)
 CUDA_MIN_CC, NV_MIN_DRIVER = (8, 0), 570
@@ -431,7 +436,9 @@ DEFAULTS = {"server": "", "name": "donor", "leaderboard": False, "vendor": None,
             "vram_cap_gb": 0, "ram_gb": 0, "mem_limit_gb": 0, "state": "volume", "cache_gb": 0, "windows": [],
             "max_down_mbps": 0, "max_up_mbps": 0, "max_down_gb_day": 0, "max_down_gb_month": 0, "max_up_gb_day": 0,
             "max_up_gb_month": 0, "budget_reset_day": 1, "on_stop": "finish", "container": "rad-quant-at-home", "image": "",
-            "version": ""}          # version: the worker release pinned by `--update` ("" = this setup's own VERSION)
+            "version": "", "digest": "", "auto_update": False}
+# version / digest: the worker release and image digest pinned by `--update` ("" = this setup's own VERSION, no digest);
+# auto_update: the hourly timer may run `--update --auto` (AUTO_UPDATE_DEFAULT is what the question offers)
 NUM = ("vram_gb", "vram_cap_gb", "ram_gb", "mem_limit_gb", "cache_gb", "max_down_mbps", "max_up_mbps", "max_down_gb_day",
        "max_down_gb_month", "max_up_gb_day", "max_up_gb_month")
 # display names: the server's rule (server/donor.py clean_display_name: tests/setup_test.py keeps them in sync), plus
@@ -473,9 +480,13 @@ VERSION_RE = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")
 def vtuple(v): return tuple(int(x) for x in v.split(".")) if isinstance(v, str) and VERSION_RE.fullmatch(v) else None
 
 
-def image_for(cfg, version=None):
+def image_for(cfg, version=None, digest=None):
+    """the image reference compose.yaml / docker-run.sh run: REPO:VERSION-STACK, pinned @DIGEST once `--update` checked
+    one (docker then pulls and runs exactly that image, whatever the tag points at later)"""
     if cfg.get("image"): return cfg["image"]
-    return f"{IMAGE_REPO}:{version or cfg.get('version') or VERSION}-{ROCM_TAG if cfg['vendor'] == 'amd' else CUDA_TAG}"
+    d = digest if version else cfg.get("digest")
+    return (f"{IMAGE_REPO}:{version or cfg.get('version') or VERSION}-{ROCM_TAG if cfg['vendor'] == 'amd' else CUDA_TAG}"
+            + (f"@{d}" if d else ""))
 
 
 def validate(cfg, hw, secret=None):
@@ -498,6 +509,8 @@ def validate(cfg, hw, secret=None):
     if not CONTAINER_RE.fullmatch(cfg["container"]): E.append("container: letters, digits, _ . -")
     if cfg["image"] and not IMAGE_RE.fullmatch(cfg["image"]): E.append("image: a lower-case image reference")
     if cfg.get("version") and not VERSION_RE.fullmatch(str(cfg["version"])): E.append("version: X.Y.Z (set by --update)")
+    if cfg.get("digest") and not re.fullmatch(r"sha256:[0-9a-f]{64}", str(cfg["digest"])): E.append("digest: sha256:<64 hex> (set by --update)")
+    if not isinstance(cfg.get("auto_update", False), bool): E.append("auto_update: true or false")
     if cfg["gpu_name"] and not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", cfg["gpu_name"]): E.append("gpu_name: [a-z0-9._-], ≤ 32")
     st = cfg["state"]
     if st != "volume" and (not st.startswith("/") or not re.fullmatch(r"/[A-Za-z0-9._/-]*", st) or "/../" in st + "/"):
@@ -697,6 +710,8 @@ def summary_lines(cfg, hw, secret_state, cfgdir, E=(), W=()):
          f"up {budget('up')}" + (f" (month from day {cfg['budget_reset_day']})" if cfg["max_down_gb_month"] or cfg["max_up_gb_month"] else ""),
          f"  when            {', '.join(cfg['windows']) + ' (' + (hw['tz'] or 'local time') + ')' if cfg['windows'] else 'always'}"
          + f"; on stop: {cfg['on_stop']} the running jobs",
+         "  updates         " + (f"automatic: an hourly timer (systemd --user) takes a new release a day after it is published, "
+                                 "digest-checked, between jobs" if cfg.get("auto_update") else "by hand: `rqah update` when the worker says so"),
          f"  leaderboard     " + (f"listed as {cfg['name']!r} (with every opted-in machine of that name)" if cfg["leaderboard"]
                                   else f"not listed (worker name {cfg['name']!r})"), "",
          "Jobs it will get" + (" (small-card mode, docs/SMALL-CARDS.md):" if 0 < cfg["vram_gb"] < 12 else ":")]
@@ -946,75 +961,203 @@ def start(host, hw, cfg, cfgdir, say=print, drain_s=3600, release=False, sleep=t
     return rc == 0
 
 
-# ================================================================ updating (--update)
+# ================================================================ updating (--update, --auto)
+DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+AUTO_UPDATE_DEFAULT = False      # the wizard's default answer (README "Updates and versions": the trade-off)
+AUTO_DELAY_H = 24                # --auto takes a release only once it is this old (time to pull a bad one)
+AUTO_DRAIN_MIN = 360             # --auto lets the running jobs finish for up to this long
+
+
+def stack_of(cfg): return ROCM_TAG if cfg["vendor"] == "amd" else CUDA_TAG
+
+
+def fetch_json(url, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent": f"rqah-setup/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r: return json.loads(r.read(1 << 20) or b"{}")
+
+
 def fetch_version(server, timeout=15):
-    """the queue's GET /api/v0/version (no token): {"api", "server", "worker": {"current", "min"}}"""
-    req = urllib.request.Request(server.rstrip("/") + "/api/v0/version", headers={"User-Agent": f"rqah-setup/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=timeout) as r: return json.loads(r.read(1 << 16) or b"{}")
+    """the queue's GET /api/v0/version (no token): {"api", "server", "worker": {"current", "min", "images", ...}}"""
+    return fetch_json(server.rstrip("/") + "/api/v0/version", timeout)
 
 
-def update(host, hw, cfg, cfgdir, secret, a, say=print, ask=None, fetch=fetch_version, sleep=time.sleep, clock=time.time):
-    """--update: the advertised (or --to) worker release -> pull, drain, rewrite the pin, recreate. Returns an exit code
-    (0 done or nothing to do, 1 failed, 2 refused / usage). Only the tag changes: the repository is IMAGE_REPO, the
-    version comes from the queue but must be X.Y.Z, and a downgrade needs --to"""
+def fetch_release(version, timeout=30):
+    """release.json of a GitHub Release (common/release.py; only for --to a release the queue does not advertise)"""
+    return fetch_json(f"{RELEASES}/download/v{version}/release.json", timeout)
+
+
+def pick_image(images, cfg, version):
+    """(digest, why not) of this config's stack in an advertised {stack: {image, digest}} or a manifest's
+    {stack: {repo, tag, digest}}: the image must be IMAGE_REPO:VERSION-STACK, the digest sha256:<64 hex>"""
+    im = images.get(stack_of(cfg)) if isinstance(images, dict) else None
+    if not isinstance(im, dict): return None, f"no {stack_of(cfg)} image advertised for {version}"
+    ref = im.get("image") or (f"{im.get('repo')}:{im.get('tag')}" if im.get("repo") else None)
+    if ref != f"{IMAGE_REPO}:{version}-{stack_of(cfg)}":
+        return None, f"the advertised image {str(ref)[:120]!r} is not {IMAGE_REPO}:{version}-{stack_of(cfg)}"
+    d = im.get("digest")
+    if not isinstance(d, str) or not DIGEST_RE.fullmatch(d): return None, "the advertised digest is malformed"
+    return d, None
+
+
+def repo_digests(host, ref):
+    rc, out, _ = host.run(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", ref])
+    try: return json.loads(out) if rc == 0 else []
+    except ValueError: return []
+
+
+def published_age_h(published, now):
+    try: t = datetime.datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError): return None
+    return (now - t) / 3600
+
+
+def update(host, hw, cfg, cfgdir, secret, a, say=print, ask=None, fetch=fetch_version, fetch_rel=fetch_release,
+           sleep=time.sleep, clock=time.time):
+    """--update: the advertised (or --to) worker release -> pull its tag, check the digest, drain, rewrite the pin
+    (REPO:TAG@DIGEST), recreate. Exit code: 0 done or nothing to do, 1 failed, 2 refused / usage.
+
+    What it trusts: the repository is IMAGE_REPO (fixed here); the release (X.Y.Z) and its digest come from the queue
+    (or, for --to another release, from that GitHub Release's release.json, or --digest); the pulled tag must carry
+    that digest, so a tag that was moved or tampered with on the registry is refused. --auto (the timer): only when
+    setup.json has auto_update on, only to a newer release, only one published at least AUTO_DELAY_H ago, never
+    without a digest; the running jobs finish first (a job boundary)."""
+    auto = bool(getattr(a, "auto", False))
+    if auto and not cfg.get("auto_update"): say("auto-update is off in setup.json (rqah setup --auto-update on)"); return 0
     if cfg.get("image"):
         say(f"setup.json overrides the image ({cfg['image']}): set the new one with `rqah setup --image REF --start`"); return 2
     have = cfg.get("version") or VERSION
-    if a.to:
-        target, why = a.to, "--to"
-        if not VERSION_RE.fullmatch(target): say(f"--to {target!r}: X.Y.Z"); return 2
-    else:
-        try: v = fetch(cfg["server"])
-        except (urllib.error.URLError, OSError, ValueError) as x:
+    digest, why_d, info = getattr(a, "digest", None), None, {}
+    if digest and not DIGEST_RE.fullmatch(digest): say("--digest: sha256:<64 hex>"); return 2
+    try: v = fetch(cfg["server"])
+    except (urllib.error.URLError, OSError, ValueError) as x:
+        if not a.to:
             say(f"could not ask the queue ({cfg['server']}) for its release: {getattr(x, 'reason', x)}; try again, or give --to X.Y.Z")
             return 1
-        w = v.get("worker") if isinstance(v, dict) else None
-        target = w.get("current") if isinstance(w, dict) else None
+        v = {}
+    w = v.get("worker") if isinstance(v, dict) and isinstance(v.get("worker"), dict) else {}
+    if a.to:
+        target = a.to
+        if not VERSION_RE.fullmatch(target): say(f"--to {target!r}: X.Y.Z"); return 2
+        why = "--to"
+    else:
+        target = w.get("current")
         if not isinstance(target, str) or not VERSION_RE.fullmatch(target):
             say("the queue's answer has no worker release (a server before 0.5?): give --to X.Y.Z"); return 1
         why = f"the queue advertises {target}" + (f" (oldest still served: {w.get('min')})" if isinstance(w.get("min"), str) else "")
-    new_img, old_img = image_for(cfg, target), image_for(cfg)
+    if w.get("current") == target: info = w
+    if not digest and not getattr(a, "no_digest_check", False):
+        if info: digest, why_d = pick_image(info.get("images"), cfg, target)
+        else:
+            try:
+                rel = fetch_rel(target)
+                digest, why_d = pick_image(rel.get("images") if isinstance(rel, dict) and rel.get("version") == target else None, cfg, target)
+                info = {"notes": rel.get("notes_url"), "published": rel.get("created"), "setup_min": rel.get("setup_min")} if digest else {}
+            except (urllib.error.URLError, OSError, ValueError) as x:
+                why_d = f"no release.json for {target} on GitHub ({getattr(x, 'reason', x)})"
+        if not digest:
+            say(f"no digest to check {target} against: {why_d}. Refused (give --digest sha256:... from the release notes, "
+                "or --no-digest-check for an image you built yourself)"); return 1
+    if auto and not digest: say("--auto never runs without a digest"); return 2
+    sm = info.get("setup_min")
+    if isinstance(sm, str) and VERSION_RE.fullmatch(sm) and vtuple(sm) > vtuple(VERSION):
+        say(f"release {target} needs rqah setup {sm} or newer (this is {VERSION}): update your rad-quant-at-home checkout "
+            "(git pull) first; nothing changed"); return 2
+    new_img, old_img = image_for(cfg, target, digest), image_for(cfg)
     ex, run, cur_img = container_state(host, cfg["container"])
-    if target == have and (not ex or cur_img == new_img):
-        say(f"up to date: {new_img}" + ("" if ex else " (no worker container yet: rqah setup --start)")); return 0
-    if vtuple(target) < vtuple(have) and not a.to:
+    if target == have and (not ex or cur_img == new_img) and (digest or "") == (cfg.get("digest") or ""):
+        if not auto or ex: say(f"up to date: {new_img}" + ("" if ex else " (no worker container yet: rqah setup --start)"))
+        return 0
+    if vtuple(target) < vtuple(have) and (not a.to or auto):
         say(f"the queue advertises {target}, older than the pinned {have}: nothing done (a downgrade needs --to {target})"); return 2
-    if vtuple(target)[:2] > vtuple(VERSION)[:2]:
-        say(f"note: this setup is {VERSION}; release {target} may want settings it does not know. Get its setup.py first "
-            "(git pull in your rad-quant-at-home checkout) unless its notes say otherwise")
+    if auto:
+        if vtuple(target) == vtuple(have): return 0                  # same release, other digest: a person decides
+        age = published_age_h(info.get("published"), clock())
+        delay = getattr(a, "auto_delay_h", None) or cfg.get("auto_delay_h") or AUTO_DELAY_H
+        if age is None or age < delay:
+            say(f"release {target} is available; --auto takes it once it is {delay:g} h old" +
+                (f" ({age:.1f} h now)" if age is not None else " (no publication time advertised)")); return 0
+    drain_min = a.drain_timeout if a.drain_timeout is not None else (AUTO_DRAIN_MIN if auto else 60)
     say(f"update: {old_img} -> {new_img} ({why})")
-    say(f"  1. docker pull {new_img}")
+    if isinstance(info.get("notes"), str) and info["notes"].startswith(RELEASES): say(f"  release notes: {info['notes']}")
+    say(f"  1. docker pull {IMAGE_REPO}:{target}-{stack_of(cfg)}" + (f", check that it is {digest}" if digest else " (NO digest check)"))
     say(f"  2. drain {cfg['container']}: " + ("hand its running jobs back now" if a.release else
-        f"let its running jobs finish (up to {a.drain_timeout:g} min, then hand them back)") if run else
+        f"let its running jobs finish (up to {drain_min:g} min, then hand them back)") if run else
         f"  2. {cfg['container']} is not running: nothing to drain")
     say(f"  3. rewrite compose.yaml / docker-run.sh / setup.json with {target}; recreate the container on the same state "
         + ("volume " + VOLUME if cfg["state"] == "volume" else "directory " + cfg["state"]) + " (token, cache, budget counters stay)")
     if a.dry_run: say("dry run: nothing done"); return 0
-    if not a.yes:
+    if not (a.yes or auto):
         if ask is None:
             if not sys.stdin.isatty(): say("not a terminal: add --yes to go ahead"); return 2
             ask = lambda q: ask_yes(input, q, True)
         if not ask("Go ahead?"): say("cancelled: nothing changed"); return 1
     if not hw["docker"]["present"] or not hw["docker"]["access"]:
         say("docker: " + ("not installed" if not hw["docker"]["present"] else hw["docker"]["error"] or "no access")); return 1
-    say(f"pulling {new_img} ...")
-    rc, out, err = host.run(["docker", "pull", new_img], timeout=7200)
+    tag_ref = f"{IMAGE_REPO}:{target}-{stack_of(cfg)}"
+    say(f"pulling {tag_ref} ...")
+    rc, out, err = host.run(["docker", "pull", tag_ref], timeout=7200)
     if rc != 0: say(f"pull failed, nothing changed: {(err or out).strip()[-300:]}"); return 1
-    if run and not drain(host, cfg["container"], a.drain_timeout * 60, a.release, say, sleep, clock):
+    if digest:
+        got = repo_digests(host, tag_ref)
+        if f"{IMAGE_REPO}@{digest}" not in got:
+            say(f"REFUSED: {tag_ref} on the registry is not the image the release published (expected {digest}, got "
+                f"{', '.join(x.split('@')[-1] for x in got if '@' in x) or 'no digest'}): the tag was moved or tampered with. "
+                "Nothing changed; tell the operator"); return 1
+        say(f"digest checked: {digest}")
+    if run and not drain(host, cfg["container"], drain_min * 60, a.release, say, sleep, clock):
         say(f"the old worker did not stop; nothing else changed (docker update --restart unless-stopped {cfg['container']} "
             "restores its restart policy)"); return 1
-    cfg = dict(cfg, version=target if target != VERSION else "")
+    cfg = dict(cfg, version=target if target != VERSION or digest else "", digest=digest or "")
     write_all(cfgdir, cfg, hw, secret)
     say(f"written: compose.yaml, docker-run.sh, setup.json in {cfgdir} (the previous ones as *.prev)")
-    if not start(host, hw, cfg, cfgdir, say, a.drain_timeout * 60, a.release, sleep, clock):
+    if not start(host, hw, cfg, cfgdir, say, drain_min * 60, a.release, sleep, clock):
         say(f"the old container is stopped and the files name {target}: fix the error above, then `rqah setup --start` "
             f"(or go back: copy the *.prev files over and run `docker compose up -d`)"); return 1
     ex, run, img = container_state(host, cfg["container"])
-    if not run or img != new_img:
+    if not run or img not in (new_img, f"{IMAGE_REPO}@{digest}" if digest else new_img):
         say(f"after the update the container is {'running ' + str(img) if run else 'not running'}: check `docker logs {cfg['container']}`")
         return 1
     say(f"updated to {target}: {cfg['container']} runs {new_img}; `docker exec {cfg['container']} rqah status` shows it")
     return 0
+
+
+# ---------------------------------------------------------------- the auto-update timer (systemd --user, opt-in)
+UNIT = "rqah-update"
+
+
+def render_units(cfgdir, python=None, script=None):
+    """a oneshot service running --update --auto and an hourly timer for it; written into the config dir and linked
+    into systemd's user manager only when the donor agrees (install_timer)"""
+    py, sc = python or sys.executable or "/usr/bin/python3", script or os.path.abspath(__file__)
+    svc = "\n".join([
+        "# rad-quant-at-home: automatic worker updates (rqah setup --auto-update on). Written by rqah setup; it runs",
+        "# `setup.py --update --auto`, which does nothing unless setup.json says auto_update and the queue advertises a",
+        "# newer release (digest-checked, at least a day old). Off: rqah setup --auto-update off (or disable the timer).",
+        "[Unit]", "Description=rad-quant-at-home worker auto-update", "After=network-online.target docker.service", "",
+        "[Service]", "Type=oneshot", f"ExecStart={shlex.quote(py)} -I {shlex.quote(sc)} --update --auto --config-dir {shlex.quote(cfgdir)}",
+        f"TimeoutStartSec={AUTO_DRAIN_MIN + 60}min", ""])
+    tmr = "\n".join([
+        "# rad-quant-at-home: when to look for a worker update (see rqah-update.service)",
+        "[Unit]", "Description=rad-quant-at-home worker auto-update (hourly)", "",
+        "[Timer]", "OnBootSec=20min", "OnUnitInactiveSec=1h", "RandomizedDelaySec=20min", "Persistent=true", "",
+        "[Install]", "WantedBy=timers.target", ""])
+    return {f"{UNIT}.service": svc, f"{UNIT}.timer": tmr}
+
+
+def install_timer(host, cfgdir, on, say=print):
+    """link and enable (on) or disable (off) the timer in the donor's systemd user manager; True if it worked"""
+    if not host.which("systemctl"):
+        if on: say(f"no systemctl: run `python3 {os.path.abspath(__file__)} --update --auto --config-dir {cfgdir}` hourly from cron instead")
+        return False
+    if not on:
+        host.run(["systemctl", "--user", "disable", "--now", f"{UNIT}.timer"]); return True
+    for argv in (["systemctl", "--user", "link", os.path.join(cfgdir, f"{UNIT}.service")],
+                 ["systemctl", "--user", "enable", "--now", os.path.join(cfgdir, f"{UNIT}.timer")]):
+        rc, out, err = host.run(argv)
+        if rc != 0: say(f"{' '.join(argv[:3])} failed: {(err or out).strip()[-200:]}"); return False
+    say(f"auto-update timer on ({UNIT}.timer, hourly; `systemctl --user list-timers` shows it). For it to run while you are "
+        f"logged out: `loginctl enable-linger {os.environ.get('USER', '$USER')}` (once)")
+    return True
 
 
 # ================================================================ the questions
@@ -1054,6 +1197,9 @@ QUESTIONS = [
     Q("max_down_gb_day", "Download budget per day (GB)", "num", "0 = no cap", "Network", True),
     Q("max_up_gb_day", "Upload budget per day (GB)", "num", "0 = no cap", "Network", True),
     Q("windows", "Run only during", "windows", "local time, e.g. 22:00-08:00 or 22:00-08:00,12:00-13:00; 'always' = no limit", "Schedule"),
+    Q("auto_update", "Update automatically", "bool", "an hourly timer on this machine (systemd --user) updates the worker to a "
+      "new release we publish: only after the release is a day old, only if the image digest matches what the queue "
+      "advertises, and only between jobs. Off: you update with `rqah update` when the worker tells you", "Schedule"),
     Q("on_stop", "On stop", "choice", "finish the running jobs (up to 15 min) or hand them back at once", "Schedule", True,
       choices=("finish", "abandon")),
     Q("container", "Container name", "text", "docker exec <name> rqah status", "Advanced", True),
@@ -1343,6 +1489,7 @@ def apply_flags(cfg, a, hw):
         got["gpus"] = parse_answer(cfg_v, q, got["gpus"], hw)
     if "windows" in got: got["windows"] = parse_windows(got["windows"])
     if "leaderboard" in got and isinstance(got["leaderboard"], str): got["leaderboard"] = got["leaderboard"] == "on"
+    if "auto_update" in got and isinstance(got["auto_update"], str): got["auto_update"] = got["auto_update"] == "on"
     cfg.update(got)
     return set(got)
 
@@ -1383,9 +1530,19 @@ def main(argv=None):
                    "rewrite the pin, recreate on the same state volume")
     u.add_argument("--to", metavar="X.Y.Z", help="--update to this release instead (also a downgrade)")
     u.add_argument("--release", action="store_true", help="drain by handing the running jobs back at once (default: let them finish)")
-    u.add_argument("--drain-timeout", type=float, default=60, metavar="MIN",
-                   help="--update / --start: how long the running jobs may take to finish before they are handed back (60)")
+    u.add_argument("--drain-timeout", type=float, default=None, metavar="MIN",
+                   help="--update / --start: how long the running jobs may take to finish before they are handed back "
+                        f"(60; --auto {AUTO_DRAIN_MIN})")
     u.add_argument("--dry-run", action="store_true", help="--update: say what it would do; change nothing")
+    u.add_argument("--digest", metavar="sha256:...", help="--update: the digest to check the pulled tag against (default: "
+                   "the one the queue advertises, or the release's release.json for --to)")
+    u.add_argument("--no-digest-check", action="store_true", help="--update without a digest check (an image you built "
+                   "yourself; never with --auto)")
+    u.add_argument("--auto", action="store_true", help="--update as the timer runs it: only if setup.json has auto_update on, "
+                   f"only a newer release published at least {AUTO_DELAY_H} h ago, digest-checked, no questions")
+    s_auto = ap.add_argument_group("automatic updates")
+    s_auto.add_argument("--auto-update", dest="auto_update", choices=("on", "off"),
+                        help="the hourly update timer (setting auto_update; on asks before installing the timer, --yes installs it)")
     s = ap.add_argument_group("settings (each also a key of --answers)")
     s.add_argument("--server"); s.add_argument("--name"); s.add_argument("--leaderboard", choices=("on", "off"))
     s.add_argument("--vendor", choices=("amd", "nvidia")); s.add_argument("--gpus", help="0,1 or all")
@@ -1423,10 +1580,16 @@ def main(argv=None):
 
     cfg, secret = load(cfgdir)
     existing = cfg is not None
+    if a.auto: a.update = True
     if a.update:
         if cfg is None:
             print(f"rqah update: no configuration in {cfgdir}: it updates a worker set up with `rqah setup` (else README "
                   "\"Updating\" has the docker commands)"); return 2
+        if a.auto:                                   # one at a time (the timer and a person may overlap)
+            import fcntl
+            lk = open(os.path.join(cfgdir, ".update.lock"), "a")
+            try: fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: print("another update is running"); return 0
         return update(host, hw, cfg, cfgdir, secret, a)
     rec = recommend(hw)
     if cfg is None:
@@ -1482,6 +1645,13 @@ def main(argv=None):
         print(f"not written: {len(E)} error(s) (--force writes anyway)", file=sys.stderr); return 1
     files = write_all(cfgdir, cfg, hw, secret)
     print("written: " + ", ".join(os.path.basename(f) for f in files) + f" in {cfgdir}")
+    if cfg.get("auto_update"):
+        for n, text in render_units(cfgdir).items(): write_atomic(os.path.join(cfgdir, n), text, 0o644)
+        if a.yes or ask_yes(input, f"Install the hourly update timer now (systemctl --user, links {UNIT}.timer)?", True):
+            install_timer(host, cfgdir, True)
+        else: print(f"timer not installed: systemctl --user link {cfgdir}/{UNIT}.service && systemctl --user enable --now {cfgdir}/{UNIT}.timer")
+    elif before.get("auto_update") and os.path.exists(os.path.join(cfgdir, f"{UNIT}.timer")):
+        install_timer(host, cfgdir, False); print("auto-update off: the timer is disabled")
     if not secret: print("note: no invite stored: the worker registers without one and starts on probation (quantization jobs "
                          "only until a few results pass), unless its state volume has a token already")
     interactive = not a.yes
@@ -1489,7 +1659,7 @@ def main(argv=None):
     do_pull = a.pull or (interactive and hw["docker"]["access"] and ask_yes(input, f"Pull the image now ({image_for(cfg)}, several GB download)?", False))
     if do_smoke or do_pull: smoke(host, hw, cfg, cfgdir, pull=do_pull, gpu_test=do_smoke)
     if a.start or (interactive and hw["docker"]["access"] and ask_yes(input, "Start the worker now (it registers with the queue)?", False)):
-        start(host, hw, cfg, cfgdir, drain_s=a.drain_timeout * 60, release=a.release)
+        start(host, hw, cfg, cfgdir, drain_s=(a.drain_timeout or 60) * 60, release=a.release)
     else:
         how = f"cd {shlex.quote(cfgdir)} && docker compose up -d" if hw["docker"]["compose"] else f"sh {shlex.quote(os.path.join(cfgdir, 'docker-run.sh'))}"
         print(f"start it with:  {how}\nthen:           docker exec {cfg['container']} rqah status")

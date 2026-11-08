@@ -370,7 +370,7 @@ answers = iter(["n",                          # advanced? no
                 "0", "",                      # cards, vram (default 11)
                 "20", "", "0", "8",           # ram, cache, down Mbps, up Mbps
                 "0", "50", "3",               # down month, up month, reset day (asked: an up budget is set)
-                "23:00-07:00"])
+                "23:00-07:00", "n"])          # windows, update automatically (0.5)
 asked, pw_asked, outl = [], [], []
 
 
@@ -386,7 +386,8 @@ res = S.plain_ui(cfg, None, hw, "/tmp/x", False, inp=inp, getpw=getpw, out=outl.
 c, sec, ss = res
 ok("plain: answers land", (c["server"], c["name"], c["leaderboard"], c["ram_gb"], c["max_up_mbps"], c["max_up_gb_month"],
                           c["budget_reset_day"], c["windows"], c["vram_gb"]) == ("https://queue.example.org", "Grace", True, 20, 8, 50, 3,
-                                                                                  ["23:00-07:00"], 11), str(c))
+                                                                                  ["23:00-07:00"], 11) and c["auto_update"] is False
+   and any(p.startswith("Update automatically") for p in asked), str(c))
 ok("plain: ram change moved the container limit", c["mem_limit_gb"] == 28, str(c["mem_limit_gb"]))
 ok("plain: the invite through getpass only", sec == INVITE and ss == "new" and len(pw_asked) == 1
    and not any(INVITE in p for p in asked) and not any(INVITE in l for l in outl))
@@ -471,7 +472,7 @@ ok("pty plain: Ctrl-C quits without writing", rc == 1 and "nothing written" in o
 root4, spec4 = machine("plain-pty", nvidia=[("NVIDIA GeForce RTX 4070", 12282, "8.9", True)], ram_gb=32)
 root_save, spec_save = root, spec
 root, spec = root4, spec4
-typed = ["n", "https://queue.example.org", INVITE, "Grace", "y", "", "", "", "", "", "", "", "", "22:00-08:00", "y", "n", "n", "n"]
+typed = ["n", "https://queue.example.org", INVITE, "Grace", "y", "", "", "", "", "", "", "", "", "22:00-08:00", "", "y", "n", "n", "n"]
 rc, outp = pty_run(["--plain"], [(0.35, (t + "\r").encode()) for t in typed], os.path.join(W, "cfg", "pty-plain-ok"), timeout=30)
 envp = os.path.join(W, "cfg", "pty-plain-ok", "worker.env")
 ok("pty plain: written; the invite stored, never echoed", rc == 0 and os.path.exists(envp) and f"RQAH_INVITE={INVITE}\n" in open(envp).read()
