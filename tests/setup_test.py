@@ -518,9 +518,10 @@ except SyntaxError as x:
     ok("Python 3.10 grammar", False, str(x))
 nested = [l for l in src.splitlines() if re.search(r'f"[^"]*\{[^}]*"[^"]*"[^}]*\}', l)]
 ok("no 3.12-only nested same-quote f-strings", not nested, str(nested[:3]))
-imports = set(re.findall(r"^import (.+)$", src, re.M)[0].replace(" ", "").split(","))
+imports = {x for l in re.findall(r"^import (.+)$", src, re.M) for x in l.replace(" ", "").split(",")}
 ok("stdlib only", imports <= {"argparse", "datetime", "getpass", "glob", "json", "os", "re", "shlex", "shutil", "stat",
-                              "subprocess", "sys", "tempfile", "textwrap", "unicodedata"}, str(imports))
+                              "subprocess", "sys", "tempfile", "textwrap", "time", "unicodedata", "urllib.error",
+                              "urllib.request"} and not re.search(r"^from ", src, re.M), str(imports))
 
 n_fail = sum(1 for _, c in RESULTS if not c)
 print(f"\n{len(RESULTS) - n_fail}/{len(RESULTS)} passed; screens in {SCREENS}")

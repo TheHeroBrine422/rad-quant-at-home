@@ -22,16 +22,27 @@ now); twice = abandon now. Time windows: no new leases outside them. Every flag 
 Bandwidth (0.4, worker/bandwidth.py): --max-down-mbps / --max-up-mbps cap the transfer rates (all jobs together);
 --max-{down,up}-gb-{day,month} are data budgets counted in STATE/bandwidth.json. The worker declares what is left
 (minus what its running jobs still have to move) and which inputs it caches when it leases; the server offers only
-jobs that fit. A spent budget: the running jobs finish, nothing new is leased until the day / month resets."""
+jobs that fit. A spent budget: the running jobs finish, nothing new is leased until the day / month resets.
+
+Updates (0.5, README "Updating"): every request carries the worker's release (X-RQAH-Version); the server's lease
+answers say which release is current and which is the oldest it still serves. The worker logs an available update
+once (and keeps working) and writes it to STATE/update.json for `rqah status`. Below the minimum the server answers
+426: the worker logs how to update, finishes the jobs it holds and leases nothing new (it asks again hourly). It
+never updates itself. The state directory is versioned (STATE/state.json, STATE_FORMAT): a newer release keeps the
+token, the input cache and the budget counters of an older one; a job leased by an older release at another job
+version is handed back on resume (not counted against the job). A state written by a newer release (a downgrade)
+keeps the token and the cache and sets its running-job records aside."""
 import argparse, fcntl, hashlib, json, os, re, shutil, signal, subprocess, sys, threading, time, traceback
 import urllib.request, urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.util import API, read_json, write_json_atomic, sha256_file, safe_relpath, env, fmt_bytes
+from common.util import API, VERSION, VERSION_HEADER, read_json, write_json_atomic, sha256_file, safe_relpath, env, fmt_bytes, vtuple
 from worker.bandwidth import Meter, GB
 import jobs
 
-UA = "rad-quant-at-home-worker/0.4"
+UA = f"rad-quant-at-home-worker/{VERSION}"
+STATE_FORMAT = 2              # 1: the 0.2-0.4 layout (no state.json); 2 (0.5): + state.json, update.json
+SHA_RE = re.compile(r"[0-9a-f]{64}")
 CACHE_REPORT_MAX = 32768                                 # cached blobs reported at lease time (most recently used)
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -45,7 +56,7 @@ class Client:
         self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
 
     def _req(self, method, path, body=None, headers=None, raw=False):
-        h = {"User-Agent": UA, **(headers or {})}
+        h = {"User-Agent": UA, VERSION_HEADER: VERSION, **(headers or {})}
         if self.token: h["Authorization"] = f"Bearer {self.token}"
         data = None
         if isinstance(body, MeteredBody):                                    # a throttled upload chunk
@@ -110,9 +121,17 @@ class Cache:
         self.d, self.cap = d, cap
         self.blobs = os.path.join(d, "blobs"); os.makedirs(self.blobs, exist_ok=True)
         self.ix_path = os.path.join(d, "index.json")
-        self.ix = read_json(self.ix_path, {}) or {}
+        try: ix = read_json(self.ix_path, {}) or {}
+        except ValueError: ix = {}                                            # a torn or foreign index: rebuilt below
         on_disk = {f for f in os.listdir(self.blobs)}
-        self.ix = {k: v for k, v in self.ix.items() if k in on_disk}       # forget what is gone
+        # keep what is there and complete: an entry of the expected shape whose blob has the recorded size (a blob
+        # that does not match is dropped and fetched again; content is verified on download, the name is its sha256)
+        self.ix = {}
+        for k, v in (ix.items() if isinstance(ix, dict) else ()):
+            if not (SHA_RE.fullmatch(k) and k in on_disk and isinstance(v, dict) and isinstance(v.get("size"), int)
+                    and isinstance(v.get("last"), (int, float))): continue
+            if os.path.getsize(os.path.join(self.blobs, k)) != v["size"]: log(f"cache: {k[:12]} has the wrong size: dropped"); continue
+            self.ix[k] = v
         for f in on_disk:                                                     # files nobody knows: drop
             if f not in self.ix and not f.endswith(".part"): os.remove(os.path.join(self.blobs, f))
         self.evicted = 0
@@ -283,6 +302,7 @@ class Worker:
             else:
                 c.setdefault("devices", self.gpus[:1])
                 write_json_atomic(self.cur_path(c["job"]), c); os.remove(legacy)
+        self.open_state()
         tok = a.token or (open(a.token_file).read().strip() if a.token_file and os.path.exists(a.token_file) else None)
         self.c = Client(a.server, tok)
         if not tok:
@@ -313,6 +333,45 @@ class Worker:
         self.lock = threading.Lock()
         self.running = {}                                                     # job id -> {thread, cancel, devices, ram}
         self.jobs_done = 0
+        self.update_seen = None                                               # the last update notice logged
+
+    def open_state(self):
+        """STATE/state.json: the state layout's format and the release that last ran on it (module docstring)"""
+        p = os.path.join(self.a.state, "state.json")
+        try: st = read_json(p)
+        except ValueError: st = None
+        st = st if isinstance(st, dict) else {}
+        fmt = st.get("format", 1) if isinstance(st.get("format", 1), int) else 1
+        prev = st.get("version") if isinstance(st.get("version"), str) else None
+        if fmt > STATE_FORMAT:
+            cur = os.path.join(self.a.state, "current")
+            if os.listdir(cur):
+                aside = os.path.join(self.a.state, f"current.format{fmt}-{int(time.time())}")
+                os.replace(cur, aside); os.makedirs(cur)
+                log(f"state written by a newer worker ({ascii(prev)[:20]}, format {fmt}; this is {VERSION}, format {STATE_FORMAT}): "
+                    f"its running-job records are set aside in {os.path.basename(aside)} (their leases run out on the server)")
+        if prev != VERSION and (prev or os.path.exists(os.path.join(self.a.state, "token"))):
+            log(f"state from worker {ascii(prev)[1:-1][:20] if prev else 'before 0.5'}: kept the token, the input cache and the "
+                "data budget counters")
+        if st.get("format") != STATE_FORMAT or prev != VERSION:
+            write_json_atomic(p, {"format": STATE_FORMAT, "version": VERSION, "previous": prev, "t": time.time()})
+
+    def note_update(self, u, refused=None):
+        """log the server's update notice once per (current, min) and keep it in STATE/update.json for `rqah status`"""
+        if not isinstance(u, dict): return
+        cur, mn = u.get("current"), u.get("min")
+        if vtuple(cur) is None or vtuple(mn) is None: return
+        key = (cur, mn, bool(refused))
+        if key == self.update_seen: return
+        self.update_seen = key
+        newer = vtuple(cur) > vtuple(VERSION)
+        if refused: log(f"UPDATE NEEDED: {ascii(str(refused))[1:-1][:400]}")
+        elif newer: log(f"update available: {VERSION} -> {cur} (this worker keeps working while the server still accepts {mn}; "
+                        f"to update: on the host `rqah update`, README \"Updating\")")
+        try: write_json_atomic(os.path.join(self.a.state, "update.json"),
+                               {"t": time.time(), "yours": VERSION, "current": cur, "min": mn, "available": newer,
+                                "refused": bool(refused)})
+        except OSError as e: log(f"update.json: {e!r}")
 
     # signals / stop file
     def on_signal(self, *_):
@@ -372,6 +431,14 @@ class Worker:
                 self.note_budget(bud)
             try: r = self.c.api("POST", "lease", {"caps": caps}, stop=self.stop.is_set)
             except APIError as e:
+                if e.code == 426:                                                  # below the server's minimum release
+                    body = e.body if isinstance(e.body, dict) else {}
+                    self.note_update(body.get("update"), refused=body.get("error") or "update needed")
+                    if not n_run: idle += 1
+                    if self.a.idle_exit and idle >= self.a.idle_exit and not n_run: log("idle: exiting"); break
+                    try: wait = min(max(float(body.get("retry_s") or 3600), 30), 3600)
+                    except (TypeError, ValueError): wait = 3600
+                    self.stop.wait(min(wait, self.a.poll) if self.a.idle_exit else wait); continue
                 if e.code == 400 and not self.legacy_caps and "unknown key" in str(e.body.get("error", "")):
                     self.legacy_caps = True
                     log("server predates 0.4 (no data budgets, no cache report): leasing with the 0.3 caps; jobs over "
@@ -382,6 +449,7 @@ class Worker:
             except Exception:
                 if self.stop.is_set(): continue
                 raise
+            if r.get("update"): self.note_update(r["update"])
             if r.get("cache_unknown"): self.cache_sent = None; continue          # the server lost our report: resend
             if "cache" in caps: self.cache_sent = caps["cache"]["rev"]
             if not r.get("job"):
@@ -447,6 +515,8 @@ class Worker:
         jobs.check_inputs(job["type"], job["params"], [i["name"] for i in job["inputs"]])
         r = jobs.requirements(m, job["params"])
         if r["gpu"] and not self.gpus: raise jobs.Rejected("a GPU job, and this worker declared no GPU")
+        if job.get("version") != m.VERSION:
+            raise jobs.Rejected(f"{job['type']} version {ascii(job.get('version'))[:12]}: this worker runs version {m.VERSION}")
         return m, r
 
     def start(self, job, cur=None):
@@ -480,6 +550,14 @@ class Worker:
         j = cur["job"]
         if not self.ids_ok(j):
             log(f"state file for job {self.shown_id(j)}: bad id or lease id; ignoring it"); return
+        m = jobs.REGISTRY.get(j.get("type")) if isinstance(j.get("type"), str) else None
+        if m is None or j.get("version") != m.VERSION:
+            # leased by the release that ran before an update: its job version is not ours. Back to the queue for a
+            # worker that runs it (abandoned: not counted against the job, no exclusion)
+            log(f"job {j['id']}: leased as {ascii(j.get('type'))[:34]} version {ascii(j.get('version'))[:12]} before an update; "
+                f"this worker runs {'version ' + str(m.VERSION) if m else 'no such type'}: handing it back")
+            self.fail(j, f"worker updated to {VERSION}: job version {ascii(j.get('version'))[:12]} is not run here", abandon=True)
+            self.cleanup(cur); return
         try: hb = self.c.api("POST", "heartbeat", {"job_id": j["id"], "lease_id": j["lease_id"]}, tries=5)
         except Exception as e: hb = {"ok": False, "cancel": True, "error": repr(e)}
         if hb.get("cancel"):
@@ -734,7 +812,7 @@ def main():
     if a.gpus and not re.fullmatch(r"\d+(,\d+)*", a.gpus): ap.error("--gpus: a comma list of device indices")
     w = Worker(a)
     signal.signal(signal.SIGINT, w.on_signal); signal.signal(signal.SIGTERM, w.on_signal)
-    log(f"rad-quant-at-home worker up: types {w.types}, cards {w.gpus or 'none'} ({w.gpu_env}), slots {w.slots}, "
+    log(f"rad-quant-at-home worker {VERSION} up: types {w.types}, cards {w.gpus or 'none'} ({w.gpu_env}), slots {w.slots}, "
         f"RAM {a.ram_gb} GB, cache {a.cache_gb} GB, windows {a.window or 'always'}"
         + (f", rate caps down {a.max_down_mbps or '-'} / up {a.max_up_mbps or '-'} Mbps" if a.max_down_mbps or a.max_up_mbps else "")
         + (", data budget " + ", ".join(f"{d} {getattr(a, f'max_{d}_gb_{p}'):g} GB/{p}" for d in ("down", "up") for p in ("day", "month")

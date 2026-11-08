@@ -14,13 +14,19 @@ and writes the worker's configuration into one directory (default ~/.config/rad-
   rqah setup --check               validate the current config against this machine; changes nothing (exit 0 ok,
                                    1 problems, 2 no config)
   rqah setup --show                print the hardware it detects and the defaults it would offer
+  rqah setup --update [--to X.Y.Z] [--yes] [--release] [--drain-timeout MIN] [--dry-run]     (alias `rqah update`)
+                                   move the worker to the release the queue advertises (or --to): pull the new
+                                   image, drain the running container (its jobs finish; --release hands them back),
+                                   rewrite the files with the new pin, recreate the container on the same state
+                                   volume (token, input cache, budget counters stay)
 
 What it does on its own: reads /proc, /sys, /dev and /etc, and runs `nvidia-smi`, `rocminfo` and `docker info` /
 `docker compose version` / `docker image inspect` if they are installed (all read-only, all local). It writes only
-inside the config directory and never runs sudo. Network only when asked: `--pull` (docker pull of the image) and
-`--start` (starts the worker, which registers with the invite). `--smoke` runs the image offline (--network none) to
+inside the config directory and never runs sudo. Network only when asked: `--pull` (docker pull of the image),
+`--start` (starts the worker, which registers with the invite) and `--update` (asks the queue for its release, pulls). `--smoke` runs the image offline (--network none) to
 check it sees the GPUs. The invite is read without echo (or from --invite-file / $RQAH_INVITE) and never printed."""
-import argparse, datetime, getpass, glob, json, os, re, shlex, shutil, stat, subprocess, sys, tempfile, textwrap, unicodedata
+import argparse, datetime, getpass, glob, json, os, re, shlex, shutil, stat, subprocess, sys, tempfile, textwrap, time, unicodedata
+import urllib.error, urllib.request
 
 SETUP_FORMAT = 1
 IMAGE_REPO = "ghcr.io/theherobrine422/rad-quant-at-home-worker"
@@ -424,7 +430,8 @@ def state_dir_for_disk(state, hw):
 DEFAULTS = {"server": "", "name": "donor", "leaderboard": False, "vendor": None, "gpus": None, "gpu_name": "", "vram_gb": 0,
             "vram_cap_gb": 0, "ram_gb": 0, "mem_limit_gb": 0, "state": "volume", "cache_gb": 0, "windows": [],
             "max_down_mbps": 0, "max_up_mbps": 0, "max_down_gb_day": 0, "max_down_gb_month": 0, "max_up_gb_day": 0,
-            "max_up_gb_month": 0, "budget_reset_day": 1, "on_stop": "finish", "container": "rad-quant-at-home", "image": ""}
+            "max_up_gb_month": 0, "budget_reset_day": 1, "on_stop": "finish", "container": "rad-quant-at-home", "image": "",
+            "version": ""}          # version: the worker release pinned by `--update` ("" = this setup's own VERSION)
 NUM = ("vram_gb", "vram_cap_gb", "ram_gb", "mem_limit_gb", "cache_gb", "max_down_mbps", "max_up_mbps", "max_down_gb_day",
        "max_down_gb_month", "max_up_gb_day", "max_up_gb_month")
 # display names: the server's rule (server/donor.py clean_display_name: tests/setup_test.py keeps them in sync), plus
@@ -460,9 +467,15 @@ def parse_windows(v):
     return ws
 
 
-def image_for(cfg):
+VERSION_RE = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")
+
+
+def vtuple(v): return tuple(int(x) for x in v.split(".")) if isinstance(v, str) and VERSION_RE.fullmatch(v) else None
+
+
+def image_for(cfg, version=None):
     if cfg.get("image"): return cfg["image"]
-    return f"{IMAGE_REPO}:{VERSION}-{ROCM_TAG if cfg['vendor'] == 'amd' else CUDA_TAG}"
+    return f"{IMAGE_REPO}:{version or cfg.get('version') or VERSION}-{ROCM_TAG if cfg['vendor'] == 'amd' else CUDA_TAG}"
 
 
 def validate(cfg, hw, secret=None):
@@ -484,6 +497,7 @@ def validate(cfg, hw, secret=None):
     if cfg["on_stop"] not in ("finish", "abandon"): E.append("on_stop: finish or abandon")
     if not CONTAINER_RE.fullmatch(cfg["container"]): E.append("container: letters, digits, _ . -")
     if cfg["image"] and not IMAGE_RE.fullmatch(cfg["image"]): E.append("image: a lower-case image reference")
+    if cfg.get("version") and not VERSION_RE.fullmatch(str(cfg["version"])): E.append("version: X.Y.Z (set by --update)")
     if cfg["gpu_name"] and not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,31}", cfg["gpu_name"]): E.append("gpu_name: [a-z0-9._-], ≤ 32")
     st = cfg["state"]
     if st != "volume" and (not st.startswith("/") or not re.fullmatch(r"/[A-Za-z0-9._/-]*", st) or "/../" in st + "/"):
@@ -874,8 +888,55 @@ def smoke(host, hw, cfg, cfgdir, pull=False, gpu_test=False, say=print):
     return ok
 
 
-def start(host, hw, cfg, cfgdir, say=print):
-    """opt-in: create and start the worker (it registers with the queue on its first start)"""
+def container_state(host, name):
+    """(exists, running, image reference) of the worker container"""
+    rc, out, _ = host.run(["docker", "inspect", "--format", "{{.State.Running}} {{.Config.Image}}", name])
+    if rc != 0 or not out.strip(): return False, False, None
+    run, _, img = out.strip().partition(" ")
+    return True, run == "true", img or None
+
+
+def drain(host, name, timeout_s=3600, release=False, say=print, sleep=time.sleep, clock=time.time):
+    """stop the running worker without losing work. Its restart policy goes to "no" first (an exit must not bring it
+    back), then SIGTERM: it finishes its running jobs and exits (--release, or after timeout_s: a second SIGTERM,
+    which hands them back to the queue at once, not counted against them). -> True once it has stopped"""
+    ex, run, _ = container_state(host, name)
+    if not run: return True
+    host.run(["docker", "update", "--restart", "no", name])
+    host.run(["docker", "kill", "--signal", "TERM", name])
+    if release:
+        sleep(2); host.run(["docker", "kill", "--signal", "TERM", name])
+        say(f"draining {name}: its running jobs are handed back to the queue now")
+    else:
+        say(f"draining {name}: it finishes its running jobs, then stops (up to {timeout_s / 60:g} min; "
+            "--release hands them back instead)")
+    t_end, said = clock() + (120 if release else timeout_s), clock()
+    while clock() < t_end:
+        if not container_state(host, name)[1]: return True
+        if clock() - said >= 300: say("  still finishing ..."); said = clock()
+        sleep(5)
+    if not release:
+        say(f"still running after {timeout_s / 60:g} min: handing its jobs back to the queue")
+        host.run(["docker", "kill", "--signal", "TERM", name])
+        t_end = clock() + 120
+        while clock() < t_end:
+            if not container_state(host, name)[1]: return True
+            sleep(5)
+    say("it did not stop by itself: docker stop (a job it still held resumes in the new container if its lease is alive, "
+        "else the queue hands it to another worker)")
+    host.run(["docker", "stop", "--time", "30", name], timeout=120)
+    return not container_state(host, name)[1]
+
+
+def start(host, hw, cfg, cfgdir, say=print, drain_s=3600, release=False, sleep=time.sleep, clock=time.time):
+    """opt-in: create and start the worker (it registers with the queue on its first start). A worker container of
+    that name that is running is drained first (drain()), then removed (never its volume) and created anew"""
+    ex, run, _ = container_state(host, cfg["container"])
+    if run and not drain(host, cfg["container"], drain_s, release, say, sleep, clock):
+        say("start FAILED: the running worker did not stop"); return False
+    if ex:
+        rc, out, err = host.run(["docker", "rm", cfg["container"]])
+        if rc != 0: say(f"start FAILED: docker rm {cfg['container']}: {(err or out).strip()[-300:]}"); return False
     if hw["docker"]["compose"]:
         argv = ["docker", "compose", "--project-directory", cfgdir, "-f", os.path.join(cfgdir, "compose.yaml"), "up", "-d"]
     else:
@@ -883,6 +944,77 @@ def start(host, hw, cfg, cfgdir, say=print):
     rc, out, err = host.run(argv, timeout=7200)
     say(("started: " if rc == 0 else "start FAILED: ") + (out + err).strip()[-400:])
     return rc == 0
+
+
+# ================================================================ updating (--update)
+def fetch_version(server, timeout=15):
+    """the queue's GET /api/v0/version (no token): {"api", "server", "worker": {"current", "min"}}"""
+    req = urllib.request.Request(server.rstrip("/") + "/api/v0/version", headers={"User-Agent": f"rqah-setup/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r: return json.loads(r.read(1 << 16) or b"{}")
+
+
+def update(host, hw, cfg, cfgdir, secret, a, say=print, ask=None, fetch=fetch_version, sleep=time.sleep, clock=time.time):
+    """--update: the advertised (or --to) worker release -> pull, drain, rewrite the pin, recreate. Returns an exit code
+    (0 done or nothing to do, 1 failed, 2 refused / usage). Only the tag changes: the repository is IMAGE_REPO, the
+    version comes from the queue but must be X.Y.Z, and a downgrade needs --to"""
+    if cfg.get("image"):
+        say(f"setup.json overrides the image ({cfg['image']}): set the new one with `rqah setup --image REF --start`"); return 2
+    have = cfg.get("version") or VERSION
+    if a.to:
+        target, why = a.to, "--to"
+        if not VERSION_RE.fullmatch(target): say(f"--to {target!r}: X.Y.Z"); return 2
+    else:
+        try: v = fetch(cfg["server"])
+        except (urllib.error.URLError, OSError, ValueError) as x:
+            say(f"could not ask the queue ({cfg['server']}) for its release: {getattr(x, 'reason', x)}; try again, or give --to X.Y.Z")
+            return 1
+        w = v.get("worker") if isinstance(v, dict) else None
+        target = w.get("current") if isinstance(w, dict) else None
+        if not isinstance(target, str) or not VERSION_RE.fullmatch(target):
+            say("the queue's answer has no worker release (a server before 0.5?): give --to X.Y.Z"); return 1
+        why = f"the queue advertises {target}" + (f" (oldest still served: {w.get('min')})" if isinstance(w.get("min"), str) else "")
+    new_img, old_img = image_for(cfg, target), image_for(cfg)
+    ex, run, cur_img = container_state(host, cfg["container"])
+    if target == have and (not ex or cur_img == new_img):
+        say(f"up to date: {new_img}" + ("" if ex else " (no worker container yet: rqah setup --start)")); return 0
+    if vtuple(target) < vtuple(have) and not a.to:
+        say(f"the queue advertises {target}, older than the pinned {have}: nothing done (a downgrade needs --to {target})"); return 2
+    if vtuple(target)[:2] > vtuple(VERSION)[:2]:
+        say(f"note: this setup is {VERSION}; release {target} may want settings it does not know. Get its setup.py first "
+            "(git pull in your rad-quant-at-home checkout) unless its notes say otherwise")
+    say(f"update: {old_img} -> {new_img} ({why})")
+    say(f"  1. docker pull {new_img}")
+    say(f"  2. drain {cfg['container']}: " + ("hand its running jobs back now" if a.release else
+        f"let its running jobs finish (up to {a.drain_timeout:g} min, then hand them back)") if run else
+        f"  2. {cfg['container']} is not running: nothing to drain")
+    say(f"  3. rewrite compose.yaml / docker-run.sh / setup.json with {target}; recreate the container on the same state "
+        + ("volume " + VOLUME if cfg["state"] == "volume" else "directory " + cfg["state"]) + " (token, cache, budget counters stay)")
+    if a.dry_run: say("dry run: nothing done"); return 0
+    if not a.yes:
+        if ask is None:
+            if not sys.stdin.isatty(): say("not a terminal: add --yes to go ahead"); return 2
+            ask = lambda q: ask_yes(input, q, True)
+        if not ask("Go ahead?"): say("cancelled: nothing changed"); return 1
+    if not hw["docker"]["present"] or not hw["docker"]["access"]:
+        say("docker: " + ("not installed" if not hw["docker"]["present"] else hw["docker"]["error"] or "no access")); return 1
+    say(f"pulling {new_img} ...")
+    rc, out, err = host.run(["docker", "pull", new_img], timeout=7200)
+    if rc != 0: say(f"pull failed, nothing changed: {(err or out).strip()[-300:]}"); return 1
+    if run and not drain(host, cfg["container"], a.drain_timeout * 60, a.release, say, sleep, clock):
+        say(f"the old worker did not stop; nothing else changed (docker update --restart unless-stopped {cfg['container']} "
+            "restores its restart policy)"); return 1
+    cfg = dict(cfg, version=target if target != VERSION else "")
+    write_all(cfgdir, cfg, hw, secret)
+    say(f"written: compose.yaml, docker-run.sh, setup.json in {cfgdir} (the previous ones as *.prev)")
+    if not start(host, hw, cfg, cfgdir, say, a.drain_timeout * 60, a.release, sleep, clock):
+        say(f"the old container is stopped and the files name {target}: fix the error above, then `rqah setup --start` "
+            f"(or go back: copy the *.prev files over and run `docker compose up -d`)"); return 1
+    ex, run, img = container_state(host, cfg["container"])
+    if not run or img != new_img:
+        say(f"after the update the container is {'running ' + str(img) if run else 'not running'}: check `docker logs {cfg['container']}`")
+        return 1
+    say(f"updated to {target}: {cfg['container']} runs {new_img}; `docker exec {cfg['container']} rqah status` shows it")
+    return 0
 
 
 # ================================================================ the questions
@@ -1244,7 +1376,16 @@ def main(argv=None):
     ap.add_argument("--smoke", action="store_true", help="after writing: validate compose.yaml, look for the image, and if it is "
                     "there, run it offline (--network none) to check it sees the GPUs")
     ap.add_argument("--pull", action="store_true", help="after writing: docker pull the image (network, several GB)")
-    ap.add_argument("--start", action="store_true", help="after writing: start the worker (it registers with the queue)")
+    ap.add_argument("--start", action="store_true", help="after writing: start the worker (it registers with the queue); a "
+                    "running worker of that name is drained first (its jobs finish)")
+    u = ap.add_argument_group("updating (--update, alias `rqah update`; README \"Updating\")")
+    u.add_argument("--update", action="store_true", help="move the worker to the release the queue advertises: pull, drain, "
+                   "rewrite the pin, recreate on the same state volume")
+    u.add_argument("--to", metavar="X.Y.Z", help="--update to this release instead (also a downgrade)")
+    u.add_argument("--release", action="store_true", help="drain by handing the running jobs back at once (default: let them finish)")
+    u.add_argument("--drain-timeout", type=float, default=60, metavar="MIN",
+                   help="--update / --start: how long the running jobs may take to finish before they are handed back (60)")
+    u.add_argument("--dry-run", action="store_true", help="--update: say what it would do; change nothing")
     s = ap.add_argument_group("settings (each also a key of --answers)")
     s.add_argument("--server"); s.add_argument("--name"); s.add_argument("--leaderboard", choices=("on", "off"))
     s.add_argument("--vendor", choices=("amd", "nvidia")); s.add_argument("--gpus", help="0,1 or all")
@@ -1282,6 +1423,11 @@ def main(argv=None):
 
     cfg, secret = load(cfgdir)
     existing = cfg is not None
+    if a.update:
+        if cfg is None:
+            print(f"rqah update: no configuration in {cfgdir}: it updates a worker set up with `rqah setup` (else README "
+                  "\"Updating\" has the docker commands)"); return 2
+        return update(host, hw, cfg, cfgdir, secret, a)
     rec = recommend(hw)
     if cfg is None:
         cfg = dict(DEFAULTS); cfg.update(rec)
@@ -1343,7 +1489,7 @@ def main(argv=None):
     do_pull = a.pull or (interactive and hw["docker"]["access"] and ask_yes(input, f"Pull the image now ({image_for(cfg)}, several GB download)?", False))
     if do_smoke or do_pull: smoke(host, hw, cfg, cfgdir, pull=do_pull, gpu_test=do_smoke)
     if a.start or (interactive and hw["docker"]["access"] and ask_yes(input, "Start the worker now (it registers with the queue)?", False)):
-        start(host, hw, cfg, cfgdir)
+        start(host, hw, cfg, cfgdir, drain_s=a.drain_timeout * 60, release=a.release)
     else:
         how = f"cd {shlex.quote(cfgdir)} && docker compose up -d" if hw["docker"]["compose"] else f"sh {shlex.quote(os.path.join(cfgdir, 'docker-run.sh'))}"
         print(f"start it with:  {how}\nthen:           docker exec {cfg['container']} rqah status")
