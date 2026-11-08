@@ -55,8 +55,8 @@ RUN git clone ${EXL3_REPO} /opt/rqah/exllamav3 && cd /opt/rqah/exllamav3 && git 
 # the run-time side extensions ourq.py --qtf2 / --codebook build (v3/e3/exl3frac2, exl3cb, exl3frac): compiled now
 # into the image (no GPU needed to compile), so donors do not wait for hipcc on their first job. A failure fails the
 # build: a published image must not compile at run time.
-ENV PYTHONPATH=/opt/rqah/exllamav3 TORCH_EXTENSIONS_DIR=/opt/rqah/torch_ext PYTORCH_ROCM_ARCH=${GPU_ARCH} \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ENV PYTHONPATH=/opt/rqah/exllamav3 TORCH_EXTENSIONS_DIR=/opt/rqah/torch_ext PYTORCH_ROCM_ARCH=${GPU_ARCH}
+# no PYTORCH_*_ALLOC_CONF=expandable_segments: on gfx1201 it made torch fault in random stock kernels (rad-exl3-mix #105)
 COPY app /opt/rqah/app
 RUN python /opt/rqah/app/docker/warm.py /opt/rqah/rxm /opt/rqah/exllamav3/exllamav3/exllamav3_ext
 # radiance: the fork's image, whole, run through its own loader

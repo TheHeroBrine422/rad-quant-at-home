@@ -18,6 +18,6 @@ RXM=${RXM:-$(cd "$R/.." && pwd)/rad-exl3-mix}          # the rad-exl3-mix checko
 PY=${PYTHON:-python3}
 exec "$PY" -I "$R/worker/worker.py" --state "$STATE" --python "$PY" --ourq "$RXM/quantize/ourq.py" \
   --exl3-src "$EXL3_SRC" --env "PYTHONPATH=$EXL3_PATH" --env "TORCH_EXTENSIONS_DIR=$TORCH_EXT" \
-  --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True ${GPU_LOCK:+--gpu-lock "$GPU_LOCK"} \
+  ${GPU_LOCK:+--gpu-lock "$GPU_LOCK"} \
   ${RADIANCE:+--radiance "$RADIANCE"} ${RADIANCE_HOME:+--env "RADIANCE_HOME=$RADIANCE_HOME"} \
   --image "local-$(git -C "$R" rev-parse --short HEAD 2>/dev/null || echo unknown)" "$@"
