@@ -757,7 +757,8 @@ table (R9700, 11-08). Verification by score reads the per-tensor files (`codes()
 with `python -m rxq assemble`. The quantization type list is one tuple now (`jobs.QUANT`: scheduler, verifier,
 scorer, status page, export).
 
-`tests/rxq_e2e.py RXM FORK [WORKDIR]` (VM, CPU, ~4 min; rxq's CPU stand-in kernels: the fork's real quantize.py with a
+`tests/rxq_e2e.py RXM FORK [WORKDIR]` (VM, CPU, ~4 min; FORK = an exllamav3 fork tree with patch 0008, since the V3
+settings default to the block-diagonal H_out path; rxq's CPU stand-in kernels: the fork's real quantize.py with a
 greedy trellis encoder, test only, results stamped `cpu-standin`), tiny two-layer model (GDN layer 2, attention layer
 3, small shapes): datapack (`--groups --hout`, `rxq-settings`, manifest); 16 generated jobs (K0.5 i4, K2.5 i8) with
 pins = the manifest's hashes; enqueue twice (16 new, then 0); server + one fake-card worker: all accepted; every tensor

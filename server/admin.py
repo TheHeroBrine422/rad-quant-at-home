@@ -582,6 +582,7 @@ def cmd_export_rxq(a, S, rows):
         if best is None and acc_u: best = acc_u[0]
         if best is not None: pick[u] = best
     if len(pick) != len(units) and not a.partial: sys.exit(f"{len(pick)}/{len(units)} accepted (--partial to export anyway)")
+    if not pick: sys.exit(f"level {a.level}: no accepted job")
     if a.checked and any(r["check_state"] != "pass" for r in pick.values()): sys.exit("not every accepted job passed its check")
     jd = os.path.join(a.out, "jobs"); os.makedirs(jd, exist_ok=True)
     for r in pick.values():
