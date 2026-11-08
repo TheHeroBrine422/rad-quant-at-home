@@ -82,7 +82,33 @@ RAM for all cards at once, a cache without reflinks for evaluations, running as 
    to print the cards torch sees, and the result is compared with the selection.
 2. **Pull** the image (opt-in, several GB).
 3. **Start** the worker (opt-in): `docker compose up -d` (or `docker-run.sh`). On its first start the worker registers
-   with the invite. Otherwise setup prints the command.
+   with the invite. Otherwise setup prints the command. A worker container of that name that is running is **drained**
+   first (its jobs finish, or `--release` hands them back; below), then removed (never its volume) and created anew.
+
+## Updating (`--update`, alias `rqah update`; 0.5)
+
+```bash
+python3 client/setup.py --update [--to X.Y.Z] [--yes] [--release] [--drain-timeout MIN] [--dry-run] [--config-dir DIR]
+```
+
+1. **Which release:** `GET <queue>/api/v0/version` (no token; the queue in `setup.json`), or `--to`. It must be
+   `X.Y.Z`; only the tag changes, the repository stays `ghcr.io/theherobrine422/rad-quant-at-home-worker`, so a queue
+   can only point at releases we published. An advertised release older than the pinned one is refused (a downgrade
+   needs `--to`). If the target is a newer minor than this `setup.py`, it says to get the matching `setup.py` first
+   (`git pull`). A config that overrides `image` is left alone.
+2. **The plan**, then a confirmation (`--yes` skips it; without a terminal it needs `--yes`); `--dry-run` stops here.
+3. `docker pull` the new tag. A failed pull changes nothing.
+4. **Drain** the running container: `docker update --restart no` (its exit must not bring it back), `docker kill
+   --signal TERM` (the worker finishes its running jobs and exits; with `on_stop` abandon it hands them back at once),
+   wait up to `--drain-timeout` minutes (60), then a second SIGTERM (it hands the jobs back to the queue, not
+   counted against them) and at last `docker stop`. `--release` sends both signals at once.
+5. Rewrite `compose.yaml`, `docker-run.sh` and `setup.json` with the new pin (`settings.version`; the previous files
+   as `*.prev`); `worker.env` and the invite are unchanged.
+6. `docker rm` the stopped container (the `rqah-state` volume or state directory stays: token, input cache, data
+   budget counters, running-job records) and start it again from the new files, then check that it runs the new tag.
+
+`rqah status` inside the container shows when an update is available and this command. `rqah update` inside the
+container refuses (it has to run on the host, where Docker is).
 
 ## Re-running and `--check`
 
@@ -183,5 +209,9 @@ the plain prompts (scripted and on a pseudo-terminal), the curses form (rendered
 with a hidden invite), the smoke step's commands, nothing written outside the config dir, Python 3.10 grammar,
 stdlib only.
 
+`tests/update_test.py` runs `--update` and `--start` against a simulated Docker (the order of the steps, the drain and
+its timeout, `--release`, `--dry-run`, refusals); `tests/update_docker_test.py` runs the drain against a real container.
+
 Not tested: real AMD hardware (the kfd / drm layout is the documented one), the smoke step against a real image (none
-is published yet), `--start`.
+is published yet), `--update` / `--start` with a real worker image and GPU (the drain is tested with a real container
+running the worker on noop jobs).

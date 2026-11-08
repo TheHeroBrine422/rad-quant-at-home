@@ -29,6 +29,13 @@ What is new on this branch (after 0.4.0):
   name on every machine. `rqah link` is gone.
 - **Open registration:** an invite is optional. Without one a worker starts on probation (server-scored quantization
   jobs only, one at a time until a few pass; evaluations later), rate-limited per address.
+- **Updates** ("Updates and versions" below): workers report their release, the queue advertises the current and the
+  oldest supported one (`rqah status`: "update available: X -> Y" and the command; the status page: the share of
+  workers on old releases; below the minimum a 426 that says how to update). `rqah update` (the setup wizard's
+  `--update`) pulls the new image, lets the running jobs finish, and recreates the container on the same state volume.
+  Job versions coexist (`ACCEPTS`, `admin.py versions` / `retire`), the database migrates in versioned steps with a
+  backup, a server restart no longer expires the leases of workers that were waiting for it, and the worker's state
+  directory is versioned.
 
 What is new in 0.4:
 - **Bandwidth limits for donors** on data caps or slow links: rate caps (`--max-down-mbps`, `--max-up-mbps`) and day /
@@ -114,6 +121,14 @@ the allowance runs out, the running jobs finish and nothing new starts until the
 left and when it resets. The worker counts payload bytes (inputs and results), not TCP/TLS overhead (a few percent),
 so leave your ISP's cap some margin. Typical sizes are in "Data per job": a 27B layer job downloads ~1.5 GB the
 first time and uploads 50-300 MB.
+
+**Update it.** When we publish a new release, the worker logs `update available: X -> Y` once and `rqah status` shows
+the command; it keeps working on the old one until the queue stops supporting it (then it takes no new jobs and says
+so). Nothing updates by itself. On the host: `rqah update` (`python3 client/setup.py --update`, for a worker set up with
+the wizard) pulls the new image, lets the running jobs finish, and recreates the container on the same state volume:
+your token, input cache and data budget counters stay. By hand: `docker pull` the new tag, `docker stop
+rad-quant-at-home` (finishes the running jobs), `docker rm rad-quant-at-home`, and the same `docker run` line with the
+new tag. Details: "Updates and versions" below.
 
 **Stop it.** `docker stop rad-quant-at-home` finishes the running jobs (up to 15 min) and exits; `docker kill -s TERM
 rad-quant-at-home` while that waits hands them back at once. `docker start rad-quant-at-home` resumes. To leave for
@@ -208,7 +223,7 @@ itself: [research-kit/](research-kit/README.md).
   `requeue`, `cancel`),
   verification (`check`, `spot`, `quarantine`, `unquarantine`, `exclude-donor`, `batch-adopt`), workers (`invite`, `add-worker`, `workers`, `trust`,
   `verifier`, `disable-worker`), donors (`invite --personal`, `donors`, `donor ID --hide`), `points`,
-  `status-page`, `export` (the accepted shards of a level in `quantize/ourq.py`'s layout, so knap4 and the search read
+  `status-page`, versions (`versions`, `retire`, 0.5), `export` (the accepted shards of a level in `quantize/ourq.py`'s layout, so knap4 and the search read
   them unchanged). RUNBOOK.md walks through them.
 - **Worker** (`worker/worker.py`): a loop of lease → fetch → run → upload → complete per job, with a heartbeat thread
   per job. One process serves all the box's cards: each job runs in its own thread, its processes see only its cards
@@ -270,7 +285,9 @@ regularized in place (the fix `proxy2b/exp/w04-blockgain/rowerr.patch` is not me
 **Versions.** The server and the worker each derive a job's inputs and outputs from their own copy of `jobs/`, so
 every type has a `VERSION`, bumped on any change of parameters, inputs, outputs or meaning. A worker declares the
 versions it runs, the server leases only matching jobs, and dedupe keys include the version. Deploy order: server
-first, then the new image. 0.2: `noop` 2 (requirement parameters), `eval_mix` 1 (implemented), `golden_record` 1 (new);
+first, then the new image. 0.5: a type may also list `ACCEPTS`, the older versions whose results its code still
+accepts and checks; queued and running jobs of those versions keep going to the workers that run them, other old
+versions wait for `admin.py retire TYPE V --migrate` ("Updates and versions"). 0.2: `noop` 2 (requirement parameters), `eval_mix` 1 (implemented), `golden_record` 1 (new);
 the quant types stay at 2 (only their declared requirements changed, which the server computes). 0.3: `quant_layer` and
 `quant_head` 3 (the `verify` parameter; score mode uploads no `rowerr.npz`; ourq runs with the CPU refit fallback),
 `quant_tensor` 1 (new). 0.5: `eval_mix` 2 (`docs` / `sub_rows`: a spot check of a few documents).
@@ -477,6 +494,58 @@ Cost on the queue host (8 threads, niced), per 27B layer:
 
 Batch checks should go layer by layer: the Hessian load and tr(W H Wᵀ) are the same for every level.
 
+## Updates and versions (0.5)
+
+**How donors learn.** A worker sends its release with every request (`X-RQAH-Version`; 0.4 workers only in their
+user agent, which the server reads as 0.4.0). Every lease answer, `/api/v0/status` and `/api/v0/me` carry `{"update":
+{"current", "min"}}`; `GET /api/v0/version` (no token) has the same. The worker logs `update available: X -> Y` once and
+keeps it in `STATE/update.json`; `rqah status` shows a VERSION column and, when there is a newer release, `update
+available: X -> Y` with `rqah update` and the exact image to pull (its own tag with the new version). The status page
+shows the share of recent workers on the current release and on older ones. `--worker-current` (default: the server's
+own release) and `--worker-min` (default 0.4.0, one release back) set what is advertised.
+
+**Below the minimum.** `/lease` answers **426** with the reason, the update command and `retry_s`: the worker logs
+`UPDATE NEEDED: ...` once, finishes and uploads the jobs it holds (heartbeat, upload and complete are never refused for
+a running lease), leases nothing new and asks again hourly. It does not exit (a restart loop helps nobody). A 0.4
+worker logs `lease refused: HTTP 426: ...` with the same text every 30 s.
+
+**Updating** (opt-in, on the host; docs/SETUP.md "Updating"):
+
+```bash
+rqah update                 # = python3 client/setup.py --update: asks the queue for its release, shows the plan, asks
+rqah update --dry-run       # what it would do
+rqah update --yes --release # no question; hand the running jobs back instead of letting them finish
+rqah update --to 0.5.0      # a given release (also the way back to an older one)
+```
+
+It pulls the new tag first (a failed pull changes nothing), then drains the container: the restart policy goes to
+`no`, SIGTERM lets the running jobs finish (up to `--drain-timeout`, 60 min; then a second SIGTERM hands them back to
+the queue, not counted against them), then rewrites `compose.yaml` / `docker-run.sh` / `setup.json` with the new pin
+(`*.prev` keep the old ones), removes the stopped container (never the volume) and starts the new one. `rqah setup
+--pull --start` drains a running worker the same way. A job that was still running when a container was killed is
+resumed by the new one while its lease lives; if the new release runs another version of that job type, the worker
+hands it back (abandoned, not counted) so a worker of the old version takes it. The state directory is versioned
+(`STATE/state.json`): a newer release keeps the token, the input cache (blobs whose size does not match their index are
+fetched again) and the budget counters; an older one (a downgrade) keeps the token and the cache and sets the job
+records aside.
+
+**No auto-update by default, and none offered for now.** Donors run our code with their GPUs; an update should be a
+decision they make. An opt-in later would be a host-side timer (systemd) running `rqah update --yes` for patch
+releases only, once the images are signed (cosign) and pulled by digest, never something inside the container (that
+needs the Docker socket, i.e. root on the host) and never Watchtower-style "latest". The value is small while releases
+are rare and the old release keeps working for a whole window.
+
+**Compatibility rules.** API v0 changes are additive (new keys, new endpoints); nothing is removed without a release
+in which it still works. The server leases to workers from `--worker-min` up (one release back by default), so a
+donor has a release window to update. Job types: `VERSION` bumps on any change of meaning, `ACCEPTS` lists the older
+versions the new code still checks; an old version is taken out of service with `admin.py retire TYPE V` (refused
+while jobs of it run, or are queued unless `--migrate` re-stamps them at the current version after checking them).
+`admin.py versions` shows what is queued per version and which workers can run it. The database schema is versioned
+(`PRAGMA user_version`, server/store.py): a newer server migrates at start after a backup (`queue.sqlite.schemaN.bak`),
+migrations only add, so the previous release's server still opens the result; a database from a newer server is
+refused. A server restart gives the leases that were active a fresh lease and moves their deadlines by the downtime,
+so workers waiting through an outage keep their jobs. RUNBOOK.md "Upgrades" has the operator's order of steps.
+
 ## Donor CLI (`client/rqah.py`)
 
 What a donor (or an agent working for one) runs to see their own part of the queue. Stdlib only; installed as
@@ -491,6 +560,7 @@ docker exec rad-quant-at-home rqah points            # lumens per worker / type,
 docker exec rad-quant-at-home rqah logs -f           # the server's events for your workers (--local: this box's job records)
 docker exec rad-quant-at-home rqah config            # server, token fingerprint, caps from the environment, profile
 docker exec rad-quant-at-home rqah config set --leaderboard on --display-name "Ada"
+# on the host (0.5): rqah update     pull the new release, drain, recreate (section "Updates and versions")
 # outside a container:
 python3 client/rqah.py --server https://<queue-url> --token-file ~/.rqah-token status
 ```
@@ -838,6 +908,16 @@ Every push to main and every pull request runs the no-GPU suites below on GitHub
 - `tests/bandwidth_e2e.py` (0.4): the bandwidth limits end to end with noop jobs, ~3 min: the budget counters (day,
   month, reset day, year wrap), rate caps on a 30 s fetch / upload / resumed fetch (±10%), budgets across a SIGKILL
   and a restart, `rqah status`, the status page.
+- `tests/update_test.py` (0.5): updates in process, ~45 s: version advertisement, 426, served / retired job
+  versions, `admin.py versions` / `retire`, schema migration and the newer-schema refusal, the restart grace, the
+  worker's update notice / state format / cache rebuild / hand-back of a resumed lease of another job version, `rqah
+  status`, the status page share, and `rqah update` against a simulated Docker.
+- `tests/upgrade_e2e.py` (0.5): the whole path with real processes, ~2 min: the 0.4.0 release (`git archive f179831`,
+  so it needs the git history) fills a database, the server is upgraded under it with a downtime longer than a
+  lease, old workers keep working, workers are updated on their state (one drained, one killed mid-job; a full cache),
+  the minimum is raised mid-job, and a simulated next release adds a job type and bumps noop's version while workers
+  of three releases share the queue (retire, `--migrate`).
+- `tests/update_docker_test.py` (0.5, manual: needs Docker): the drain of `rqah update` against a real container.
 - `tests/setup_test.py`: the setup wizard (docs/SETUP.md) on fake machines (fake sysfs and command output), ~20 s, no
   GPU, no network: a 4 / 8 / 12 / 16 / 32 GB card matrix, multi-card with an iGPU, unsupported cards, no Docker,
   the files and their modes, re-runs, `--check`, the plain prompts and the curses form on a pseudo-terminal.
@@ -877,4 +957,5 @@ Every push to main and every pull request runs the no-GPU suites below on GitHub
   (Σdy² partial sums, input-Hessian partials by token chunk and layer group); **big-box** backward passes (Σdy², REAL-Q
   Fisher), fuller H_out accumulators, long-context checks: trusted donors, with split-half / per-layer comparisons
   against our snapshots.
-- TLS / a reverse proxy in front, rate limits, token rotation, signed images (cosign), reproducible builds.
+- TLS / a reverse proxy in front, rate limits, token rotation, signed images (cosign), reproducible builds; then `rqah
+  update` could pull by digest and check the signature (and an opt-in timer for patch releases would be reasonable).

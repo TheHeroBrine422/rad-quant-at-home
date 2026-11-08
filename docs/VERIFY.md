@@ -155,6 +155,20 @@ are not re-checked.
 - Binding codes to the seed (checking that `sign(suh)` / `sign(svh)` follow the job's seed) would stop copying across
   best-of-N copies. It needs the quantizer's device RNG on the server, so it is left out.
 
+### Updates (0.5)
+
+The update path adds no way for the queue to run code on a donor's machine:
+
+- The queue only *advertises* releases (`current`, `min`). The worker never updates itself, and a 426 only stops it from
+  leasing; it keeps running the image the donor chose.
+- `rqah update` takes the release from the queue but uses it only as a tag (`X.Y.Z`) in the fixed repository
+  `ghcr.io/theherobrine422/rad-quant-at-home-worker`, refuses an older one without `--to`, shows the plan and asks
+  before it pulls. A spoofed or compromised queue can therefore at most pick another release we published, and only
+  when the donor runs the command. Images are not signed yet (README "Next"): pulling by digest with a signature check
+  is the next step before any opt-in automatic update.
+- Version claims are not trusted for anything but compatibility: a worker that lies about its release gains nothing (it
+  still declares job versions, and every result is verified as before).
+
 ### Identity: trust is per worker, not per donor (#9, won't fix)
 
 Quarantine, the spot-check draw (a worker's first result of each type, then a random share) and the exclusion of a

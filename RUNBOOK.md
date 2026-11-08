@@ -155,6 +155,39 @@ on that release's levels (`$A list --level L` has the `by` worker of each job).
 
 ## 7. Upgrades and backups
 
+### Upgrades (0.5)
+
+The order for a release (README "Updates and versions" has the rules):
+
+1. **Code.** A job type whose meaning changes gets a new `VERSION`. If the new code can still accept and check results
+   of the old version (e.g. a parameter added with a default), list it in `ACCEPTS`: queued and running old jobs then
+   keep going to old workers. If not, the old version's queued jobs will wait after the deploy (step 5). A release
+   bumps `VERSION`.
+2. **Images first:** build and push the worker images of the new release (README "Publishing images"). The server
+   advertises its own release as current (`RQAH_WORKER_CURRENT` overrides it), so donors see "update available" as
+   soon as it runs: the tag must exist by then.
+3. **Server:** `sqlite3 queue.sqlite ".backup q.bak"`; `$A versions` (what is queued per job version). Then replace the
+   server (`docker compose pull && docker compose up -d`, or restart the process). At start it migrates the database
+   if needed (after a copy, `queue.sqlite.schemaN.bak`; the log says `database migrated to schema N`), extends the
+   leases that were active by the downtime (`restart: N active leases extended`; a `server_start` event), and prints a
+   `WARNING` for every queued or running job version it does not accept. A database from a newer server is refused
+   (exit 1 with the message): run that release, or restore the backup.
+4. **Watch the window:** `$A versions` (worker releases seen in the last 7 days, and how many workers raising the
+   minimum would refuse), the status page's release shares, `$A workers`. Old workers keep working meanwhile.
+5. **Old job versions:** `$A retire TYPE V` once nothing needs version V (refused while jobs of it run; refused while
+   some are queued, unless `--migrate` re-stamps them at the current version after checking their parameters and inputs
+   against it; `--dry-run` first). Running jobs are never touched. `--undo` puts it back.
+6. **End of the window:** `RQAH_WORKER_MIN=<new release>` and restart the server. Older workers finish what they hold,
+   then get 426 with the update command (their log, `rqah status`). Default window: one release.
+7. **Rollback:** the previous release's server opens a migrated database (migrations only add). Restoring
+   `queue.sqlite.schemaN.bak` also works but loses everything since the upgrade.
+
+Server restarts: a planned one loses no work even when it takes longer than `--lease-s` (the leases are extended by
+the downtime at start; workers retry until it answers). A worker that died meanwhile loses its lease one `--lease-s`
+after the start.
+
+### Older notes
+
 - A job type's meaning changes → bump its `VERSION`; a release → bump `VERSION`. Deploy the server first,
   then the new worker image; old workers stop getting the changed type.
 - 0.3 renamed the project to rad-quant-at-home: `RQAH_*` variables (the 0.2 `RADQUANT_*` are read in 0.3 with a
