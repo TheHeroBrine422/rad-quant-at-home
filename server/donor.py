@@ -25,7 +25,7 @@ from server.verify import QUANT
 
 QUANT_SET = set(QUANT)
 ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
-LABEL_TYPES = {"quant_layer": "quantize a layer", "quant_tensor": "quantize part of a layer", "quant_head": "quantize the LM head", "eval_mix": "score a candidate mix",
+LABEL_TYPES = {"quant_layer": "quantize a layer", "quant_tensor": "quantize part of a layer", "rxq_quant": "quantize part of a layer (V3)", "quant_head": "quantize the LM head", "eval_mix": "score a candidate mix",
                "golden_record": "record reference outputs", "noop": "test job"}
 VERIFICATION = ("running", "verified", "accepted", "awaiting check", "spot-check pending", "failed check",
                 "failed spot check", "voided", "superseded", "expired", "abandoned", "failed", "rejected", "cancelled")
@@ -73,7 +73,7 @@ def label(jtype, params, level=None):
     p = params if isinstance(params, dict) else {}
     ident = lambda x: x if isinstance(x, str) and ID_RE.fullmatch(x) else "?"
     if jtype == "quant_layer": return f"{ident(p.get('level', level))} · layer {int(p['layer']) if isinstance(p.get('layer'), int) else '?'}"
-    if jtype == "quant_tensor":
+    if jtype in ("quant_tensor", "rxq_quant"):
         n = lambda x: int(x) if isinstance(x, int) and not isinstance(x, bool) else "?"
         return f"{ident(p.get('level', level))} · layer {n(p.get('layer'))} part {n(p.get('group'))}"
     if jtype == "quant_head": return f"{ident(p.get('level', level))} · LM head"

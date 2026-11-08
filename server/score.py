@@ -65,6 +65,7 @@ def series(p):
 
 def group(p, jtype):
     """one job's identity across best-of-N copies (seed_offset differs): series, K and the layer / head"""
+    if jtype == "rxq_quant": return f"{series(p)}:K{float(p['K'])}:{p['layer']}/{p['group']}/" + ",".join(k.rsplit('.', 1)[-1] for k in p['keys'])
     return f"{series(p)}:K{float(p['K'])}:{p.get('layer', 'head') if jtype != 'quant_tensor' else str(p['layer']) + '/' + str(p['group'])}"
 
 
@@ -190,11 +191,14 @@ def den_of(S, model_key, key, Wt, H):
 def score_files(S, jtype, p, res_dir, data_path, log=None):
     """decode every tensor of a result and compute rel against our weights / Hessians -> (rows, error)"""
     m = jobs.get(jtype); plan = m.plan(p)
-    shard = os.path.join(res_dir, m.shard(p))
     wf = data_path(f"{Q.root(p)}/weights/{m.wfile(p)}")
-    try: Q.check_shard(p, plan, shard, wf)
+    try:
+        if hasattr(m, "codes"): sh = m.codes(p, res_dir, wf)                # rxq_quant: one file per tensor
+        else:
+            shard = os.path.join(res_dir, m.shard(p))
+            Q.check_shard(p, plan, shard, wf); sh = ST(shard)
     except Exception as e: return None, f"structure: {e}"
-    sh, wts = ST(shard), ST(wf)
+    wts = ST(wf)
     mk = f"{p['model']}@{p['revision']}"
     seed = S.secret("tiles")
     out = []
@@ -350,7 +354,7 @@ def reevaluate(S, results, ser, keys):
 
 
 def pending(S, level=None):
-    q = "SELECT id, params FROM jobs WHERE state='accepted' AND type IN ('quant_layer','quant_head','quant_tensor') AND check_state IS NULL"
+    q = "SELECT id, params FROM jobs WHERE state='accepted' AND type IN (" + ",".join(f"'{t}'" for t in jobs.QUANT) + ") AND check_state IS NULL"
     a = []
     if level: q += " AND level=?"; a.append(level)
     return [r["id"] for r in S.q(q + " ORDER BY accepted_at, id", a) if is_score(json.loads(r["params"]))]

@@ -744,3 +744,33 @@ that Docker records `TAG@DIGEST` as the container's image is assumed, and `rqah 
 the timer under a real systemd user manager; `--update` with a real worker image and GPU; `E2E_SERVER=docker` (the server
 container was not rebuilt for this branch).
 
+
+## 18. The V3 ladder's `rxq_quant` jobs (ladder branch, w86, 2026-11-08)
+
+`jobs/rxq_quant.py`: one Hessian group (or tensor) of a trunk layer at one ladder level, run with rad-exl3-mix's V3
+quantizer pipeline (`python -m rxq job`, pipeline/config/v3.toml: H_out at every level, tile CD, sub-1 damping, i4 +
+qtf2, in-job C9). Jobs come from rad-exl3-mix `python -m rxq.ladder jobs MANIFEST` and go in with `admin.py
+enqueue-jobs`; every input is pinned by its sha256 (`pins`: exactly the inputs the parameters imply). The worker
+refuses a lease whose input hashes differ from the pins, the server refuses a result whose job.json does not record
+them, and `admin.py pins-check` lists queued jobs that went stale. Requirements (`req`) come from the generator's measured
+table (R9700, 11-08). Verification by score reads the per-tensor files (`codes()`); `admin.py export` assembles a level
+with `python -m rxq assemble`. The quantization type list is one tuple now (`jobs.QUANT`: scheduler, verifier,
+scorer, status page, export).
+
+`tests/rxq_e2e.py RXM FORK [WORKDIR]` (VM, CPU, ~4 min; rxq's CPU stand-in kernels: the fork's real quantize.py with a
+greedy trellis encoder, test only, results stamped `cpu-standin`), tiny two-layer model (GDN layer 2, attention layer
+3, small shapes): datapack (`--groups --hout`, `rxq-settings`, manifest); 16 generated jobs (K0.5 i4, K2.5 i8) with
+pins = the manifest's hashes; enqueue twice (16 new, then 0); server + one fake-card worker: all accepted; every tensor
+and C9 file bit-identical (data + metadata) to direct `rxq job` runs on the fixture files (30/30); `admin.py score`
+16 pass (the worker is a verifier); `export` (rxq assemble of the accepted job dirs) == a direct assembly; a Hessian
+changed after enqueue: enqueue-jobs refuses, pins-check lists the job, the worker refuses it ("differ from the job's
+pins") and runs the other three; in-process accept() refusals (job.json without the pinned inputs, a missing C9 file,
+another settings stamp, stand-in codes without `RQAH_ALLOW_STANDIN=1`). **9/9 PASS.**
+
+The suites after the change: sched_test 40/40, score_test 40/40, statuspage_test 26/26, probation_test 16/16,
+checker_nan_test 12/12, e2e_noop 135/135, upgrade_e2e 23/23, update_test 81/81, bandwidth_e2e 22/22 (VM, 11-08).
+
+Real 27B tensors (colo, layers 2 + 3, K0.5 i4 / K2.5 i8 / K6.5 mul1, CPU stand-in, w86's dry run): see rad-exl3-mix
+`local/workers/w86/` (LOG 2026-11-08). Not tested: a GPU worker running rxq_quant (the job runs `python -m rxq job`, which
+the lead's gpucheck27 checks on card 0 against ourq), the worker images with rxq inside (the CUDA / ROCm Dockerfiles
+still stage ourq only: add rad-exl3-mix pipeline/ and set `--rxq`).

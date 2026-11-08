@@ -28,9 +28,11 @@ Every job module defines
                                 (ok, detail dict); tol: {name: value} overrides of the type's TOL"""
 import re
 from common.schema import validate, SchemaError
-from . import noop, quant_layer, quant_tensor, quant_head, eval_mix, golden_record
+from . import noop, quant_layer, quant_tensor, quant_head, eval_mix, golden_record, rxq_quant
 
-REGISTRY = {m.NAME: m for m in (noop, quant_layer, quant_tensor, quant_head, eval_mix, golden_record)}
+REGISTRY = {m.NAME: m for m in (noop, quant_layer, quant_tensor, quant_head, eval_mix, golden_record, rxq_quant)}
+# the quantization job types: verified by score / the checker, exported per level, probation-eligible in score mode
+QUANT = ("quant_layer", "quant_tensor", "quant_head", "rxq_quant")
 
 
 class Rejected(ValueError):

@@ -65,6 +65,15 @@ w25 (donors, status page):
                                          set the priority of the queued / leased jobs of every level matching the shell
                                          pattern (e.g. 'q27-k2.*'): P, or K's granularity default (+ B); heads +1
   queue [--limit N]                      queued jobs in scheduling order: priority classes, levels, sizes
+ladder branch (rxq_quant, 2026-11-08):
+  rxq-settings MODEL REV FILE.toml       a V3 settings file (rad-exl3-mix pipeline/config/v3.toml) into the datapack as
+                                         models/MODEL@REV/rxq/<settings stamp>.toml; then `manifest`
+  enqueue-jobs FILE.jsonl [--dry-run] [--priority-boost B]
+                                         rxq_quant jobs from `python -m rxq.ladder jobs MANIFEST ...` (rad-exl3-mix): all
+                                         checked first (schema, stamps, pins = the manifest's sha256), then enqueued
+  pins-check                             queued jobs whose pinned inputs no longer match the manifest
+  export --level L OUT [--rxq-python PY --rxq DIR]   rxq_quant levels: the accepted job dirs as OUT/jobs/<id>, assembled
+                                         by rxq into OUT/level (or the assemble command printed)
 0.5 (updates, RUNBOOK.md "Upgrades"):
   versions [--days D] [--json]           per job type and version: queued / running / accepted jobs, whether this
                                          server's code still accepts it, the workers seen in D days (7) that declare
@@ -83,7 +92,7 @@ import argparse, concurrent.futures as cf, json, os, re, shutil, sys, time
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.util import read_json, write_json_atomic, sha256_file, st_header, safe_relpath, fmt_bytes, env, vtuple
+from common.util import read_json, write_json_atomic, sha256_file, st_header, safe_relpath, fmt_bytes, env, vtuple, stamp
 from common.st import copy_tensors
 from common import radfile, release as RL
 import jobs
@@ -497,20 +506,108 @@ def cmd_cancel(a, S):
 
 
 def level_jobs(S, level):
-    return [r for r in S.q("SELECT * FROM jobs WHERE level=? AND type IN ('quant_layer','quant_head','quant_tensor') "
+    return [r for r in S.q("SELECT * FROM jobs WHERE level=? AND type IN (" + ",".join(f"'{t}'" for t in jobs.QUANT) + ") "
                            "AND verify_of IS NULL ORDER BY id", (level,))]
 
 
 def unit_of(r):
-    """the piece of the level a job makes (copies of best-of-N share it): layer, layer/group or head"""
+    """the piece of the level a job makes (copies of best-of-N share it): layer, layer/group, layer/group/keys or head"""
     p = json.loads(r["params"])
+    if r["type"] == "rxq_quant": return (p["layer"], p["group"], tuple(p["keys"]))
     return ("head",) if r["type"] == "quant_head" else (p["layer"], p.get("group", -1))
+
+
+def rxq_stamp(path):
+    """rxq's settings stamp of a settings file (rad-exl3-mix pipeline/rxq/config.py settings_stamp: sha256 of the canonical
+    JSON of its meta / inputs / quant / post sections, 16 hex)"""
+    import tomllib
+    with open(path, "rb") as f: c = tomllib.load(f)
+    return stamp({k: c[k] for k in ("meta", "inputs", "quant", "post")})
+
+
+def cmd_rxq_settings(a):
+    """copy a settings file into the datapack as models/M@R/rxq/<stamp>.toml (then `manifest`)"""
+    st = rxq_stamp(a.file)
+    d = os.path.join(a.data, "models", f"{a.model}@{a.rev}", "rxq"); os.makedirs(d, exist_ok=True)
+    dst = os.path.join(d, f"{st}.toml")
+    if os.path.exists(dst):
+        if open(dst, "rb").read() != open(a.file, "rb").read(): sys.exit(f"{dst} exists with other content (same stamp, other comments?)")
+    else:
+        shutil.copyfile(a.file, dst + ".part"); os.replace(dst + ".part", dst)
+    print(f"settings {st} -> {os.path.relpath(dst, a.data)}; now run `manifest`")
+
+
+def cmd_enqueue_jobs(a, S):
+    """jobs from a generator's JSONL ({type, params, level, ukey, priority[, grp]} a line: rad-exl3-mix
+    `python -m rxq.ladder jobs`); every pinned input must be in the manifest with exactly that sha256"""
+    man = man_files(a.data); n = dup = 0; levels = {}
+    rows = [json.loads(l) for l in open(a.file) if l.strip()]
+    for r in rows:                                     # all or nothing: check every job before the first insert
+        p = r["params"]; jobs.check_params(r["type"], p)
+        stale = [k for k, h in (p.get("pins") or {}).items() if (man.get(k) or {}).get("sha256") != h]
+        if stale: sys.exit(f"{r['ukey']}: pinned inputs not in the manifest with that sha256: {stale[:3]} (manifest stale, or the "
+                           f"datapack changed after the jobs were generated)")
+        if r["type"] != "rxq_quant" and not a.any_type: sys.exit(f"{r['ukey']}: type {r['type']} (enqueue-jobs takes rxq_quant; --any-type)")
+    if a.dry_run: print(f"{len(rows)} jobs OK (dry run)"); return
+    with S.tx() as db:
+        for r in rows:
+            prio = r.get("priority", 0) + a.priority_boost
+            jid = add_job(S, db, man, r["type"], r["params"], r.get("level"), r["ukey"], priority=prio, grp=r.get("grp"))
+            if jid is None: dup += 1
+            else: n += 1; levels[r.get("level")] = levels.get(r.get("level"), 0) + 1
+    print(f"{n} new jobs ({dup} already queued) in {len(levels)} levels" + (f": {', '.join(f'{k} {v}' for k, v in list(levels.items())[:6])}"
+                                                                             + (" ..." if len(levels) > 6 else "") if levels else ""))
+
+
+def cmd_pins_check(a, S):
+    """queued / leased jobs whose pinned inputs no longer match the manifest (they would fail on every worker)"""
+    man = man_files(a.data); bad = 0
+    for r in S.q("SELECT id, type, params, level FROM jobs WHERE state IN ('queued','leased')"):
+        pins = (json.loads(r["params"]) or {}).get("pins") or {}
+        stale = [k for k, h in pins.items() if (man.get(k) or {}).get("sha256") != h]
+        if stale: bad += 1; print(f"job {r['id']} {r['level']}: {len(stale)} stale pins, e.g. {stale[0]}")
+    print(f"{bad} jobs with stale pins")
+
+
+def cmd_export_rxq(a, S, rows):
+    """rxq_quant levels: the accepted job dirs (best passed copy per unit) as OUT/jobs/<id>, and the level assembled by
+    rxq (`python -m rxq assemble OUT/level OUT/jobs/*`, run with --rxq-python, else printed)"""
+    from server import score as SC
+    units = {}
+    for r in rows: units.setdefault(unit_of(r), []).append(r)
+    pick = {}
+    for u, rs in units.items():
+        acc_u = [r for r in rs if r["state"] == "accepted"]
+        best = SC.best_of_group(S, acc_u) if any(SC.is_score(json.loads(r["params"])) for r in acc_u) else None
+        if best is None and acc_u: best = acc_u[0]
+        if best is not None: pick[u] = best
+    if len(pick) != len(units) and not a.partial: sys.exit(f"{len(pick)}/{len(units)} accepted (--partial to export anyway)")
+    if a.checked and any(r["check_state"] != "pass" for r in pick.values()): sys.exit("not every accepted job passed its check")
+    jd = os.path.join(a.out, "jobs"); os.makedirs(jd, exist_ok=True)
+    for r in pick.values():
+        dst = os.path.join(jd, str(r["id"]))
+        if not os.path.lexists(dst): os.symlink(os.path.abspath(os.path.join(a.results, str(r["id"]))), dst)
+    p0 = json.loads(next(iter(pick.values()))["params"])
+    tmpl = os.path.join(a.data, "models", f"{p0['model']}@{p0['revision']}", "config.json")
+    cmd = ["-m", "rxq", "assemble", os.path.join(a.out, "level")] + sorted(os.path.join(jd, str(r["id"])) for r in pick.values()) + \
+          ["--template", tmpl] + (["--keys-from"] if a.partial else []) + (["--allow-standin"] if os.environ.get("RQAH_ALLOW_STANDIN") == "1" else [])
+    if a.rxq_python:
+        import subprocess
+        env = dict(os.environ); env["PYTHONPATH"] = a.rxq or env.get("PYTHONPATH", "")
+        rc = subprocess.call([a.rxq_python] + cmd, env=env)
+        if rc: sys.exit(f"rxq assemble exit {rc}")
+        print(f"exported {len(pick)} rxq_quant jobs of {a.level}: {a.out}/level (assembled), job dirs in {jd}")
+    else:
+        print(f"exported {len(pick)} rxq_quant job dirs of {a.level} to {jd}; assemble with:\n  PYTHONPATH=<rad-exl3-mix>/pipeline python "
+              + " ".join(cmd[:4]) + f" {jd}/* --template {tmpl}" + (" --keys-from" if a.partial else ""))
 
 
 def cmd_export(a, S):
     from server import score as SC
     from common.st import merge_shards
     rows = level_jobs(S, a.level)
+    if rows and all(r["type"] == "rxq_quant" for r in rows): return cmd_export_rxq(a, S, rows)
+    if any(r["type"] == "rxq_quant" for r in rows): sys.exit(f"level {a.level} mixes rxq_quant with ourq jobs")
     units = {}
     for r in rows: units.setdefault(unit_of(r), []).append(r)
     pick = {}                                           # one accepted result per unit: the best passed copy (best of N)
@@ -602,7 +699,8 @@ def cmd_score_import(a, S):
     done = 0
     for u, r in {unit_of(r): r for r in level_jobs(S, a.level)}.items():
         p = json.loads(r["params"]); m = jobs.get(r["type"]); d = a.dir
-        src = f"q-L{p['layer']:02d}.safetensors" if r["type"] == "quant_tensor" else m.shard(p)   # ourq's own names
+        if r["type"] == "rxq_quant": src = m.tfile(p["keys"][0])              # our own rxq job dir (t-<key> files)
+        else: src = f"q-L{p['layer']:02d}.safetensors" if r["type"] == "quant_tensor" else m.shard(p)   # ourq's own names
         if not os.path.exists(os.path.join(d, src)): continue
         if r["type"] == "quant_tensor":                 # the group's tensors of ourq's whole-layer shard
             d = tempfile.mkdtemp(prefix="rqah-import-")
@@ -804,6 +902,12 @@ def main():
     x.add_argument("--copies", type=int, default=1, help="best of N: N copies of every job (seed_offset + 0..N-1)")
     x.add_argument("--priority-boost", type=int, default=0, help="added to the default priority from K's granularity")
     x.add_argument("--priority", type=int, help="explicit priority (instead of the granularity default)")
+    x = sp.add_parser("enqueue-jobs", help="jobs from a generator's JSONL (rxq.ladder jobs)"); x.add_argument("file")
+    x.add_argument("--priority-boost", type=int, default=0); x.add_argument("--dry-run", action="store_true")
+    x.add_argument("--any-type", action="store_true")
+    sp.add_parser("pins-check", help="queued jobs whose pinned inputs no longer match the manifest")
+    x = sp.add_parser("rxq-settings", help="a V3 settings file into the datapack (models/M@R/rxq/<stamp>.toml)")
+    x.add_argument("model"); x.add_argument("rev"); x.add_argument("file")
     x = sp.add_parser("reprioritize"); x.add_argument("pattern", help="shell pattern over level names, e.g. 'q27-k2.*'")
     x.add_argument("--priority", type=int); x.add_argument("--by-granularity", action="store_true")
     x.add_argument("--priority-boost", type=int, default=0); x.add_argument("--dry-run", action="store_true")
@@ -819,6 +923,8 @@ def main():
         x = sp.add_parser(c); x.add_argument("ids", nargs="*"); x.add_argument("--level"); x.add_argument("--state")
         x.add_argument("--force", action="store_true")
     x = sp.add_parser("export"); x.add_argument("--level", required=True); x.add_argument("out")
+    x.add_argument("--rxq-python", help="rxq_quant levels: run rxq assemble with this python (else the command is printed)")
+    x.add_argument("--rxq", help="rxq_quant levels: rad-exl3-mix pipeline/ (PYTHONPATH for --rxq-python)")
     x.add_argument("--partial", action="store_true"); x.add_argument("--checked", action="store_true", help="refuse unless every job passed the checker")
     x = sp.add_parser("check"); x.add_argument("--level", required=True); x.add_argument("--rows-frac", type=float, default=1.0)
     x.add_argument("--tol", type=float, default=None); x.add_argument("--recheck", action="store_true")
@@ -836,6 +942,7 @@ def main():
     a = ap.parse_args()
     if a.cmd in ("release-fetch", "release-show") and (a.out or a.db):      # no database access
         return cmd_release_fetch(a) if a.cmd == "release-fetch" else cmd_release_show(a)
+    if a.cmd == "rxq-settings": return cmd_rxq_settings(a)
     if not a.db: ap.error("--db (or RQAH_DB) is required")
     global DATA
     DATA = a.data
@@ -860,6 +967,8 @@ def main():
     elif a.cmd == "manifest": cmd_manifest(a)
     elif a.cmd == "datapack": cmd_datapack(a)
     elif a.cmd == "enqueue-level": cmd_enqueue_level(a, S)
+    elif a.cmd == "enqueue-jobs": cmd_enqueue_jobs(a, S)
+    elif a.cmd == "pins-check": cmd_pins_check(a, S)
     elif a.cmd == "reprioritize": cmd_reprioritize(a, S)
     elif a.cmd == "queue": cmd_queue(a, S)
     elif a.cmd == "score": cmd_score(a, S)

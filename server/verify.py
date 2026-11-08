@@ -32,7 +32,7 @@ import json, os, secrets, shutil, time
 import jobs
 from server.score import is_score
 
-QUANT = ("quant_layer", "quant_head", "quant_tensor")
+QUANT = jobs.QUANT
 
 
 class Policy:
