@@ -366,8 +366,10 @@ class Worker:
         self.update_seen = key
         newer = vtuple(cur) > vtuple(VERSION)
         if refused: log(f"UPDATE NEEDED: {ascii(str(refused))[1:-1][:400]}")
-        elif newer: log(f"update available: {VERSION} -> {cur} (this worker keeps working while the server still accepts {mn}; "
-                        f"to update: on the host `rqah update`, README \"Updating\")")
+        elif newer:
+            notes = u.get("notes") if isinstance(u.get("notes"), str) and u["notes"].startswith("https://github.com/") else None
+            log(f"update available: {VERSION} -> {cur} (this worker keeps working while the server still accepts {mn}; "
+                f"to update: on the host `rqah update`, README \"Updates and versions\")" + (f"; release notes {ascii(notes)[1:-1][:200]}" if notes else ""))
         try: write_json_atomic(os.path.join(self.a.state, "update.json"),
                                {"t": time.time(), "yours": VERSION, "current": cur, "min": mn, "available": newer,
                                 "refused": bool(refused)})

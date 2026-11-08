@@ -73,14 +73,19 @@ w25 (donors, status page):
                                          take an old job version out of service (nothing of it is leased or accepted
                                          any more). Refused while jobs of it run; refused while some are queued unless
                                          --migrate, which re-stamps them at the type's current version after checking
-                                         their parameters and inputs against it (running jobs are never touched)"""
-import argparse, concurrent.futures as cf, json, os, shutil, sys, time
+                                         their parameters and inputs against it (running jobs are never touched)
+  release-fetch [X.Y.Z | latest] [--file F] [--out PATH]
+                                         the release manifest (common/release.py: the release's image digests) from its
+                                         GitHub Release (or a local file), checked, written next to the database (or
+                                         --out); the running server picks it up and advertises that release
+  release-show [--out PATH]              the installed manifest"""
+import argparse, concurrent.futures as cf, json, os, re, shutil, sys, time
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.util import read_json, write_json_atomic, sha256_file, st_header, safe_relpath, fmt_bytes, env, vtuple
 from common.st import copy_tensors
-from common import radfile
+from common import radfile, release as RL
 import jobs
 from jobs import qwen, quant_common as QC, golden_common as G
 from server.store import Store, SchemaTooNew
@@ -345,6 +350,41 @@ def cmd_retire(a, S):
         db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('retired', ?)", (json.dumps({k: sorted(x) for k, x in ret.items() if x}),))
         S.event(db, "retire", detail={"type": t, "version": v, "migrated": len(moved)})
     print(f"{t} v{v} retired" + (f"; {len(moved)} queued jobs moved to v{m.VERSION}" if moved else ""))
+
+
+def release_path(a):
+    return a.out or os.path.join(os.path.dirname(os.path.abspath(a.db)), "release.json")
+
+
+def cmd_release_fetch(a):
+    """a release manifest from GitHub (or --file), checked, installed atomically"""
+    if a.file:
+        b = open(a.file, "rb").read(1 << 20); src = a.file
+    else:
+        import urllib.request
+        v = None if a.version in (None, "latest") else a.version
+        if v is not None and not re.fullmatch(RL.VERSION_PAT, v): sys.exit("release-fetch: X.Y.Z or latest")
+        src = RL.asset_url(v)
+        try:
+            with urllib.request.urlopen(urllib.request.Request(src, headers={"User-Agent": "rqah-admin"}), timeout=60) as r: b = r.read(1 << 20)
+        except OSError as e: sys.exit(f"release-fetch: {src}: {e}")
+    try: m = RL.loads(b)
+    except ValueError as e: sys.exit(f"release-fetch: {src}: refused: {e}")
+    if a.version not in (None, "latest") and m["version"] != a.version: sys.exit(f"release-fetch: {src} is {m['version']}, not {a.version}")
+    p = release_path(a)
+    old = read_json(p) if os.path.exists(p) else None
+    write_json_atomic(p, m)
+    print(f"{p}: release {m['version']} (was {old.get('version') if isinstance(old, dict) else 'none'}), published {m['created']}")
+    for s, im in sorted(m["images"].items()): print(f"  {s:18s} {im['repo']}:{im['tag']}@{im['digest']}")
+    print("the server advertises it at its next request (current = this release unless RQAH_WORKER_CURRENT is set)")
+
+
+def cmd_release_show(a):
+    p = release_path(a)
+    if not os.path.exists(p): sys.exit(f"no release manifest at {p} (admin.py release-fetch)")
+    try: m = RL.loads(open(p, "rb").read())
+    except ValueError as e: sys.exit(f"{p}: {e}")
+    print(json.dumps(m, indent=1, sort_keys=True))
 
 
 def cmd_reprioritize(a, S):
@@ -791,7 +831,11 @@ def main():
     x = sp.add_parser("versions"); x.add_argument("--days", type=float, default=7); x.add_argument("--json", action="store_true")
     x = sp.add_parser("retire"); x.add_argument("type"); x.add_argument("version", type=int)
     x.add_argument("--migrate", action="store_true"); x.add_argument("--dry-run", action="store_true"); x.add_argument("--undo", action="store_true")
+    x = sp.add_parser("release-fetch"); x.add_argument("version", nargs="?", default="latest"); x.add_argument("--file"); x.add_argument("--out")
+    x = sp.add_parser("release-show"); x.add_argument("--out")
     a = ap.parse_args()
+    if a.cmd in ("release-fetch", "release-show") and (a.out or a.db):      # no database access
+        return cmd_release_fetch(a) if a.cmd == "release-fetch" else cmd_release_show(a)
     if not a.db: ap.error("--db (or RQAH_DB) is required")
     global DATA
     DATA = a.data

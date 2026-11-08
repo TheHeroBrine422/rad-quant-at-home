@@ -134,13 +134,25 @@ def local_budget(a):
             "spent": sorted({k.split("_")[0] for k, v in lim.items() if v is not None and v - b.get(k, 0) < (1 << 20)})}
 
 
-def new_image(image_id, ver):
-    """the image a worker built as image_id (RQAH_IMAGE_ID: REPO:X.Y.Z-STACK+COMMIT) would be at release ver, or None"""
+def stack_of(image_id):
+    """(repo, stack) of this image (RQAH_IMAGE_ID: REPO:X.Y.Z-STACK+COMMIT), or (None, None)"""
     ref = (image_id or "").split("+", 1)[0]
-    if ":" not in ref or "/" not in ref: return None
+    if ":" not in ref or "/" not in ref: return None, None
     repo, tag = ref.rsplit(":", 1)
-    m = re.match(r"\d{1,4}\.\d{1,4}\.\d{1,4}", tag)
-    return f"{repo}:{ver}{tag[m.end():]}" if m and vtuple(ver) else None
+    m = re.match(r"\d{1,4}\.\d{1,4}\.\d{1,4}-", tag)
+    return (repo, tag[m.end():]) if m else (None, None)
+
+
+def new_image(image_id, ver, images=None):
+    """the image this worker's image (image_id) is at release ver: REPO:VER-STACK, pinned @digest when the queue
+    advertises one for that stack (the release manifest), else None"""
+    repo, stack = stack_of(image_id)
+    if not stack or not vtuple(ver): return None
+    im = (images or {}).get(stack) if isinstance(images, dict) else None
+    if isinstance(im, dict) and re.fullmatch(r"[a-z0-9][a-z0-9./:-]{0,200}", str(im.get("image", ""))) \
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", str(im.get("digest", ""))):
+        return f"{im['image']}@{im['digest']}"
+    return f"{repo}:{ver}-{stack}"
 
 
 def update_lines(m):
@@ -154,10 +166,12 @@ def update_lines(m):
     if vtuple(mine) and vtuple(mine) < vtuple(cur):
         L.append(f"update available: {mine} -> {cur}" + (f" (this worker keeps getting jobs while the queue accepts {mn} and newer)"
                  if vtuple(mine) >= vtuple(mn) else f": this worker is below the minimum {mn} and gets NO new jobs until updated"))
-        img = new_image(e("IMAGE_ID"), cur)
+        img = new_image(e("IMAGE_ID"), cur, u.get("images"))
         L.append("  on the host:  rqah update     (= python3 client/setup.py --update, for a worker set up with rqah setup)")
         L.append(f"  or by hand:   docker pull {img or '<the worker image>:' + cur + '-<rocm7.14-gfx1201|cu128>'}, then recreate "
-                 "the container with that tag and the same state volume (README \"Updating\")")
+                 "the container with that image and the same state volume (README \"Updates and versions\")")
+        if isinstance(u.get("notes"), str) and u["notes"].startswith("https://github.com/"):
+            L.append(f"  release notes: {u['notes']}")
     for w in m.get("workers", []):
         v = w.get("version")
         if w.get("id") != (m.get("worker") or {}).get("id") and v and vtuple(v) and vtuple(v) < vtuple(cur):

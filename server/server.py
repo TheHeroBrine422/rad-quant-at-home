@@ -41,7 +41,8 @@ or, when the peer is one of --trusted-proxy, the rightmost X-Forwarded-For entry
   GET  /  (/index.html)   no auth: the public status page (server/statuspage.py), rebuilt every --status-interval s;
                           with --status-dir also written there for a static host
   GET  /healthz           no auth: 200 if the database answers (container healthcheck)
-  GET  /api/v0/version    no auth (0.5): {api, server, worker: {current, min}} -- what `rqah update` moves to
+  GET  /api/v0/version    no auth (0.5): {api, server, worker: {current, min, images, notes, published}} -- what
+                          `rqah update` moves to (images: {stack: {image, digest}} from the release manifest)
   GET  /api/v0/admin/summary  read-only queue overview, only with --admin-token-file, bearer = that token
   POST /api/v0/search/batch           an eval_mix batch (server/batch.py)      } only with --search-token-file,
   GET  /api/v0/search/batch/ID        its status and per-candidate results    } bearer = that token; enqueues
@@ -53,9 +54,12 @@ this host (or in the server container: `rqah admin ...`).
 
 Versions (0.5, README "Updating", RUNBOOK.md "Upgrades"): a worker sends its release in X-RQAH-Version (before 0.5:
 only in its user agent, rad-quant-at-home-worker/0.4; 0.3 said 0.2). The server records it (workers.version), and
-every lease answer, /status and /me carry {"update": {current, min}} (--worker-current, default this release;
---worker-min, default WORKER_MIN). A worker below the minimum gets 426 on /lease with the way to update; the jobs it
-holds still heartbeat, upload and complete. API v0 changes are additive: the previous release's workers and CLI keep
+every lease answer, /status and /me carry {"update": {current, min, images, notes, published}}: current is the
+release in the release manifest (--release-manifest, default release.json next to the database: common/release.py,
+written by the release workflow, installed with `admin.py release-fetch`; re-read when it changes), else
+--worker-current, else this server's release; images are that release's image digests per stack (only when the
+manifest is the current release). --worker-min (default WORKER_MIN) is the oldest release still served. A worker
+below it gets 426 on /lease with the way to update; the jobs it holds still heartbeat, upload and complete. API v0 changes are additive: the previous release's workers and CLI keep
 working against this server (tests/upgrade_e2e.py runs the 0.4.0 worker against it). A restart extends the leases
 that were active by the downtime (Store.after_restart), so a server outage longer than --lease-s loses no work."""
 import argparse, errno, hashlib, hmac, json, os, re, secrets, shutil, signal, sys, threading, time, traceback
@@ -68,6 +72,7 @@ from common.schema import validate, SchemaError
 import jobs
 from jobs import golden_common as G
 from server.store import Store, SchemaTooNew
+from common import release as RL
 from server import verify as V, batch as B, donor as D, statuspage as SP
 from server import sched as SCH
 from server.sched import norm_req, job_filter
@@ -143,12 +148,14 @@ class Queue:
         self.probation = (int(getattr(a, "probation_pass", SCH.PROBATION_PASS)), int(getattr(a, "eval_unlock", SCH.EVAL_UNLOCK)))
         self.store.probation = self.probation                # the donor API reports the tiers with the same thresholds
         self.proxies = {x.strip() for x in (getattr(a, "trusted_proxy", None) or "").split(",") if x.strip()}
-        self.worker_current = getattr(a, "worker_current", None) or VERSION
+        self.worker_current_flag = getattr(a, "worker_current", None) or None
         self.worker_min = getattr(a, "worker_min", None) or WORKER_MIN
-        for k in ("worker_current", "worker_min"):
-            if not VERSION_RE.fullmatch(getattr(self, k)): sys.exit(f"--{k.replace('_', '-')}: X.Y.Z, not {getattr(self, k)!r}")
-        if vtuple(self.worker_min) > vtuple(self.worker_current): sys.exit("--worker-min is above --worker-current")
-        self.store.meta_set("worker_current", self.worker_current); self.store.meta_set("worker_min", self.worker_min)
+        self.release_path = getattr(a, "release_manifest", None) or os.path.join(os.path.dirname(os.path.abspath(a.db)), "release.json")
+        self._rel, self._rel_key, self._meta_cur = None, None, None
+        for k, v in (("worker-current", self.worker_current_flag), ("worker-min", self.worker_min)):
+            if v is not None and not VERSION_RE.fullmatch(v): sys.exit(f"--{k}: X.Y.Z, not {v!r}")
+        if vtuple(self.worker_min) > vtuple(self.worker_current): sys.exit("--worker-min is above the current worker release")
+        self.store.meta_set("worker_min", self.worker_min); self.sync_meta()
         self.restart = self.store.after_restart(self.lease_s)
 
     # ------------------------------------------------------------ versions (0.5)
@@ -161,12 +168,44 @@ class Queue:
         m = re.fullmatch(r"rad-quant-at-home-worker/(\d{1,4}\.\d{1,4})", (headers.get("User-Agent") or "").strip())
         return m.group(1) + ".0" if m else None
 
+    def release(self):
+        """the release manifest (common/release.py) or None; re-read when the file changes, the last good one kept
+        when it turns unreadable (a warning in the log)"""
+        try: st = os.stat(self.release_path); key = (st.st_mtime_ns, st.st_size)
+        except OSError: key = None
+        if key != self._rel_key:
+            self._rel_key = key
+            if key is None: self._rel = None
+            else:
+                try:
+                    with open(self.release_path, "rb") as f: self._rel = RL.loads(f.read(1 << 20))
+                    print(f"release manifest: {self._rel['version']} ({', '.join(sorted(self._rel['images']))})", flush=True)
+                except (OSError, ValueError) as e:
+                    print(f"release manifest {self.release_path} refused, keeping the previous one: {e}", flush=True)
+        return self._rel
+
+    @property
+    def worker_current(self):
+        """the release workers should run: --worker-current, else the release manifest's, else this server's"""
+        if self.worker_current_flag: return self.worker_current_flag
+        rel = self.release()
+        return rel["version"] if rel else VERSION
+
+    def sync_meta(self):
+        """meta worker_current (the status page reads it) follows the manifest"""
+        cur = self.worker_current
+        if cur != self._meta_cur: self.store.meta_set("worker_current", cur); self._meta_cur = cur
+
     def update_info(self, ver=None):
-        """what every lease answer, /status and /me carry: the release workers should run and the oldest still served"""
-        u = {"current": self.worker_current, "min": self.worker_min}
+        """what every lease answer, /status and /me carry: the release workers should run, the oldest still served,
+        and (from the release manifest, when it is that release) its image digests per stack and its notes page"""
+        cur = self.worker_current
+        u = {"current": cur, "min": self.worker_min}
+        rel = self.release()
+        if rel and rel["version"] == cur: u.update(RL.advertised(rel))
         if ver:
             u["yours"] = ver
-            u["available"] = vtuple(ver) < vtuple(self.worker_current)
+            u["available"] = vtuple(ver) < vtuple(cur)
             u["supported"] = vtuple(ver) >= vtuple(self.worker_min)
         return u
 
@@ -886,8 +925,12 @@ def main():
                     help="passed quant results after which a worker registered without an invite may hold more than one lease")
     ap.add_argument("--eval-unlock", type=int, default=env("EVAL_UNLOCK", SCH.EVAL_UNLOCK, int),
                     help="... and after which it may run eval_mix and every other type whose check takes our hardware")
-    ap.add_argument("--worker-current", default=env("WORKER_CURRENT", VERSION),
-                    help="the worker release donors should run, advertised in every lease answer (default: this release)")
+    ap.add_argument("--worker-current", default=env("WORKER_CURRENT"),
+                    help="the worker release donors should run, advertised in every lease answer (default: the release "
+                         "manifest's, else this server's release)")
+    ap.add_argument("--release-manifest", default=env("RELEASE_MANIFEST"),
+                    help="release.json of the current worker release (its image digests; admin.py release-fetch writes it; "
+                         "default: next to the database; re-read when it changes)")
     ap.add_argument("--worker-min", default=env("WORKER_MIN", WORKER_MIN),
                     help="the oldest worker release that is still leased jobs; older ones get 426 with the way to update "
                          "(default %(default)s; raise it once the previous release's window ends: RUNBOOK.md)")
@@ -905,7 +948,7 @@ def main():
     def reaper():
         while True:
             time.sleep(min(5.0, a.lease_s / 4))
-            try: Handler.Q.store.expire(); Handler.Q.sweep_spool(); Handler.Q.store.alive()
+            try: Handler.Q.store.expire(); Handler.Q.sweep_spool(); Handler.Q.store.alive(); Handler.Q.sync_meta()
             except Exception: traceback.print_exc()
     threading.Thread(target=reaper, daemon=True).start()
     if a.status_interval > 0:
@@ -937,7 +980,8 @@ def main():
            if a.open_registration else "invites only")
     print(f"rad-quant-at-home queue on http://{a.bind}:{srv.server_address[1]}  db={a.db}  data={a.data}  results={a.results}  "
           f"admin summary {'on' if a.admin_token_file else 'off'}, search API {'on' if a.search_token_file else 'off'}, "
-          f"registration {reg}, workers {a.worker_min}..{a.worker_current}, "
+          f"registration {reg}, workers {Q0.worker_min}..{Q0.worker_current}"
+          f"{' (release manifest)' if Q0.release() and not a.worker_current else ''}, "
           f"spot checks {a.spot_rate:.0%} (eval {a.eval_spot_rate:.0%}, {a.eval_spot_docs} docs) + first {a.spot_first}, scorer {'on' if a.score_threads > 0 else 'off'}, status page "
           f"{f'every {a.status_interval:g}s' + (' -> ' + a.status_dir if a.status_dir else '') if a.status_interval > 0 else 'off'}", flush=True)
     srv.serve_forever()
