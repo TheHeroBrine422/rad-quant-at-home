@@ -1,4 +1,4 @@
-# rad-quant-at-home: donate GPU time to the rad-exl3 quantizations (v0.4)
+# rad-quant-at-home: donate GPU time to the rad-exl3 quantizations (v0.5)
 
 > **Status: pre-release.** There is no public queue server yet and the job types still change; please read, comment and
 > open issues, but don't run a worker against anything until a release is announced.
@@ -24,7 +24,7 @@ steps were built and run on the 4070 without Docker, `tests/cuda_rootfs.sh`, but
 ≥ 8 GB of free RAM per compile job; ROCm: with radiance inside), `docker run --gpus` on an NVIDIA host, and one real
 R9700 job of each type.
 
-What is new on this branch (after 0.4.0):
+What is new in 0.5:
 - **Credit by display name:** the leaderboard has one row per public display name (case-insensitive); use the same
   name on every machine. `rqah link` is gone.
 - **Open registration:** an invite is optional. Without one a worker starts on probation (server-scored quantization
@@ -94,7 +94,7 @@ docker run -d --name rad-quant-at-home --restart unless-stopped --device /dev/kf
   --security-opt seccomp=unconfined --security-opt no-new-privileges --cap-drop ALL --memory 40g --stop-timeout 900 \
   -v rqah-state:/var/lib/rqah -v /etc/localtime:/etc/localtime:ro \
   -e RQAH_SERVER=https://<queue-url> -e RQAH_INVITE=<invite-code> -e RQAH_NAME=<name-for-the-leaderboard> \
-  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.4.0-rocm7.14-gfx1201 --gpu-name r9700 --gpus 0 --vram-gb 32 --ram-gb 32 --cache-gb 200
+  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.5.0-rocm7.14-gfx1201 --gpu-name r9700 --gpus 0 --vram-gb 32 --ram-gb 32 --cache-gb 200
 ```
 
 NVIDIA (`--gpus all` hands the cards to the container; the worker's own `--gpus 0` picks among them):
@@ -104,7 +104,7 @@ docker run -d --name rad-quant-at-home --restart unless-stopped --gpus all \
   --security-opt no-new-privileges --cap-drop ALL --memory 24g --stop-timeout 900 \
   -v rqah-state:/var/lib/rqah -v /etc/localtime:/etc/localtime:ro \
   -e RQAH_SERVER=https://<queue-url> -e RQAH_INVITE=<invite-code> -e RQAH_NAME=<name-for-the-leaderboard> \
-  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.4.0-cu128 --gpu-name rtx4070 --gpus 0 --vram-gb 12 --ram-gb 16 --cache-gb 50
+  ghcr.io/theherobrine422/rad-quant-at-home-worker:0.5.0-cu128 --gpu-name rtx4070 --gpus 0 --vram-gb 12 --ram-gb 16 --cache-gb 50
 ```
 
 Declare the VRAM the worker may really use: a card that also drives your desktop has ~1 GB less (e.g. `--vram-gb 11`
@@ -743,7 +743,7 @@ Files: `docker/server/Dockerfile`, `entrypoint.sh` (`rad-quant-at-home serve | a
 with the compose plugin (tested: Docker 29.8, compose 5.6; Podman untested).
 
 ```bash
-# 1. build (from a commit; --worktree for uncommitted code). Tags rad-quant-at-home-server:0.4.0, :0.4.0-<commit>, :latest
+# 1. build (from a commit; --worktree for uncommitted code). Tags rad-quant-at-home-server:0.5.0, :0.5.0-<commit>, :latest
 docker/server/build.sh
 # 2. configure: copy .env.example to .env next to compose.yaml and set at least the directories
 cd docker/server && cp .env.example .env
@@ -926,7 +926,7 @@ labels).
 IMAGE_REPO=ghcr.io/theherobrine422/rad-quant-at-home-worker RXM_COMMIT=<rxm-commit> RADIANCE_IMAGE=radiance:<fork-commit> \
   docker/build.sh rocm <commit>                      # never from --worktree
 IMAGE_REPO=ghcr.io/theherobrine422/rad-quant-at-home-worker RXM_COMMIT=<rxm-commit> docker/build.sh cuda <commit>
-docker image inspect ghcr.io/theherobrine422/rad-quant-at-home-worker:0.4.0-cu128 --format '{{json .Config.Labels}}'
+docker image inspect ghcr.io/theherobrine422/rad-quant-at-home-worker:0.5.0-cu128 --format '{{json .Config.Labels}}'
 docker push ghcr.io/theherobrine422/rad-quant-at-home-worker --all-tags
 ```
 
@@ -935,8 +935,8 @@ The CUDA build compiles exllamav3 and the side extensions for `TORCH_CUDA_ARCH` 
 `BUILD_ARGS="--build-arg MAX_JOBS=1"`, and `--build-arg TORCH_CUDA_ARCH=8.9` for a quick single-arch test build).
 
 Tags:
-- `0.4.0-rocm7.14-gfx1201`, `0.4.0-cu128`: what donors pin.
-- `0.4.0-rocm` / `0.4.0-cuda` and `rocm` / `cuda`: these move.
+- `0.5.0-rocm7.14-gfx1201`, `0.5.0-cu128`: what donors pin (by digest since 0.5).
+- `0.5.0-rocm` / `0.5.0-cuda` and `rocm` / `cuda`: these move.
 - `rocm-<commit>-rxm<commit>`, `cuda-...`: the exact source commits.
 
 #### Research images (research-kit/)
