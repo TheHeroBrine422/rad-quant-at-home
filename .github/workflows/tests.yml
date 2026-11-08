@@ -26,6 +26,8 @@ jobs:
         python: ["3.12", "3.x"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0              # tests/upgrade_e2e.py runs the 0.4.0 release (git archive) against this tree
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
@@ -37,10 +39,12 @@ jobs:
         run: |
           set -e
           for t in tests/score_test.py tests/sched_test.py tests/checker_nan_test.py tests/statuspage_test.py \
-                   tests/setup_test.py tests/probation_test.py; do
+                   tests/setup_test.py tests/probation_test.py tests/update_test.py; do
             echo "::group::$t"; python -I "$t"; echo "::endgroup::"
           done
       - name: bandwidth e2e
         run: python -I tests/bandwidth_e2e.py
       - name: e2e (server as a process)
         run: python -I tests/e2e_noop.py
+      - name: upgrade e2e (0.4.0 -> this tree -> a simulated next release)
+        run: python -I tests/upgrade_e2e.py
