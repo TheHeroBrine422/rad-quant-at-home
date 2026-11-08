@@ -39,7 +39,8 @@ from the codes, and finding codes with low error is exactly the work being donat
 1. **Structure** (at upload, `accept()`): exactly the tensors of the job's layer plan (`.trellis` int16
    `[in/16, out/16, 16K]`, `.suh` f16 `[in]`, `.svh` f16 `[out]`, `.mul1` int32), shapes from our bf16 weights.
    The trellis word count fixes K: codes of another K do not fit.
-2. **Format**: `suh` / `svh` finite, non-zero, |x| ≤ 1e3; `.mul1` is exllamav3's MUL1 constant (0x83DCD12D, also
+2. **Format**: `suh` / `svh` finite, at most 1% exact zeros (ladder branch, 11-08: an honest scale refit can underflow
+   a row's f16 scale to 0, seen once in 5120 on a V3 K0.5 q_proj; zeroed rows only raise the scored error), |x| ≤ 1e3; `.mul1` is exllamav3's MUL1 constant (0x83DCD12D, also
    for i8 / i8c, whose decode is the mul1 hash plus rounding). Any int16 pattern is a valid tail-biting trellis, so
    the codes themselves need no further format check.
 3. **Error**: the exact decode and `rel` per tensor (above). `tr(W H Wᵀ)` is the same for every result of a tensor

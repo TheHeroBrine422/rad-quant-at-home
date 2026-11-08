@@ -7,7 +7,7 @@
 
 1. structure: the shard holds exactly {key}.trellis / suh / svh / mul1 of every linear in the layer plan, with the
    dtypes and shapes the bf16 weights imply; proxy.jsonl covers each tensor once with the job's K / codebook /
-   scaled-Hessian setting; job.json carries the job's settings stamp; suh / svh finite, non-zero, |x| <= 1e3 and mul1
+   scaled-Hessian setting; job.json carries the job's settings stamp; suh / svh finite, at most 1% zero, |x| <= 1e3, mul1
    the MUL1 marker (docs/VERIFY.md "Format", the score verifier's rule).
 2. proxy recompute: each tensor decoded from its codes (exl3dec), rel = tr(dW H dW^T) / tr(W H W^T) against OUR
    input Hessian and OUR bf16 weight, compared with the proxy_err the worker logged (exllamav3's post-refit error,
@@ -29,12 +29,15 @@ _DT = {"F32": np.float32, "F16": np.float16, "I16": np.int16, "I32": np.int32, "
 
 
 def validity(key, t, K):
-    """format checks beyond the shapes (quant_common.check_shard): finite, non-zero, bounded scales; the mul1 marker;
+    """format checks beyond the shapes (quant_common.check_shard): finite, bounded scales, at most 1% of them zero (an
+    honest scale refit can underflow a row's f16 scale to 0: 1 of 5120 on a V3 K0.5 q_proj, w86 11-08; zeroing rows only
+    raises the scored error, so the allowance buys a cheater nothing); the mul1 marker;
     the trellis width of the declared K"""
     for x in ("suh", "svh"):
         a = t[x].astype(np.float32)
         if not np.isfinite(a).all(): return f"{key}.{x}: not finite"
-        if (a == 0).any(): return f"{key}.{x}: zero scale"
+        nz = int((a == 0).sum())                        # a few exact zeros are honest: the scale refit can shrink a row's
+        if nz > max(1, a.size // 100): return f"{key}.{x}: {nz} zero scales"   # scale below f16's 6e-8 (V3 sub-1 q_proj, w86)
         if np.abs(a).max() > LIMIT_SCALE: return f"{key}.{x}: scale above {LIMIT_SCALE:g}"
     if int(t["mul1"]) & 0xFFFFFFFF != exl3dec.MUL1: return f"{key}.mul1: marker {int(t['mul1']) & 0xFFFFFFFF:#x}"
     if t["trellis"].shape[-1] != round(16 * K): return f"{key}.trellis: {t['trellis'].shape[-1]} words per tile, K{K} needs {round(16 * K)}"

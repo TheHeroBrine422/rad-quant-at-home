@@ -768,6 +768,11 @@ changed after enqueue: enqueue-jobs refuses, pins-check lists the job, the worke
 pins") and runs the other three; in-process accept() refusals (job.json without the pinned inputs, a missing C9 file,
 another settings stamp, stand-in codes without `RQAH_ALLOW_STANDIN=1`). **9/9 PASS.**
 
+Found by the colo dry run (real 27B q_proj, K0.5 i4, CPU stand-in): the input-side scale refit underflowed one of 5120
+suh entries to f16 zero, and the format rule ("non-zero scales") failed the job, which on a donor would have meant a
+quarantine for an honest result. The rule now allows up to 1% exact zeros (zeroed rows only raise the scored error);
+`tests/validity_test.py` 9/9.
+
 The suites after the change: sched_test 40/40, score_test 40/40, statuspage_test 26/26, probation_test 16/16,
 checker_nan_test 12/12, e2e_noop 135/135, upgrade_e2e 23/23, update_test 81/81, bandwidth_e2e 22/22 (VM, 11-08).
 
