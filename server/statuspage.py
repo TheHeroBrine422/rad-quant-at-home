@@ -8,6 +8,9 @@ resources; a <meta refresh> reloads it every minute. server.py rebuilds it every
 60), serves it at / and, with --status-dir, also writes DIR/index.html for any static host; this script builds it once
 (cron, tests). It is polyglot XHTML: an XML parser must accept it (tests/statuspage_test.py).
 
+0.5: the worker releases donors' workers seen in the last 24 h run, as shares of current / older (the version numbers
+are public; nothing per worker), from workers.version and the release the server advertises (meta worker_current).
+
 What it may show: counts, job types, ladder level names, public corpus names, layer numbers, lumens, opted-in donors'
 display names (checked by donor.public_name, then escaped). What it never shows: worker names, tokens, invites,
 addresses, hostnames, GPU names, job parameters beyond the above, errors, quarantine reasons, file paths.
@@ -18,6 +21,7 @@ Campaign file (optional; default: campaign.json next to the database; re-read at
 ladder.levels may also be the list of level names (only those count). Without the file the total is the number of
 levels with jobs in the queue."""
 import argparse, html, json, os, re, sqlite3, sys, tempfile, time
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from server import donor as D
@@ -117,6 +121,20 @@ def collect(S, campaign=None, now=None):
         recent.append({"t": j["accepted_at"], "type": j["type"], "label": D.label(j["type"], p, j["level"]), "by": by,
                        "state": st, "listed": by not in ("a donor", "our hardware")})
     title = c.get("title") if isinstance(c.get("title"), str) else None
+    try:                                                     # a database a 0.5 server has not migrated yet has neither
+        cur = (S.q("SELECT v FROM meta WHERE k='worker_current'") or [[None]])[0][0]
+        seen = Counter(r[0] for r in S.q("SELECT version FROM workers WHERE verifier=0 AND disabled=0 AND last_seen>=?", (now - 86400,)))
+    except sqlite3.OperationalError:
+        cur, seen = None, Counter()
+    vt = lambda v: tuple(int(x) for x in v.split(".")) if isinstance(v, str) and re.fullmatch(r"\d{1,4}\.\d{1,4}\.\d{1,4}", v) else None
+    versions = None
+    if cur and vt(cur) and seen:
+        n = sum(seen.values())
+        older = Counter({v: k for v, k in seen.items() if vt(v) and vt(v) < vt(cur)})
+        unknown = sum(k for v, k in seen.items() if not vt(v))
+        versions = {"current": cur, "workers": n, "on_current": sum(k for v, k in seen.items() if vt(v) and vt(v) >= vt(cur)),
+                    "older": sorted(older.items(), key=lambda kv: vt(kv[0]), reverse=True)[:4], "older_n": sum(older.values()),
+                    "unknown": unknown}
     note = c.get("note") if isinstance(c.get("note"), str) else None
     tgt = lambda k, f: (c.get(k) or {}).get(f) if isinstance(c.get(k), dict) and _num((c.get(k) or {}).get(f)) else None
     return {"t": now, "title": title, "note": note,
@@ -128,7 +146,7 @@ def collect(S, campaign=None, now=None):
             "spot": {"pass": spot.get("pass", 0), "fail": spot.get("fail", 0), "pending": spot.get("pending", 0)},
             "by_type": by_type, "cards_busy": cards, "workers_busy": len({r["worker_id"] for r in busy}), "budget_paused": paused,
             "donors_day": donors_day, "board": rows[:50], "board_more": max(0, len(rows) - 50), "others": others,
-            "lumens_all": lumens_all, "recent": recent}
+            "lumens_all": lumens_all, "recent": recent, "versions": versions}
 
 
 CSS = """
@@ -197,6 +215,13 @@ def render(d):
                  f'<td class="n">{_n(t["day"])}</td><td class="n">{_n(t["total"])}</td></tr>')
     if not d["by_type"]: o.append('<tr><td colspan="5" class="mut">no jobs yet</td></tr>')
     o += ['</tbody>', '</table>']
+    V_ = d.get("versions")
+    if V_:
+        pct = lambda k: f"{100 * k / V_['workers']:.0f}%"
+        o.append(f'<p class="mut">worker release {_e(V_["current"])} (current): {pct(V_["on_current"])} of the {_n(V_["workers"])} '
+                 'workers seen in the last 24 h' + "".join(f' · {_e(v)}: {pct(k)}' for v, k in V_["older"])
+                 + (f' · older than 0.5: {pct(V_["unknown"])}' if V_["unknown"] else '')
+                 + (' · donors: <code>rqah status</code> says how to update' if V_["older_n"] or V_["unknown"] else '') + '</p>')
     rr = sum(t["reruns"] for t in d["by_type"])
     if rr: o.append(f'<p class="mut">plus {_n(rr)} verification re-runs on our own hardware</p>')
     o += ['</section>', '<section id="donors">', '<h2>Donors</h2>',

@@ -4,6 +4,30 @@ import hashlib, json, os, re, struct, sys, tempfile, time
 
 API = "v0"
 NAME = "rad-quant-at-home"                                            # the project; short form rqah (CLI alias, env)
+VERSION_RE = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")
+VERSION_HEADER = "X-RQAH-Version"                                    # 0.5: a worker's software version, on every request
+
+
+def read_version():
+    """this install's release (the repository's VERSION file; the images copy it), "0.0.0" if missing or malformed"""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "VERSION")) as f: v = f.read().strip()
+    except OSError:
+        return "0.0.0"
+    return v if VERSION_RE.fullmatch(v) else "0.0.0"
+
+
+VERSION = read_version()
+
+
+def vtuple(v):
+    """"0.5.0" -> (0, 5, 0); "0.4" -> (0, 4, 0); anything else -> None"""
+    if not isinstance(v, str) or not re.fullmatch(r"\d{1,4}(\.\d{1,4}){1,2}", v): return None
+    t = tuple(int(x) for x in v.split("."))
+    return t + (0,) * (3 - len(t))
+
+
+def vstr(t): return ".".join(map(str, t))
 ENV_PREFIX = "RQAH_"
 # 0.2 names, still read for one version (0.3.x) by both sides: RADQUANT_<name> (the v0 RXMQ_* / RXMW_* are gone)
 LEGACY = {"server": ("RADQUANT_", {}), "worker": ("RADQUANT_", {})}

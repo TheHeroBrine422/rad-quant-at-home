@@ -37,7 +37,17 @@ search adopted the candidate).
 operator; 1: registered without an invite, on probation until enough quant results pass, server/sched.py tier();
 2: a probation worker that was quarantined: it never unlocks, admin.py probation ID off clears it); reg_log (one
 row per registration without an invite: time and a keyed hash of the client address or IPv6 /64, never the address
-itself; rows older than a day are dropped), for the rate limits."""
+itself; rows older than a day are dropped), for the rate limits.
+
+Schema versions (0.5, RUNBOOK.md "Upgrades"): the database's PRAGMA user_version is the last migration applied
+(MIGRATIONS; 0 = a database from before 0.5, or a new one). Opening applies the missing ones in order, each in its own
+transaction, after a consistent copy of the old database (FILE.schemaN.bak, once per version). A database from a
+newer server (user_version > SCHEMA_VERSION) is refused: restore the backup or run the newer server. Migrations only
+add (tables, columns, rows), so the previous release's server still opens a migrated database (one-release rollback).
+  1  the 0.2-0.5 columns (MIGRATE) and one donor per worker from before donors
+  2  workers.version (the worker software's release, from its X-RQAH-Version header or, before 0.5, its user agent);
+     meta keys alive_t (the server's last reaper tick: a restart extends the leases by the downtime), worker_current /
+     worker_min (what the server advertises, for the status page), retired (job versions taken out of service)"""
 import hashlib, hmac, ipaddress, json, os, secrets, sqlite3, threading, time
 
 SCHEMA = """
@@ -90,6 +100,33 @@ MIGRATE = [("workers", "trusted", "INTEGER NOT NULL DEFAULT 0"), ("workers", "ve
            ("workers", "probation", "INTEGER NOT NULL DEFAULT 0")]
 
 
+def _add_columns(db, cols):
+    for t, c, decl in cols:
+        if c not in {r[1] for r in db.execute(f"PRAGMA table_info({t})")}:
+            db.execute(f"ALTER TABLE {t} ADD COLUMN {c} {decl}")
+
+
+def _migrate_1(db):
+    _add_columns(db, MIGRATE)
+    for w in db.execute("SELECT id, name, created FROM workers WHERE donor_id IS NULL").fetchall():   # workers from before donors
+        d = db.execute("INSERT INTO donors(display_name, created) VALUES(?,?)", (w["name"], w["created"])).lastrowid
+        db.execute("UPDATE workers SET donor_id=? WHERE id=?", (d, w["id"]))
+
+
+def _migrate_2(db):
+    _add_columns(db, [("workers", "version", "TEXT")])
+
+
+# user_version -> the step that reaches it; only ever append (a step must be safe on a database the previous release
+# wrote, and leave one that release can still open)
+MIGRATIONS = {1: _migrate_1, 2: _migrate_2}
+SCHEMA_VERSION = max(MIGRATIONS)
+
+
+class SchemaTooNew(RuntimeError):
+    pass
+
+
 def h(s): return hashlib.sha256(s.encode()).hexdigest()
 
 
@@ -105,15 +142,33 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=30)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL"); self.db.execute("PRAGMA busy_timeout=30000")
-        self.db.executescript(SCHEMA)
-        for t, c, decl in MIGRATE:
-            if c not in {r[1] for r in self.db.execute(f"PRAGMA table_info({t})")}:
-                self.db.execute(f"ALTER TABLE {t} ADD COLUMN {c} {decl}")
         self.lock = threading.RLock()
-        with self.tx() as db:                                # workers from before donors: one donor each, not on the board
-            for w in db.execute("SELECT id, name, created FROM workers WHERE donor_id IS NULL").fetchall():
-                d = db.execute("INSERT INTO donors(display_name, created) VALUES(?,?)", (w["name"], w["created"])).lastrowid
-                db.execute("UPDATE workers SET donor_id=? WHERE id=?", (d, w["id"]))
+        self.migrated = self.migrate()
+
+    def migrate(self):
+        """bring the schema to SCHEMA_VERSION (module docstring) -> the versions applied (empty: nothing to do)"""
+        uv = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if uv > SCHEMA_VERSION:
+            raise SchemaTooNew(f"{self.path}: database schema {uv} is newer than this server's {SCHEMA_VERSION} (written by a "
+                               f"newer release): run that release, or restore the backup {self.path}.schema{SCHEMA_VERSION}.bak")
+        if uv == SCHEMA_VERSION: return []
+        old = self.db.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()[0]
+        if old:                                              # a consistent copy first (WAL included), once per version
+            bak = f"{self.path}.schema{uv}.bak"
+            if not os.path.exists(bak):
+                dst = sqlite3.connect(bak + ".part")
+                try: self.db.backup(dst)
+                finally: dst.close()
+                os.replace(bak + ".part", bak)
+        self.db.executescript(SCHEMA)
+        done = []
+        for v in range(uv + 1, SCHEMA_VERSION + 1):
+            with self.tx() as db:
+                if db.execute("PRAGMA user_version").fetchone()[0] >= v: continue      # another process got there first
+                MIGRATIONS[v](db)
+                db.execute(f"PRAGMA user_version={int(v)}")
+            done.append(v)
+        return done
 
     # ------------------------------------------------------------ plumbing
     def tx(self):
@@ -132,6 +187,36 @@ class Store:
             if r: return r[0]
             v = secrets.token_hex(32); db.execute("INSERT INTO meta(k, v) VALUES(?,?)", (name, v))
         return v
+
+    def meta_get(self, k, default=None):
+        r = self.q("SELECT v FROM meta WHERE k=?", (k,))
+        return r[0][0] if r else default
+
+    def meta_set(self, k, v):
+        with self.tx() as db: db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES(?,?)", (k, str(v)))
+
+    def after_restart(self, lease_s, now=None):
+        """a server start: the leases that were active when it went down get a fresh lease_s (their workers retry and
+        heartbeat once it answers again), and their hard deadlines move by the downtime (meta alive_t: the last reaper
+        tick; unknown after an upgrade from 0.4: no move). -> (downtime s or None, leases extended)"""
+        now = now or time.time()
+        alive = self.meta_get("alive_t")
+        down = max(0.0, now - float(alive)) if alive else None
+        with self.tx() as db:
+            n = db.execute("UPDATE leases SET expires=MAX(expires, ?), deadline=deadline + ? WHERE state='active'",
+                           (now + lease_s, down or 0.0)).rowcount
+            db.execute("UPDATE jobs SET lease_expires=(SELECT expires FROM leases l WHERE l.id=jobs.lease_id) WHERE state='leased'")
+            self.event(db, "server_start", detail={"downtime_s": None if down is None else round(down, 1), "leases": n})
+            db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('alive_t', ?)", (str(now),))
+        return down, n
+
+    def alive(self, now=None):
+        with self.tx() as db: db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('alive_t', ?)", (str(now or time.time()),))
+
+    def retired(self):
+        """{job type: set of versions taken out of service} (admin.py retire)"""
+        try: return {t: set(v) for t, v in json.loads(self.meta_get("retired") or "{}").items()}
+        except (ValueError, TypeError, AttributeError): return {}
 
     def q(self, sql, args=()):
         with self.lock: return self.db.execute(sql, args).fetchall()

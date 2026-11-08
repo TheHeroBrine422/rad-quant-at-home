@@ -41,6 +41,7 @@ or, when the peer is one of --trusted-proxy, the rightmost X-Forwarded-For entry
   GET  /  (/index.html)   no auth: the public status page (server/statuspage.py), rebuilt every --status-interval s;
                           with --status-dir also written there for a static host
   GET  /healthz           no auth: 200 if the database answers (container healthcheck)
+  GET  /api/v0/version    no auth (0.5): {api, server, worker: {current, min}} -- what `rqah update` moves to
   GET  /api/v0/admin/summary  read-only queue overview, only with --admin-token-file, bearer = that token
   POST /api/v0/search/batch           an eval_mix batch (server/batch.py)      } only with --search-token-file,
   GET  /api/v0/search/batch/ID        its status and per-candidate results    } bearer = that token; enqueues
@@ -48,22 +49,33 @@ or, when the peer is one of --trusted-proxy, the rightmost X-Forwarded-For entry
   POST /api/v0/search/batch/ID/adopt  {candidates: [C, ...]}: the search adopts them; each gets a full trusted re-run
 
 Nothing else that changes the queue goes over HTTP: admin.py works on the database and the data root directly, on
-this host (or in the server container: `rqah admin ...`)."""
+this host (or in the server container: `rqah admin ...`).
+
+Versions (0.5, README "Updating", RUNBOOK.md "Upgrades"): a worker sends its release in X-RQAH-Version (before 0.5:
+only in its user agent, rad-quant-at-home-worker/0.4; 0.3 said 0.2). The server records it (workers.version), and
+every lease answer, /status and /me carry {"update": {current, min}} (--worker-current, default this release;
+--worker-min, default WORKER_MIN). A worker below the minimum gets 426 on /lease with the way to update; the jobs it
+holds still heartbeat, upload and complete. API v0 changes are additive: the previous release's workers and CLI keep
+working against this server (tests/upgrade_e2e.py runs the 0.4.0 worker against it). A restart extends the leases
+that were active by the downtime (Store.after_restart), so a server outage longer than --lease-s loses no work."""
 import argparse, errno, hashlib, hmac, json, os, re, secrets, shutil, signal, sys, threading, time, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, parse_qs, unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common.util import API, NAME_RE, safe_relpath, sha256_file, read_json, env
+from common.util import API, NAME_RE, VERSION, VERSION_HEADER, VERSION_RE, safe_relpath, sha256_file, read_json, env, vtuple
 from common.schema import validate, SchemaError
 import jobs
 from jobs import golden_common as G
-from server.store import Store
+from server.store import Store, SchemaTooNew
 from server import verify as V, batch as B, donor as D, statuspage as SP
 from server import sched as SCH
 from server.sched import norm_req, job_filter
 
 CHUNK_MAX = 64 << 20
+WORKER_MIN = "0.4.0"                   # the oldest worker release this server leases to by default (one release back)
+UPDATE_HOW = ("on the host: `rqah update` (python3 client/setup.py --update), or pull the new image tag and recreate the "
+              "container with the same state volume (README \"Updating\")")
 IMPLAUSIBLE_TO_VERIFIER = 2            # #4: after this many donors' implausible results a job goes to our verifiers
 JSON_MAX = 1 << 20
 BATCH_MAX = 32 << 20
@@ -131,6 +143,46 @@ class Queue:
         self.probation = (int(getattr(a, "probation_pass", SCH.PROBATION_PASS)), int(getattr(a, "eval_unlock", SCH.EVAL_UNLOCK)))
         self.store.probation = self.probation                # the donor API reports the tiers with the same thresholds
         self.proxies = {x.strip() for x in (getattr(a, "trusted_proxy", None) or "").split(",") if x.strip()}
+        self.worker_current = getattr(a, "worker_current", None) or VERSION
+        self.worker_min = getattr(a, "worker_min", None) or WORKER_MIN
+        for k in ("worker_current", "worker_min"):
+            if not VERSION_RE.fullmatch(getattr(self, k)): sys.exit(f"--{k.replace('_', '-')}: X.Y.Z, not {getattr(self, k)!r}")
+        if vtuple(self.worker_min) > vtuple(self.worker_current): sys.exit("--worker-min is above --worker-current")
+        self.store.meta_set("worker_current", self.worker_current); self.store.meta_set("worker_min", self.worker_min)
+        self.restart = self.store.after_restart(self.lease_s)
+
+    # ------------------------------------------------------------ versions (0.5)
+    @staticmethod
+    def client_version(headers):
+        """a worker's release: its X-RQAH-Version header, else (before 0.5) the X.Y of its user agent as X.Y.0 (0.3
+        workers sent 0.2); None for anything else (the CLI, curl)"""
+        v = (headers.get(VERSION_HEADER) or "").strip()
+        if VERSION_RE.fullmatch(v): return v
+        m = re.fullmatch(r"rad-quant-at-home-worker/(\d{1,4}\.\d{1,4})", (headers.get("User-Agent") or "").strip())
+        return m.group(1) + ".0" if m else None
+
+    def update_info(self, ver=None):
+        """what every lease answer, /status and /me carry: the release workers should run and the oldest still served"""
+        u = {"current": self.worker_current, "min": self.worker_min}
+        if ver:
+            u["yours"] = ver
+            u["available"] = vtuple(ver) < vtuple(self.worker_current)
+            u["supported"] = vtuple(ver) >= vtuple(self.worker_min)
+        return u
+
+    def version_report(self):
+        """queued / leased jobs whose version this server's code does not accept, or that are retired -> lines (startup
+        warning; admin.py versions has the full table)"""
+        ret, out = self.store.retired(), []
+        for r in self.store.q("SELECT type, version, state, COUNT(*) n FROM jobs WHERE state IN ('queued','leased') "
+                              "GROUP BY type, version, state ORDER BY type, version"):
+            m = jobs.REGISTRY.get(r["type"])
+            if m is None or r["version"] not in jobs.served(m) or r["version"] in ret.get(r["type"], ()):
+                out.append(f"{r['n']} {r['state']} {r['type']} v{r['version']} jobs: this server "
+                           + (f"runs {r['type']} v{m.VERSION} and does not accept v{r['version']}" if m else "does not know the type")
+                           + (" (retired)" if m and r["version"] in ret.get(r["type"], ()) else "")
+                           + " -- they are not leased (admin.py versions; retire --migrate)")
+        return out
 
     def tier(self, q, wr):
         """(tier, passed quant results) of worker row wr (sched.tier)"""
@@ -191,12 +243,24 @@ class Queue:
         return None
 
     # ------------------------------------------------------------ lease
-    def lease(self, w, caps):
+    def lease(self, w, caps, ver=None):
         """docs/SCHED.md: priority classes strictly in order; inside a class whole levels first and cached inputs
         first; only jobs that fit the worker's declared data budget; a gang job, or a higher-class job that has
-        waited --class-wait-s, drains a busy worker that could run it"""
+        waited --class-wait-s, drains a busy worker that could run it. ver: the worker's release (client_version);
+        below --worker-min: 426"""
         try: validate(caps, CAPS, "caps")
         except SchemaError as e: raise HTTPError(400, str(e))
+        if ver:
+            with self.store.tx() as db: db.execute("UPDATE workers SET version=?, last_seen=? WHERE id=?", (ver, time.time(), w["id"]))
+            if vtuple(ver) < vtuple(self.worker_min):
+                raise HTTPError(426, f"this worker runs rad-quant-at-home {ver}; the queue needs {self.worker_min} or newer "
+                                f"(current {self.worker_current}). It gets no new jobs until updated: {UPDATE_HOW}",
+                                update=self.update_info(ver), retry_s=3600)
+        r = self._pick(w, caps)
+        r["update"] = self.update_info(ver)
+        return r
+
+    def _pick(self, w, caps):
         cr = caps.get("cache")
         if cr is not None:
             if "shas" in cr: self.cache_reports[w["id"]] = (cr["rev"], frozenset(cr["shas"]))
@@ -236,7 +300,7 @@ class Queue:
             if not wr["verifier"]:                          # #7: abandon + lease again does not restart the deadline
                 failed = set(failed) | {jid for jid, t0 in self._held(db, w["id"]).items()
                                         if (c := self._cap_of(db, jid)) is not None and t0 + c <= now}
-            eligible = job_filter(wr, caps, failed, SCH.donor_groups(db, wr), tr_)
+            eligible = job_filter(wr, caps, failed, SCH.donor_groups(db, wr), tr_, self.store.retired())
             tr = SCH.Transfers(self.manifest(), self.up_memo)
 
             def fits_now(r): return r["cards"] <= free_cards and r["ram_gb"] <= free_ram
@@ -448,6 +512,9 @@ class Queue:
                 raise HTTPError(409, f"lease {l['state']}, job {j['state']}")
             params = json.loads(j["params"])
         m = jobs.get(j["type"])
+        if j["version"] not in jobs.served(m) or j["version"] in self.store.retired().get(j["type"], ()):
+            raise HTTPError(409, f"this server no longer accepts {j['type']} version {j['version']} results (it runs version "
+                            f"{m.VERSION}); the operator retired or replaced it", retired=True)
         outs = m.outputs(params)
         if set(files) - set(outs): raise HTTPError(400, f"unexpected files {sorted(set(files) - set(outs))}")
         miss = m.required_outputs(params) - set(files)
@@ -528,12 +595,17 @@ class Queue:
 
     def status(self, w=None):
         rows = self.store.q("SELECT type, state, COUNT(*) n FROM jobs GROUP BY type, state")
-        out = {"jobs": [dict(r) for r in rows], "workers": self.store.q("SELECT COUNT(*) FROM workers")[0][0]}
+        out = {"jobs": [dict(r) for r in rows], "workers": self.store.q("SELECT COUNT(*) FROM workers")[0][0],
+               "update": self.update_info(w["version"] if w is not None else None)}
         if w is not None:                                   # the asking worker's own standing (its points, flags)
             me = self.store.q("SELECT COALESCE(SUM(lumens), 0) FROM points WHERE worker_id=?", (w["id"],))[0][0]
             out["me"] = {"id": w["id"], "name": w["name"], "lumens": me, "trusted": bool(w["trusted"]),
                          "quarantined": bool(w["quarantined"]), "tier": self.tier(self.store.q, w)[0]}
         return out
+
+    def version(self):
+        """GET /api/v0/version (no auth): public, like the status page"""
+        return {"api": API, "server": VERSION, "worker": self.update_info()}
 
     def health(self):
         self.store.q("SELECT 1")
@@ -565,7 +637,7 @@ class Queue:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "rad-quant-at-home-server/0"
+    server_version = f"rad-quant-at-home-server/{VERSION}"
     Q: Queue = None
 
     def log_message(self, fmt, *args):
@@ -617,6 +689,7 @@ class Handler(BaseHTTPRequestHandler):
             u = urlsplit(self.path); parts = [unquote(x) for x in u.path.strip("/").split("/")]
             Q = self.Q
             if method == "GET" and parts == ["healthz"]: return self._send(200, Q.health())
+            if method == "GET" and parts == ["api", API, "version"]: return self._send(200, Q.version())
             if method == "GET" and parts in ([""], ["index.html"]): return self._page()
             if method == "GET" and parts[:4] == ["api", API, "admin", "summary"] and len(parts) == 4:
                 a = self.headers.get("Authorization", "")
@@ -631,7 +704,8 @@ class Handler(BaseHTTPRequestHandler):
             ep = parts[2:]
             if method == "POST" and ep == ["register"]: return self._send(200, Q.register(self._json(), self._client_addr()))
             w = self._worker()
-            if method == "POST" and ep == ["lease"]: return self._send(200, Q.lease(w, self._json().get("caps", {})))
+            if method == "POST" and ep == ["lease"]:
+                return self._send(200, Q.lease(w, self._json().get("caps", {}), Q.client_version(self.headers)))
             if method == "POST" and ep == ["heartbeat"]: return self._send(200, Q.heartbeat(w, self._json()))
             if method == "POST" and ep == ["complete"]: return self._send(200, Q.complete(w, self._json()))
             if method == "POST" and ep == ["fail"]: return self._send(200, Q.fail(w, self._json()))
@@ -674,7 +748,7 @@ class Handler(BaseHTTPRequestHandler):
         S = self.Q.store
         arg = lambda k, d: int(qs.get(k, [d])[0])
         try:
-            if method == "GET" and ep == []: return self._send(200, D.me(S, w))
+            if method == "GET" and ep == []: return self._send(200, {**D.me(S, w), "update": self.Q.update_info()})
             if method == "GET" and ep == ["jobs"]:
                 wk = qs.get("worker", [None])[0]
                 return self._send(200, D.my_jobs(S, w, arg("limit", 50), int(wk) if wk else None, qs.get("active", ["0"])[0] == "1"))
@@ -812,15 +886,26 @@ def main():
                     help="passed quant results after which a worker registered without an invite may hold more than one lease")
     ap.add_argument("--eval-unlock", type=int, default=env("EVAL_UNLOCK", SCH.EVAL_UNLOCK, int),
                     help="... and after which it may run eval_mix and every other type whose check takes our hardware")
+    ap.add_argument("--worker-current", default=env("WORKER_CURRENT", VERSION),
+                    help="the worker release donors should run, advertised in every lease answer (default: this release)")
+    ap.add_argument("--worker-min", default=env("WORKER_MIN", WORKER_MIN),
+                    help="the oldest worker release that is still leased jobs; older ones get 426 with the way to update "
+                         "(default %(default)s; raise it once the previous release's window ends: RUNBOOK.md)")
     ap.add_argument("--verbose", action="store_true", default=env("VERBOSE", False, lambda v: v not in ("0", "false", "no")))
     a = ap.parse_args()
     miss = [f"--{k} (RQAH_{k.upper()})" for k in ("db", "data", "spool", "results") if not getattr(a, k)]
     if miss: ap.error("missing " + ", ".join(miss))
-    Handler.Q = Queue(a)
+    try: Handler.Q = Queue(a)
+    except SchemaTooNew as e: sys.exit(str(e))
+    Q0 = Handler.Q
+    if Q0.store.migrated: print(f"database migrated to schema {Q0.store.migrated[-1]} (backup next to it: *.bak)", flush=True)
+    down, n = Q0.restart
+    if n: print(f"restart: {n} active leases extended" + (f" by the downtime ({down:.0f} s)" if down is not None else ""), flush=True)
+    for l in Q0.version_report(): print("WARNING " + l, flush=True)
     def reaper():
         while True:
             time.sleep(min(5.0, a.lease_s / 4))
-            try: Handler.Q.store.expire(); Handler.Q.sweep_spool()
+            try: Handler.Q.store.expire(); Handler.Q.sweep_spool(); Handler.Q.store.alive()
             except Exception: traceback.print_exc()
     threading.Thread(target=reaper, daemon=True).start()
     if a.status_interval > 0:
@@ -852,11 +937,13 @@ def main():
            if a.open_registration else "invites only")
     print(f"rad-quant-at-home queue on http://{a.bind}:{srv.server_address[1]}  db={a.db}  data={a.data}  results={a.results}  "
           f"admin summary {'on' if a.admin_token_file else 'off'}, search API {'on' if a.search_token_file else 'off'}, "
-          f"registration {reg}, "
+          f"registration {reg}, workers {a.worker_min}..{a.worker_current}, "
           f"spot checks {a.spot_rate:.0%} (eval {a.eval_spot_rate:.0%}, {a.eval_spot_docs} docs) + first {a.spot_first}, scorer {'on' if a.score_threads > 0 else 'off'}, status page "
           f"{f'every {a.status_interval:g}s' + (' -> ' + a.status_dir if a.status_dir else '') if a.status_interval > 0 else 'off'}", flush=True)
     srv.serve_forever()
     srv.server_close()
+    try: Handler.Q.store.alive()                             # the downtime a restart measures starts now
+    except Exception: traceback.print_exc()
     with Handler.Q.store.lock: Handler.Q.store.db.close()
     print("stopped", flush=True)
 
