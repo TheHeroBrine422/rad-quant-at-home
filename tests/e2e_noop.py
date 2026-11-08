@@ -1140,7 +1140,10 @@ def v02_units(E):
     n1 = S.q("SELECT COUNT(*) FROM jobs WHERE verify_state='pending' AND accepted_by=1")[0][0]
     n2 = S.q("SELECT COUNT(*) FROM jobs WHERE verify_state='pending' AND accepted_by=2")[0][0]
     first = S.q("SELECT verify_state FROM jobs WHERE id=1")[0][0]
-    ok("spot-check draws: 3-5% of a donor's jobs (4% + its first), none of a verifier's", 0.03 <= n1 / 5000 <= 0.05 and n2 == 0 and first == "pending",
+    # binomial bound, not a fixed 3-5% window: 5000 draws at 4% have sd ~13.9, so 3-5% (+-3.6 sd) failed about 1 run in
+    # a few thousand (CI 11-08: 253 = 5.06%). +-5 sd (~130-270) fails ~1 in 2 million; the first job adds one.
+    lo, hi = 5000 * 0.04 - 5 * (5000 * 0.04 * 0.96) ** 0.5, 5000 * 0.04 + 5 * (5000 * 0.04 * 0.96) ** 0.5 + 1
+    ok("spot-check draws: ~4% of a donor's jobs (binomial +-5 sd) + its first, none of a verifier's", lo <= n1 <= hi and n2 == 0 and first == "pending",
        f"{n1} of 5000 ({n1 / 50:.2f}%), verifier {n2}")
     j = E["J"]["c1"]; p = json.loads(jrow(j)["params"]); t = f"{W}/etamper"
     dp = lambda rel: os.path.join(DATA, rel)
