@@ -1,8 +1,9 @@
 # Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
 # The rad-quant-at-home donor worker image, NVIDIA (CUDA 12.8): quantization jobs only (quant_layer, quant_head; our
 # eval kernels have no CUDA path, so there is no radiance here and the server never leases eval_mix / golden_record to
-# it: the worker declares its job types). Same code, same quantizer and patch series as Dockerfile.rocm; the stack is
-# the one our RTX 4070 test box runs (torch 2.11.0+cu128).
+# it: the worker declares its job types; 0.6: also rxq_quant, the V3 ladder's jobs, from rad-exl3-mix pipeline/rxq).
+# Same code, same quantizer and patch series as Dockerfile.rocm; the stack is the one our RTX 4070 test box runs (torch
+# 2.11.0+cu128).
 #
 # Build with docker/build.sh cuda (context: app/ = this repo, rxm/ = the quantizer paths of rad-exl3-mix). The host
 # needs the NVIDIA driver (>= 570 for CUDA 12.8) and the NVIDIA Container Toolkit (`docker run --gpus ...`).
@@ -77,6 +78,7 @@ VOLUME /var/lib/rqah
 # caps: --gpu-name, --gpus / --cards, --vram-gb, --ram-gb, --cache-gb, --window, --vram-cap-gb
 ENTRYPOINT ["python", "-I", "/opt/rqah/app/worker/worker.py", "--state", "/var/lib/rqah", \
             "--ourq", "/opt/rqah/rxm/quantize/ourq.py", "--exl3-src", "/opt/rqah/exllamav3/exllamav3/exllamav3_ext", \
+            "--rxq", "/opt/rqah/rxm/pipeline", \
             "--env", "PYTHONPATH=/opt/rqah/exllamav3", "--env", "TORCH_EXTENSIONS_DIR=/opt/rqah/torch_ext", \
             "--env", "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True", \
-            "--python", "/opt/venv/bin/python", "--job-types", "noop,quant_layer,quant_head,quant_tensor"]
+            "--python", "/opt/venv/bin/python", "--job-types", "noop,quant_layer,quant_head,quant_tensor,rxq_quant"]

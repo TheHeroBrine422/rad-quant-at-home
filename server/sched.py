@@ -68,8 +68,10 @@ def job_filter(wr, caps, failed=frozenset(), groups=frozenset(), tier_="full", r
     expire since their last requeue (one attempt per worker per job). groups: best-of-N groups (jobs.grp) of which the
     worker's donor already holds or delivered a copy (#11: one copy of a group per donor). tier_: tier() of the
     worker; below "full" only score-mode quant jobs. 0.5: a job's version must be one the worker declares (exactly)
-    and one this server's code still accepts (jobs.served), and not retired ({type: versions}, admin.py retire)"""
-    types = set(caps.get("job_types") or ()) & {n for n, m in jobs.REGISTRY.items() if m.IMPLEMENTED}
+    and one this server's code still accepts (jobs.served), and not retired ({type: versions}, admin.py retire). 0.6: a
+    type with MIN_WORKER only for a worker row whose reported release is at least that (rxq_quant: 0.6.0)"""
+    wv = wr["version"] if "version" in wr.keys() else None
+    types = set(caps.get("job_types") or ()) & {n for n, m in jobs.REGISTRY.items() if m.IMPLEMENTED and not jobs.too_old(m, wv)}
     vers = caps.get("versions", {})
     disk = caps.get("disk_gb", 0) * 1e9
     cards = caps.get("cards", 1 if caps.get("gpu") else 0)

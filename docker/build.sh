@@ -6,7 +6,9 @@
 #   app/  this repository at COMMIT (default HEAD)
 #   rxm/  the quantizer code the jobs run, from a rad-exl3-mix checkout at RXM_COMMIT (default its HEAD): only the
 #         paths listed in RXM_PATHS (ourq.py, the exllamav3 patch series, the side extensions, the staged golden
-#         recorder, its licence files)
+#         recorder, the V3 pipeline package pipeline/rxq (0.6: rxq_quant jobs), its licence files). The kernel dirs
+#         come whole (their *.sh test scripts too, since 0.6): rxq's code stamp hashes every file in them, so an image
+#         stamps its results exactly as a checkout of the same commit does
 # --worktree takes this repo's paths from its working tree (tests only; tags end in -dirty); rad-exl3-mix still comes
 # from RXM_COMMIT unless RXM_WORKTREE=1.
 #
@@ -32,7 +34,7 @@ esac
 [ -d "$RXM/quantize" ] || { echo "no rad-exl3-mix checkout at $RXM (set RXM_REPO)"; exit 2; }
 APP_PATHS="LICENSE NOTICE LICENSES VERSION common jobs worker client docker checker"
 RXM_PATHS="LICENSE NOTICE LICENSES quantize/ourq.py quantize/exl3-patches v3/e3/exl3frac v3/e3/exl3frac2 v3/e3/exl3cb
-           eval/gold27/mkgold27.py proxy2b/common.py"
+           eval/gold27/mkgold27.py proxy2b/common.py pipeline/rxq"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/ctx/app" "$T/ctx/rxm"
 if [ "${2:-}" = "--worktree" ]; then
@@ -44,11 +46,11 @@ else
 fi
 if [ "${RXM_WORKTREE:-0}" = 1 ]; then
   RC=$(git -C "$RXM" rev-parse --short HEAD)-dirty
-  tar -C "$RXM" --exclude=__pycache__ --exclude='*.pyc' --exclude='v3/e3/*/*.sh' --exclude='v3/e3/*/build' -cf - $RXM_PATHS \
+  tar -C "$RXM" --exclude=__pycache__ --exclude='*.pyc' --exclude='v3/e3/*/build' --exclude='v3/e3/*/qtf2_frac_gen.cu' -cf - $RXM_PATHS \
     | tar -C "$T/ctx/rxm" -xf -
 else
   RC=$(git -C "$RXM" rev-parse --short "${RXM_COMMIT:-HEAD}")
-  git -C "$RXM" archive --format=tar "$RC" -- $RXM_PATHS ':(exclude)v3/e3/**/*.sh' | tar -C "$T/ctx/rxm" -xf -
+  git -C "$RXM" archive --format=tar "$RC" -- $RXM_PATHS | tar -C "$T/ctx/rxm" -xf -
 fi
 [ -f "$T/ctx/app/docker/Dockerfile.$VAR" ] || { echo "docker/Dockerfile.$VAR is not in $C"; exit 1; }
 TAG="$REPO:$VERSION-$STACK"

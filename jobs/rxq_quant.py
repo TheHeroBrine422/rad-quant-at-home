@@ -1,8 +1,8 @@
 # Copyright 2026 Hero422. Licensed under the Apache License, Version 2.0 (see LICENSE).
-"""rxq_quant (ladder branch, 2026-11-08): one Hessian group (or one tensor) of a trunk layer at one ladder level with
+"""rxq_quant (0.6.0; ladder branch, 2026-11-08): one Hessian group (or one tensor) of a trunk layer at one ladder level with
 rad-exl3-mix's V3 quantizer pipeline (`python -m rxq job SPEC -o OUT`, rad-exl3-mix pipeline/), the settings the V3
-freeze pins (pipeline/config/v3.toml: H_out at every level, tile CD on attn_qg, sub-1 damping, i4 + qtf2, C9 alpha on the
-writers, ...). The jobs are generated from the settings file by `python -m rxq.ladder jobs` (rad-exl3-mix) and enqueued
+freeze pins (pipeline/config/v3.toml: H_out at every level, tile CD on attn_qg, sub-1 damping, the codebook table + qtf2,
+C9 alpha on the writers, ...). The jobs are generated from the settings file by `python -m rxq.ladder jobs` (rad-exl3-mix) and enqueued
 with `admin.py enqueue-jobs`; this module only checks and runs them.
 
 Parameters: model, revision, arch, level, K, codebook (i8 / i4 / mul1), layer, group, keys (the tensors: the group's,
@@ -28,6 +28,7 @@ from common.util import write_json_atomic, st_header
 from . import qwen, quant_common as Q
 
 NAME, VERSION, IMPLEMENTED = "rxq_quant", 1, True
+MIN_WORKER = "0.6.0"                                   # the first release whose worker (and image: pipeline/rxq) runs it
 TOL = {"proxy_rel": 0.015}
 HEX64 = {"type": "string", "pattern": "[0-9a-f]{64}"}
 KEY = {"type": "string", "pattern": r"model\.language_model\.layers\.\d{1,3}\.[a-z_]+\.[a-z_]+"}

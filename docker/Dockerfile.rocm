@@ -93,5 +93,6 @@ VOLUME /var/lib/rqah
 # (env or flags) and the caps: --gpu-name, --gpus / --cards, --vram-gb, --ram-gb, --cache-gb, --window
 ENTRYPOINT ["python", "-I", "/opt/rqah/app/worker/worker.py", "--state", "/var/lib/rqah", \
             "--ourq", "/opt/rqah/rxm/quantize/ourq.py", "--exl3-src", "/opt/rqah/exllamav3/exllamav3/exllamav3_ext", \
+            "--rxq", "/opt/rqah/rxm/pipeline", \
             "--env", "PYTHONPATH=/opt/rqah/exllamav3", "--env", "TORCH_EXTENSIONS_DIR=/opt/rqah/torch_ext", \
             "--python", "/usr/local/bin/python"]

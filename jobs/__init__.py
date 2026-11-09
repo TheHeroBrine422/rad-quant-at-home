@@ -11,6 +11,8 @@ Every job module defines
                                 after a bump the old version's queued jobs wait (admin.py versions, retire --migrate)
     IMPLEMENTED                 False: the interface exists, the worker refuses to run it
     TRUSTED_ONLY                True: leased only to workers the operator flagged trusted (big-box jobs)
+    MIN_WORKER                  (optional, 0.6) the oldest worker release ("X.Y.Z") leased this type; a worker that
+                                reports an older release, or none, never gets it (min_worker())
     requires(p, info)           what one job needs: {"gpu", "cards", "vram_gb" (per card), "ram_gb" (host)}; info is
                                 the model's datapack record (models/<m>@<rev>/model.json: n_params, ...) or None. The
                                 server leases a job only to a worker whose declared and currently free cards / RAM
@@ -42,6 +44,22 @@ class Rejected(ValueError):
 def served(m):
     """the job versions of type m whose results this server code accepts: its VERSION and ACCEPTS"""
     return {m.VERSION, *getattr(m, "ACCEPTS", ())}
+
+
+def min_worker(m):
+    """the type's oldest worker release as a tuple, or None (any release)"""
+    from common.util import vtuple
+    v = getattr(m, "MIN_WORKER", None)
+    return vtuple(v) if v else None
+
+
+def too_old(m, worker_version):
+    """True if a worker of that release (None: it did not say) may not run type m"""
+    from common.util import vtuple
+    mv = min_worker(m)
+    if mv is None: return False
+    wv = vtuple(worker_version) if worker_version else None
+    return wv is None or wv < mv
 
 
 def get(jtype):

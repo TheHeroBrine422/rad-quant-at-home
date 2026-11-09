@@ -7,7 +7,8 @@ layer 3 attention + MLP, small shapes, random weights / Hessians / H_out), with 
 greedy trellis encoder, test only). Needs torch + safetensors (the rxq environment); localhost only, ~3-5 min.
 
   datapack   admin.py datapack --groups --hout, rxq-settings (the V3 settings file by its stamp), manifest
-  generate   rad-exl3-mix `python -m rxq.ladder jobs MANIFEST --levels 0.5-i4,2.5-i8 --layers 2-3`: 16 rxq_quant jobs,
+  generate   rad-exl3-mix `python -m rxq.ladder jobs MANIFEST --levels 0.5-<cb>,2.5-i8 --layers 2-3` (<cb>: the settings
+             file's codebook at K0.5, i4 before #126, i8 after; RXQ_E2E_LEVELS overrides): 16 rxq_quant jobs,
              every input pinned (sha256 = the manifest's), requirements from the measured table
   enqueue    admin.py enqueue-jobs (all checked first); a second run adds nothing (ukeys)
   run        server (RQAH_ALLOW_STANDIN=1) + one worker (fake card, RXQ_CPU_STANDIN=1): every job accepted
@@ -21,6 +22,9 @@ greedy trellis encoder, test only). Needs torch + safetensors (the rxq environme
              queued ones, the worker refuses them ("differ from the job's pins") and runs nothing
   accept     in process: a result whose job.json does not record the pinned inputs, a t-file with another settings stamp,
              a missing C9 file, and stand-in codes on a server without RQAH_ALLOW_STANDIN are all refused
+  anchor     (0.6) tools/rxq_anchor.py restamp: the K2.5 direct runs re-stamped to a settings file that differs only in a
+             value no job reads (meta.date) -> that level's 8 jobs enqueued, `score-import` makes one trusted row per tensor with the
+             same codes and errors as the original level's; a settings file whose change reaches the jobs is refused
 Last line: "RXQ E2E n/m PASS"."""
 import glob, hashlib, json, os, shutil, signal, sqlite3, subprocess, sys, time
 
@@ -106,11 +110,12 @@ def gen(levels, layers, out):
     return r.returncode, r.stdout + r.stderr
 
 
-rc, o = gen("0.5-i4,2.5-i8", "2-3", f"{W}/jobs.jsonl")
+LEVELS = os.environ.get("RXQ_E2E_LEVELS") or f"0.5-{RC.codebook_for(RC.load(f'{PIPE}/config/v3.toml'), 0.5)},2.5-i8"
+rc, o = gen(LEVELS, "2-3", f"{W}/jobs.jsonl")
 J = [json.loads(l) for l in open(f"{W}/jobs.jsonl")] if rc == 0 else []
 man = json.load(open(f"{DATA}/manifest.json"))["files"]
 pins_ok = all(all(man[n]["sha256"] == h for n, h in j["params"]["pins"].items()) for j in J)
-ok("generate", rc == 0 and len(J) == 16 and pins_ok and all(j["params"]["hout"] == "bn1920" for j in J),
+ok(f"generate ({LEVELS})", rc == 0 and len(J) == 16 and pins_ok and all(j["params"]["hout"] == "bn1920" for j in J),
    f"{len(J)} jobs; pins == manifest {pins_ok}; e.g. req {J[0]['params']['req'] if J else None} | {o.strip()[:160]}")
 rc, o = admin("enqueue-jobs", f"{W}/jobs.jsonl"); rc2, o2 = admin("enqueue-jobs", f"{W}/jobs.jsonl")
 ok("enqueue", rc == 0 and "16 new jobs" in o and "0 new jobs (16 already queued)" in o2, (o.strip() + " | " + o2.strip())[:240])
@@ -123,6 +128,8 @@ srv = subprocess.Popen([PY, "-I", f"{HERE}/server/server.py", "--db", DBP, "--da
                         "--port", str(PORT), "--lease-s", "60", "--heartbeat-s", "5", "--retry-s", "0.5",
                         "--admin-token-file", f"{W}/secrets/admin-token"], stdout=open(f"{W}/server.log", "a"), stderr=subprocess.STDOUT, env=e)
 time.sleep(1.5)
+if srv.poll() is not None:
+    sys.exit("test server died at once (port busy from an older rxq_e2e run? kill it: pgrep -f '[s]erver.py --db')")
 _, out = admin("add-worker", "cpu1"); tok = out.split("token")[-1].strip()
 admin("verifier", out.split()[1])               # our own box: its results are trusted rows (anchors)
 
@@ -200,7 +207,7 @@ ok("export", same_lv, f"admin export (rxq assemble of the accepted job dirs) == 
 
 # ---------------------------------------------------------------- content addressing
 wk.send_signal(signal.SIGTERM); wk.wait(60)
-rc, o = gen("6.5-mul1", "2", f"{W}/jobs65.jsonl")
+rc, o = gen("7.5-i8", "2", f"{W}/jobs65.jsonl")   # was 6.5-mul1: mul1 retired with the int8-only decision (11-09)
 rc, o = admin("enqueue-jobs", f"{W}/jobs65.jsonl")
 J65 = [json.loads(l) for l in open(f"{W}/jobs65.jsonl")]
 hp = f"{HS}/{qwen35.layer_plan(2)[0][0]}.safetensors"
@@ -261,6 +268,40 @@ os.environ.pop("RQAH_ALLOW_STANDIN")
 res["standin"] = refused(lambda d: None)
 ok("accept", not base_ok and all(v[0] for v in res.values()), f"untouched result accepted ({why0}); refused: " +
    "; ".join(f"{k}: {v[1]}" for k, v in res.items()))
+
+# ---------------------------------------------------------------- anchors under another settings stamp (tools/rxq_anchor.py)
+import re                                               # noqa: E402
+v3 = open(f"{PIPE}/config/v3.toml").read()
+
+
+def variant(path, rx, rep):
+    t = re.sub(rx, rep, v3, count=1, flags=re.M); open(path, "w").write(t); return t != v3
+
+
+okv = variant(f"{W}/v3-anchor.toml", r'^date = "[^"]*"', 'date = "anchor-test"')            # stamped, reaches no job
+okv &= variant(f"{W}/v3-anchor-bad.toml", r"^sigma_reg = [0-9.]+", "sigma_reg = 0.03")    # reaches every job
+anc = [PY, f"{HERE}/tools/rxq_anchor.py"]   # not -I: rxq_anchor imports rxq.blkorder -> torch, invisible to -I when torch is in user site-packages, "restamp", "--rxq", PIPE, "--old", f"{PIPE}/config/v3.toml", "--allow-standin"]
+r_bad = subprocess.run(anc + ["--new", f"{W}/v3-anchor-bad.toml", "--out", f"{W}/anchor-bad", f"{direct}/{lv25}"], capture_output=True, text=True)
+r_ok = subprocess.run(anc + ["--new", f"{W}/v3-anchor.toml", "--out", f"{W}/anchor", f"{direct}/{lv25}"], capture_output=True, text=True)
+admin("rxq-settings", "tiny", "r1", f"{W}/v3-anchor.toml"); admin("manifest")
+r_g = subprocess.run([PY, "-m", "rxq.ladder", "jobs", f"{DATA}/manifest.json", "--model", "tiny", "--rev", "r1", "--levels", "2.5-i8",
+                      "--layers", "2-3", "--config", f"{W}/v3-anchor.toml", "-o", f"{W}/jobs-anchor.jsonl"], capture_output=True, text=True,
+                     env=env_rxq, cwd=PIPE)
+JA = [json.loads(l) for l in open(f"{W}/jobs-anchor.jsonl")] if r_g.returncode == 0 else []
+lvA = JA[0]["level"] if JA else "?"
+rc_e, o_e = admin("enqueue-jobs", f"{W}/jobs-anchor.jsonl")
+rc_i, o_i = admin("score-import", "--level", lvA, f"{W}/anchor", "--note", "rxq_e2e anchor", env={"RQAH_ALLOW_STANDIN": "1"})
+nkeys = sum(len(j["params"]["keys"]) for j in JA)
+imp = {r["key"]: (r["codes_sha"], r["rel"]) for r in db().execute("SELECT * FROM scores WHERE basis='import' AND kind='trusted'")}
+orig = {r["key"]: (r["codes_sha"], r["rel"]) for r in db().execute(
+    "SELECT s.* FROM scores s JOIN jobs j ON j.id=s.job_id WHERE j.level=?", (lv25,))}
+with safe_open(glob.glob(f"{W}/anchor/t-*")[0], "pt") as x: mA = x.metadata()
+ok("anchor", okv and r_bad.returncode == 1 and "other codes" in r_bad.stdout and r_ok.returncode == 0 and rc_e == 0 and rc_i == 0
+   and len(imp) == nkeys > 0 and all(imp[k] == orig.get(k) for k in imp) and mA["level"] == lvA
+   and mA["rxq_restamp_from"].startswith(st),
+   f"bad toml refused {r_bad.returncode == 1}; restamp {r_ok.stdout.strip().splitlines()[-1][:80] if r_ok.stdout.strip() else r_ok.stderr[-160:]}; "
+   f"{len(JA)} jobs of {lvA} enqueued; import: {o_i.strip().splitlines()[-1] if o_i.strip() else ''}; {len(imp)}/{nkeys} trusted rows, "
+   f"codes / rel == the {lv25} rows {all(imp[k] == orig.get(k) for k in imp)}")
 
 srv.send_signal(signal.SIGTERM); srv.wait(30)
 print(f"RXQ E2E {sum(RESULTS)}/{len(RESULTS)} PASS")

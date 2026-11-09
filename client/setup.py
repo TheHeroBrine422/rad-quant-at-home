@@ -52,7 +52,7 @@ def repo_version():
         if re.fullmatch(r"\d+\.\d+\.\d+", v): return v
     except OSError:
         pass
-    return "0.5.0"
+    return "0.6.0"
 
 
 VERSION = repo_version()

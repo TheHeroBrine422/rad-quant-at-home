@@ -15,7 +15,7 @@ name: rad-quant-at-home-worker
 
 services:
   worker:
-    image: ${RQAH_IMAGE:-${RADQUANT_IMAGE:-ghcr.io/theherobrine422/rad-quant-at-home-worker:0.5.0-rocm7.14-gfx1201}}
+    image: ${RQAH_IMAGE:-${RADQUANT_IMAGE:-ghcr.io/theherobrine422/rad-quant-at-home-worker:0.6.0-rocm7.14-gfx1201}}
     restart: unless-stopped
     devices: [/dev/kfd, /dev/dri]
     group_add:                                  # the host's numeric ids: getent group video render

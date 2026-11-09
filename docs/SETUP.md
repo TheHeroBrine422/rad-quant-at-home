@@ -153,7 +153,7 @@ toggle, `a` advanced, `s` summary, `w` write, `q` quit. Over SSH either one work
 The form (2 × R9700, 128 GB):
 
 ```
- rad-quant-at-home setup 0.5.0 · editing ~/.config/rad-quant-at-home
+ rad-quant-at-home setup 0.6.0 · editing ~/.config/rad-quant-at-home
  CPU     Fake CPU 9000 (16 threads)   RAM 128 GB (100 GB available now)
  GPU AMD    #0  AMD Radeon AI PRO R9700             32 GB  gfx1201          ok
  GPU AMD    #1  AMD Radeon AI PRO R9700             32 GB  gfx1201          ok
@@ -187,7 +187,7 @@ The summary of the plain prompts (RTX 4070 driving the display, 32 GB):
 ```
 What will be written (in ~/.config/rad-quant-at-home):
   worker.env      the settings below + your invite  (mode 0600)
-  compose.yaml    image ghcr.io/theherobrine422/rad-quant-at-home-worker:0.5.0-cu128
+  compose.yaml    image ghcr.io/theherobrine422/rad-quant-at-home-worker:0.6.0-cu128
   docker-run.sh   the same as one docker run line
   setup.json      these answers (no invite), for the next run
 
