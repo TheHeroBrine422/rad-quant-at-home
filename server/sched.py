@@ -11,7 +11,7 @@ the worker already caches; a worker with a download budget instead takes the job
 import fnmatch, json
 import jobs
 
-QUANT = ("quant_layer", "quant_tensor", "quant_head")
+QUANT = jobs.QUANT
 # probation (workers registered without an invite, docs/VERIFY.md "Identity"): the defaults of server.py's
 # --probation-pass / --eval-unlock
 PROBATION_PASS, EVAL_UNLOCK = 3, 5
@@ -21,7 +21,7 @@ def passed_quant(q, wid):
     """a worker's quant results the scorer or checker passed and that earned lumens (a duplicate earns none);
     q(sql, args) -> rows"""
     return q("SELECT COUNT(*) FROM jobs j WHERE j.accepted_by=? AND j.verify_of IS NULL AND j.state='accepted' AND "
-             "j.check_state='pass' AND j.type IN ('quant_layer','quant_tensor','quant_head') AND "
+             "j.check_state='pass' AND j.type IN (" + ",".join(f"'{t}'" for t in QUANT) + ") AND "
              "(SELECT COALESCE(SUM(lumens), 0) FROM points p WHERE p.job_id=j.id AND p.worker_id=j.accepted_by) > 1e-9",
              (wid,))[0][0]
 

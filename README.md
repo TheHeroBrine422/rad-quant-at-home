@@ -24,6 +24,11 @@ steps were built and run on the 4070 without Docker, `tests/cuda_rootfs.sh`, but
 ≥ 8 GB of free RAM per compile job; ROCm: with radiance inside), `docker run --gpus` on an NVIDIA host, and one real
 R9700 job of each type.
 
+Ladder branch (`ladder`, 2026-11-08, not released): the **`rxq_quant`** job type for the V3 trunk ladder (one Hessian
+group of a layer at one level, run with rad-exl3-mix's pipeline `python -m rxq job` and the frozen settings file; inputs
+pinned by sha256; `admin.py rxq-settings` / `enqueue-jobs` / `pins-check`; export assembles with rxq). TESTS.md
+section 18. The worker images do not carry rad-exl3-mix `pipeline/` yet (docker/build.sh RXM_PATHS + a pin with it).
+
 What is new in 0.5:
 - **Credit by display name:** the leaderboard has one row per public display name (case-insensitive); use the same
   name on every machine. `rqah link` is gone.

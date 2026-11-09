@@ -226,6 +226,7 @@ class JobContext:
     def __init__(self, cfg, job, paths, out_dir, stage_dir, cancel, devices):
         self.cfg, self.jtype, self.jversion, self.params = cfg, job["type"], job["version"], job["params"]
         self._paths, self.input_names = paths, list(paths)
+        self.input_sha = {i["name"]: i["sha256"] for i in job.get("inputs") or ()}    # what the cache verified (rxq_quant pins)
         self.out_dir, self.stage_dir, self._cancel = out_dir, stage_dir, cancel
         self.devices = list(devices)
         ge = cfg.gpu_env
@@ -288,6 +289,7 @@ class Worker:
         os.makedirs(os.path.join(a.state, "current"), exist_ok=True)
         # what job modules read through ctx.cfg: this install's paths (never from the server)
         self.state, self.python, self.ourq, self.exl3_src = a.state, a.python, a.ourq, a.exl3_src
+        self.rxq = a.rxq
         self.radiance, self.mkgold27, self.headroom_mib = a.radiance, a.mkgold27, a.headroom_mib
         self.image, self.gpu_name = a.image, a.gpu_name
         self.vram_cap_gb, self.capwrap = a.vram_cap_gb, os.path.join(os.path.dirname(os.path.abspath(__file__)), "capwrap.py")
@@ -782,6 +784,7 @@ def main():
     ap.add_argument("--gpu-lock", default=e("GPU_LOCK"), help="flock this file around every GPU job; {card} = one lock per card")
     ap.add_argument("--python", default=sys.executable); ap.add_argument("--ourq", help="quantize/ourq.py")
     ap.add_argument("--exl3-src", help="the fork's exllamav3_ext sources (ourq --frac-ext)")
+    ap.add_argument("--rxq", default=e("RXQ"), help="rad-exl3-mix pipeline/ (rxq_quant jobs; default: next to --ourq) ($RQAH_RXQ)")
     ap.add_argument("--radiance", default=e("RADIANCE", "radiance"), help="the radiance binary (eval_mix, golden_record tp2)")
     ap.add_argument("--mkgold27", default=e("MKGOLD27", os.path.join(REPO, "eval", "gold27", "mkgold27.py")),
                     help="the staged golden recorder (golden_record staged)")

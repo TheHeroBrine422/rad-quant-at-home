@@ -24,10 +24,11 @@ import argparse, html, json, os, re, sqlite3, sys, tempfile, time
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import jobs
 from server import donor as D
 
-QUANT = ("quant_layer", "quant_tensor", "quant_head")
-TYPE_ORDER = ("quant_layer", "quant_tensor", "quant_head", "eval_mix", "golden_record", "noop")
+QUANT = jobs.QUANT
+TYPE_ORDER = ("quant_layer", "quant_tensor", "rxq_quant", "quant_head", "eval_mix", "golden_record", "noop")
 
 
 class RO:
@@ -57,7 +58,7 @@ def collect(S, campaign=None, now=None):
     now = now or time.time(); c = campaign or {}
     # ladder: a level is done when every one of its (not cancelled) quant jobs is accepted
     lv = {}
-    for r in S.q("SELECT level, state, check_state, COUNT(*) n FROM jobs WHERE type IN ('quant_layer','quant_tensor','quant_head') AND "
+    for r in S.q("SELECT level, state, check_state, COUNT(*) n FROM jobs WHERE type IN (" + ",".join(f"'{t}'" for t in jobs.QUANT) + ") AND "
                  "verify_of IS NULL AND level IS NOT NULL AND state<>'cancelled' GROUP BY level, state, check_state"):
         if not D.ID_RE.fullmatch(r["level"] or ""): continue
         x = lv.setdefault(r["level"], {"jobs": 0, "accepted": 0, "checked": 0})
